@@ -28,6 +28,12 @@
   "bundle": {
     "active": true,
     "targets": ["app", "dmg"],
-    "icon": []
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/[email protected]",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }
