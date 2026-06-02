@@ -1,0 +1,91 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Diagonal warm base -->
+    <linearGradient id="bg" x1="0.12" y1="0.05" x2="0.9" y2="1">
+      <stop offset="0%" stop-color="#3a2512"/>
+      <stop offset="42%" stop-color="#1c130d"/>
+      <stop offset="100%" stop-color="#0b0a09"/>
+    </linearGradient>
+    <!-- Off-center warm glow blob -->
+    <radialGradient id="blob" cx="36%" cy="30%" r="62%">
+      <stop offset="0%" stop-color="#ff8a3d" stop-opacity="0.55"/>
+      <stop offset="48%" stop-color="#fb6a1a" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#fb6a1a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="vignette" cx="50%" cy="50%" r="60%">
+      <stop offset="52%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.45"/>
+    </radialGradient>
+    <!-- Rich gold -> orange -> deep red on the mark -->
+    <linearGradient id="orange" x1="0.1" y1="0" x2="0.92" y2="1">
+      <stop offset="0%" stop-color="#ffe0a0"/>
+      <stop offset="32%" stop-color="#fb8a22"/>
+      <stop offset="72%" stop-color="#f0570c"/>
+      <stop offset="100%" stop-color="#d6410a"/>
+    </linearGradient>
+    <radialGradient id="core" cx="40%" cy="36%" r="70%">
+      <stop offset="0%" stop-color="#fff6ec"/>
+      <stop offset="30%" stop-color="#ffbe7a"/>
+      <stop offset="100%" stop-color="#ee5d0a"/>
+    </radialGradient>
+    <radialGradient id="coreHalo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ff9a48" stop-opacity="0.75"/>
+      <stop offset="100%" stop-color="#ff9a48" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="26%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="topEdge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffd9b0" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#ffd9b0" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="markGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="16"/>
+    </filter>
+    <filter id="dropShadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="11"/>
+    </filter>
+    <filter id="softHi" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+    <g id="arrows" fill="none" stroke-width="3.0" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+      <path d="M3 3v5h5"/>
+      <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+      <path d="M21 21v-5h-5"/>
+    </g>
+  </defs>
+
+  <!-- Tile -->
+  <rect width="1024" height="1024" rx="232" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="232" fill="url(#blob)"/>
+  <rect width="1024" height="1024" rx="232" fill="url(#vignette)"/>
+
+  <!-- Soft bloom behind the mark -->
+  <g transform="translate(248,248) scale(22)" filter="url(#markGlow)">
+    <use href="#arrows" stroke="#fb6a1a" stroke-opacity="0.85"/>
+  </g>
+  <!-- Drop shadow (floating mark) -->
+  <g transform="translate(248,262) scale(22)" filter="url(#dropShadow)">
+    <use href="#arrows" stroke="#000000" stroke-opacity="0.5"/>
+  </g>
+  <!-- Crisp mark -->
+  <g transform="translate(248,248) scale(22)">
+    <use href="#arrows" stroke="url(#orange)"/>
+  </g>
+  <!-- Bright top edge-light on the mark -->
+  <g transform="translate(248,248) scale(22)" opacity="0.5">
+    <use href="#arrows" stroke="url(#topEdge)" stroke-width="1.1"/>
+  </g>
+
+  <!-- Glowing active-account core -->
+  <circle cx="512" cy="512" r="132" fill="url(#coreHalo)"/>
+  <circle cx="512" cy="512" r="62" fill="url(#core)"/>
+  <ellipse cx="492" cy="494" rx="22" ry="16" fill="#ffffff" fill-opacity="0.6" filter="url(#softHi)"/>
+
+  <!-- Glossy sheen + rim -->
+  <rect width="1024" height="1024" rx="232" fill="url(#sheen)"/>
+  <rect x="3" y="3" width="1018" height="1018" rx="229" fill="none"
+        stroke="#ffffff" stroke-opacity="0.09" stroke-width="2.5"/>
+</svg>

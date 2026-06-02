@@ -3,74 +3,52 @@
    ============================================================ */
 
 :root {
-  /* Surfaces */
-  --bg-window: #ececee;
-  --bg-sidebar: rgba(0, 0, 0, 0.015);
-  --surface: #ffffff;
-  --surface-2: #f6f6f8;
-  --surface-hover: #f0f0f3;
+  /* Surfaces — warm dark (ai4ba style) */
+  --bg-window: #100e0c;
+  --bg-sidebar: rgba(255, 255, 255, 0.015);
+  --surface: #1a1512;
+  --surface-2: #221c17;
+  --surface-hover: #2c241d;
 
-  /* Text */
-  --text: #1d1d1f;
-  --text-2: #6e6e73;
-  --text-3: #8e8e93;
+  /* Text — cream / warm */
+  --text: #f4efe8;
+  --text-2: #b7ac9d;
+  --text-3: #8a8073;
 
   /* Lines */
-  --line: rgba(0, 0, 0, 0.09);
-  --line-strong: rgba(0, 0, 0, 0.16);
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.15);
 
-  /* Accent + status (Apple system colors) */
-  --accent: #0a84ff;
-  --accent-press: #0060df;
-  --accent-soft: rgba(10, 132, 255, 0.12);
-  --green: #34c759;
-  --amber: #ff9f0a;
-  --red: #ff3b30;
-  --green-soft: rgba(52, 199, 89, 0.16);
-  --amber-soft: rgba(255, 159, 10, 0.18);
-  --red-soft: rgba(255, 59, 48, 0.16);
+  /* Accent (warm orange) + status */
+  --accent: #fb6a1a;
+  --accent-press: #e85c0c;
+  --accent-soft: rgba(251, 106, 26, 0.16);
+  --accent-grad: linear-gradient(135deg, #fb8a2a 0%, #e85c0c 100%);
+  --accent-grad-hover: linear-gradient(135deg, #fc9a3f 0%, #f0570c 100%);
+  --green: #34d399;
+  --amber: #fcd34d;
+  --red: #fb7185;
+  --green-soft: rgba(52, 211, 153, 0.16);
+  --amber-soft: rgba(252, 211, 77, 0.16);
+  --red-soft: rgba(251, 113, 133, 0.16);
 
   /* Elevation */
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.06), 0 1px 1px rgba(0, 0, 0, 0.04);
-  --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.22), 0 2px 8px rgba(0, 0, 0, 0.12);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.5), 0 10px 28px rgba(0, 0, 0, 0.3);
+  --shadow-pop: 0 24px 64px rgba(0, 0, 0, 0.62), 0 4px 14px rgba(0, 0, 0, 0.45);
 
   --radius: 12px;
   --radius-sm: 8px;
 
   color: var(--text);
-  background: var(--bg-window);
+  /* Warm radial glow from the top, over the deep base. */
+  background:
+    radial-gradient(1100px 620px at 50% -14%, rgba(251, 106, 26, 0.1), transparent 62%),
+    var(--bg-window);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg-window: #1c1c1e;
-    --bg-sidebar: rgba(255, 255, 255, 0.02);
-    --surface: #2c2c2e;
-    --surface-2: #242426;
-    --surface-hover: #3a3a3c;
-
-    --text: #f5f5f7;
-    --text-2: #a1a1a6;
-    --text-3: #8e8e93;
-
-    --line: rgba(255, 255, 255, 0.1);
-    --line-strong: rgba(255, 255, 255, 0.18);
-
-    --accent: #0a84ff;
-    --accent-press: #409cff;
-    --accent-soft: rgba(10, 132, 255, 0.22);
-    --green-soft: rgba(52, 199, 89, 0.22);
-    --amber-soft: rgba(255, 159, 10, 0.22);
-    --red-soft: rgba(255, 59, 48, 0.24);
-
-    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
-    --shadow-pop: 0 16px 50px rgba(0, 0, 0, 0.55);
-  }
 }
 
 * {
@@ -133,15 +111,17 @@ button svg {
 
 button.primary,
 button.accent {
-  background: var(--accent);
+  background: var(--accent-grad);
   border-color: transparent;
   color: #fff;
   font-weight: 600;
+  box-shadow: 0 4px 16px rgba(251, 106, 26, 0.32);
 }
 
 button.primary:hover:not(:disabled),
 button.accent:hover:not(:disabled) {
-  background: var(--accent-press);
+  background: var(--accent-grad-hover);
+  box-shadow: 0 6px 20px rgba(251, 106, 26, 0.42);
 }
 
 button.danger {
@@ -171,30 +151,19 @@ button.danger:hover:not(:disabled) {
 }
 
 .topbar {
+  /* Empty draggable strip that keeps the macOS traffic lights clear; the brand
+     moved to the sidebar footer. Stays draggable via -webkit-app-region. */
   -webkit-app-region: drag;
-  align-items: center;
-  display: flex;
-  justify-content: space-between;
-  /* Sticky top + opaque background so scrolled content doesn't bleed into the traffic-lights area */
-  position: sticky;
-  top: 0;
-  z-index: 20;
-  margin: 0 -22px 16px;
-  padding: 14px 22px 12px 64px; /* padding-left leaves room for the macOS traffic lights */
-  min-height: 34px;
-  background: var(--bg-window);
-  border-bottom: 1px solid var(--line);
+  flex: none;
+  margin: 0 -22px 10px;
+  min-height: 38px;
+  background: transparent;
 }
 
 .topbar button {
   -webkit-app-region: no-drag;
 }
 
-.topbar h1 {
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: -0.01em;
-}
 
 .topbar .sub {
   color: var(--text-3);
@@ -306,13 +275,73 @@ button.danger:hover:not(:disabled) {
 }
 
 .sidebar {
-  align-content: start;
   background: var(--bg-sidebar);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* Tool tabs — scroll only when too tall; the footer stays pinned at the bottom. */
+.sidebarNav {
+  align-content: start;
   display: grid;
   gap: 4px;
-  /* Stays put while the panel scrolls; only scrolls itself when taller than the viewport. */
+  flex: 1;
   min-height: 0;
   overflow-y: auto;
+}
+
+.sidebarFoot {
+  align-items: center;
+  display: flex;
+  gap: 9px;
+  margin-top: 8px;
+  padding: 10px 8px 2px;
+  border-top: 1px solid var(--line);
+}
+
+.footLogo {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 7px;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
+}
+
+.footMeta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.footMeta strong {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.footMeta small {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.footBy {
+  align-self: flex-start;
+  margin-top: 3px;
+  padding: 0;
+  min-height: 0;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.footBy:hover:not(:disabled) {
+  background: none;
+  text-decoration: underline;
 }
 
 .toolTab {
@@ -343,9 +372,10 @@ button.danger:hover:not(:disabled) {
 }
 
 .toolTab.selected {
-  background: var(--accent);
+  background: var(--accent-grad);
   border-color: transparent;
   color: #fff;
+  box-shadow: 0 4px 16px rgba(251, 106, 26, 0.3);
 }
 
 .toolTab.selected small {

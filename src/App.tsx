@@ -18,8 +18,11 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./tauri";
 import { UsageView } from "./UsageView";
+import logoUrl from "./assets/logo.svg";
 import type { Account, AddAccountInput, AppSnapshot, ToolId, ToolStatus } from "./types";
 
 const toolDescriptions: Record<ToolId, string> = {
@@ -49,6 +52,13 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [switchNotice, setSwitchNotice] = useState<string | null>(null);
   const [autoSwitchBanner, setAutoSwitchBanner] = useState<string | null>(null);
+  const [version, setVersion] = useState("");
+
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => {});
+  }, []);
 
   const load = useCallback(async () => {
     setBusy("load");
@@ -141,14 +151,7 @@ export function App() {
 
   return (
     <main className="shell">
-      <header className="topbar" data-tauri-drag-region>
-        <div>
-          <h1>AI Account Switcher</h1>
-        </div>
-        <button className="iconButton" onClick={refresh} disabled={busy !== null} title="Refresh quota for the selected tool">
-          {busy === "refresh" || busy === "load" ? <Loader2 className="spin" /> : <RefreshCw />}
-        </button>
-      </header>
+      <header className="topbar" data-tauri-drag-region />
 
       {!snapshot.disclaimerAccepted && (
         <section className="notice">
@@ -190,30 +193,47 @@ export function App() {
 
       <div className="workspace">
         <aside className="sidebar">
-          {snapshot.tools.map((tool) => (
+          <div className="sidebarNav">
+            {snapshot.tools.map((tool) => (
+              <button
+                className={`toolTab ${view === "accounts" && tool.id === selectedTool ? "selected" : ""}`}
+                key={tool.id}
+                onClick={() => {
+                  setView("accounts");
+                  setSelectedTool(tool.id);
+                }}
+              >
+                <span>{tool.name}</span>
+                <small>{tool.installed ? activeLabel(tool) : "Tool not installed"}</small>
+              </button>
+            ))}
+            <div className="sideDivider" />
             <button
-              className={`toolTab ${view === "accounts" && tool.id === selectedTool ? "selected" : ""}`}
-              key={tool.id}
-              onClick={() => {
-                setView("accounts");
-                setSelectedTool(tool.id);
-              }}
+              className={`toolTab ${view === "usage" ? "selected" : ""}`}
+              onClick={() => setView("usage")}
             >
-              <span>{tool.name}</span>
-              <small>{tool.installed ? activeLabel(tool) : "Tool not installed"}</small>
+              <span className="usageTabLabel">
+                <BarChart3 />
+                Usage
+              </span>
+              <small>Token &amp; cost</small>
             </button>
-          ))}
-          <div className="sideDivider" />
-          <button
-            className={`toolTab ${view === "usage" ? "selected" : ""}`}
-            onClick={() => setView("usage")}
-          >
-            <span className="usageTabLabel">
-              <BarChart3 />
-              Usage
-            </span>
-            <small>Token &amp; cost</small>
-          </button>
+          </div>
+
+          <div className="sidebarFoot">
+            <img className="footLogo" src={logoUrl} alt="" />
+            <div className="footMeta">
+              <strong>AI Account Switcher</strong>
+              <small>{version ? `v${version}` : ""}</small>
+              <button
+                className="footBy"
+                onClick={() => void openUrl("https://hoangphan.blog/").catch(() => {})}
+                title="https://hoangphan.blog/"
+              >
+                Powered by Hoàng Phan
+              </button>
+            </div>
+          </div>
         </aside>
 
         {view === "usage" && <UsageView />}
