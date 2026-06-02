@@ -6,6 +6,12 @@ Built with [Tauri](https://tauri.app) (Rust + React).
 
 > ⚠️ Using multiple subscription accounts may violate a provider's terms of service. This app only manages logins locally on your machine — use at your own discretion.
 
+## ⬇️ Download
+
+Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/ai-switcher/releases/latest) page — download the `.dmg` under **Assets**, open it, and drag **AI Account Switcher** to Applications.
+
+> First launch only: the app is unsigned, so right-click it → **Open** (or run `xattr -cr "/Applications/AI Account Switcher.app"`). See [Install](#install) below.
+
 ## Features
 
 - **One window for every tool.** Log in, switch, rename, and remove accounts per tool.
@@ -25,7 +31,7 @@ Built with [Tauri](https://tauri.app) (Rust + React).
 
 ## Install
 
-1. Download the latest `.dmg` from the [Releases](../../releases) page.
+1. Download the latest `.dmg` from the [Releases](https://github.com/hoangpm96/ai-switcher/releases/latest) page.
 2. Open the `.dmg` and drag **AI Account Switcher** to Applications.
 
 The app is **not code-signed** (no paid Apple Developer account), so macOS Gatekeeper will warn on first launch. To open it:
