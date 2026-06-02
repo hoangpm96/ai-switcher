@@ -19,12 +19,16 @@ use crate::models::{
 };
 use crate::pricing::{load_price_table, PriceTable};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Cap on sessions returned per tool in the report (newest first).
 const MAX_SESSIONS: usize = 30;
+
+/// Bump when the cache format or scan logic changes in a way that invalidates old aggregates
+/// (e.g. the symlink-dedup fix) so a stale cache is discarded instead of double-counting.
+const CACHE_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // On-disk incremental cache
@@ -33,7 +37,10 @@ const MAX_SESSIONS: usize = 30;
 #[derive(Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UsageCache {
-    /// JSONL file path → read cursor (so each line is only counted once).
+    /// Format version — a mismatch discards the cache (see CACHE_VERSION).
+    #[serde(default)]
+    version: u32,
+    /// Canonical JSONL file path → read cursor (so each line is only counted once).
     files: BTreeMap<String, FileCursor>,
     /// "tool|YYYY-MM-DD|model" → token totals (drives daily + per-model views).
     buckets: BTreeMap<String, TokenBreakdown>,
@@ -69,10 +76,16 @@ struct SessionRecord {
 }
 
 fn load_cache(path: &Path) -> UsageCache {
-    std::fs::read_to_string(path)
+    let cache: UsageCache = std::fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Discard a cache written by an older version (its aggregates may be wrong).
+    if cache.version == CACHE_VERSION {
+        cache
+    } else {
+        UsageCache::default()
+    }
 }
 
 fn save_cache(path: &Path, cache: &UsageCache) {
@@ -97,17 +110,29 @@ pub fn build_report(
 ) -> UsageReport {
     let mut cache = load_cache(cache_path);
 
+    // The app symlinks the shared session store across profile dirs + the machine default, so the
+    // same physical JSONL is reachable from several config dirs. Resolve symlinks and scan each
+    // real file once, or its tokens get counted 2-3x.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
     for dir in claude_dirs {
         for file in collect_jsonl(&dir.join("projects"), "") {
-            scan_claude_file(&file, &mut cache);
+            let real = std::fs::canonicalize(&file).unwrap_or(file);
+            if seen.insert(real.clone()) {
+                scan_claude_file(&real, &mut cache);
+            }
         }
     }
     for dir in codex_dirs {
         for file in collect_jsonl(&dir.join("sessions"), "rollout-") {
-            scan_codex_file(&file, &mut cache);
+            let real = std::fs::canonicalize(&file).unwrap_or(file);
+            if seen.insert(real.clone()) {
+                scan_codex_file(&real, &mut cache);
+            }
         }
     }
 
+    cache.version = CACHE_VERSION;
     save_cache(cache_path, &cache);
 
     let prices = load_price_table(price_cache_path);
@@ -605,6 +630,38 @@ mod tests {
         assert_eq!(total.cache_read, 90); // 40 + 50
         assert_eq!(total.output, 30); // 10 + 20
         assert_eq!(total.input, 160); // (100-40) + (150-50) = 60 + 100
+    }
+
+
+    #[test]
+    fn dedups_symlinked_files_across_config_dirs() {
+        // The shared-session symlinks make one physical file reachable from several config dirs.
+        // build_report must count it once, not once per dir.
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("aisw_dedup_{}", std::process::id()));
+        let default_projects = base.join("default/projects/sub");
+        let profile_projects = base.join("profile/projects");
+        std::fs::create_dir_all(&default_projects).unwrap();
+        std::fs::create_dir_all(&profile_projects).unwrap();
+
+        let real = default_projects.join("conv.jsonl");
+        let line = r#"{"message":{"model":"claude-x","id":"m1","role":"assistant","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-06-01T10:00:00.000Z"}"#;
+        std::fs::write(&real, format!("{line}\n")).unwrap();
+        // The profile's projects dir is a symlink to the default's (mirrors link_shared_sessions).
+        let _ = std::fs::remove_dir(&profile_projects);
+        symlink(base.join("default/projects"), &profile_projects).unwrap();
+
+        let cache = base.join("usage.json");
+        let prices = base.join("prices.json"); // missing → no cost, fine for token assert
+        let claude_dirs = vec![base.join("default"), base.join("profile")];
+        let report = build_report(&cache, &prices, &claude_dirs, &[]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        // Counted once: 100 input + 50 output, not doubled.
+        assert_eq!(claude.total.input, 100);
+        assert_eq!(claude.total.output, 50);
+        assert_eq!(claude.sessions.len(), 1);
     }
 
     #[test]

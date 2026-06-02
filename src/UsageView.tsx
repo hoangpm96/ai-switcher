@@ -10,6 +10,7 @@ export function UsageView() {
   const [report, setReport] = useState<UsageReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string>("claude");
 
   const load = useCallback(async () => {
     setBusy(true);
@@ -62,9 +63,28 @@ export function UsageView() {
         </div>
       )}
 
-      {report?.tools.map((tool) => (
-        <ToolUsageSection key={tool.toolId} tool={tool} priceUnavailable={report.priceStatus === "unavailable"} />
-      ))}
+      {report && (
+        <>
+          <div className="usageTabs">
+            {report.tools.map((tool) => (
+              <button
+                key={tool.toolId}
+                className={tool.toolId === selected ? "selected" : ""}
+                onClick={() => setSelected(tool.toolId)}
+              >
+                {tool.displayName}
+                {tool.estimate && <span className="estimateMini">≈ est</span>}
+              </button>
+            ))}
+          </div>
+          {(() => {
+            const tool = report.tools.find((t) => t.toolId === selected) ?? report.tools[0];
+            return tool ? (
+              <ToolUsageSection tool={tool} priceUnavailable={report.priceStatus === "unavailable"} />
+            ) : null;
+          })()}
+        </>
+      )}
 
       {!report && !error && (
         <div className="empty">
@@ -91,19 +111,7 @@ function PriceStatus({ report }: { report: UsageReport | null }) {
 function ToolUsageSection({ tool, priceUnavailable }: { tool: ToolUsage; priceUnavailable: boolean }) {
   const empty = total(tool.total) === 0;
   return (
-    <div className="usageTool">
-      <div className="usageToolHead">
-        <h3>{tool.displayName}</h3>
-        {tool.estimate && (
-          <span
-            className="badge warn estimateBadge"
-            title="Claude Code's token logs are inaccurate (often far lower than reality). These numbers are only a rough estimate."
-          >
-            ≈ estimate
-          </span>
-        )}
-      </div>
-
+    <div className="usageToolBody">
       {empty ? (
         <div className="usageEmpty">
           <BarChart3 />
@@ -140,6 +148,7 @@ function StatTile({ label, value, sub, big }: { label: string; value: string; su
 /** Simple inline SVG bar chart of the last CHART_DAYS days (cost when priced, else tokens). */
 function TrendChart({ daily, priceUnavailable }: { daily: DayUsage[]; priceUnavailable: boolean }) {
   const days = daily.slice(-CHART_DAYS);
+  const [hover, setHover] = useState<number | null>(null);
   if (days.length === 0) return null;
 
   const useCost = !priceUnavailable && days.some((d) => d.costUsd != null);
@@ -151,21 +160,51 @@ function TrendChart({ daily, priceUnavailable }: { daily: DayUsage[]; priceUnava
   const gap = 1.5;
   const barW = (width - gap * (days.length - 1)) / days.length;
 
+  const active = hover != null ? days[hover] : null;
+
   return (
     <div className="usageChart">
       <div className="usageChartHead">
         <span>{useCost ? "Daily cost" : "Daily tokens"} · last {days.length} days</span>
+        {active ? (
+          <span className="usageChartReadout">
+            <strong>{active.date}</strong>
+            {" · "}
+            {formatTokens(total(active.tokens))} tokens
+            {" · "}
+            {formatUsd(active.costUsd)}
+          </span>
+        ) : (
+          <span className="usageChartHint">hover a bar for the day</span>
+        )}
       </div>
-      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" className="usageChartSvg" role="img">
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        className="usageChartSvg"
+        role="img"
+        onMouseLeave={() => setHover(null)}
+      >
         {days.map((d, i) => {
           const v = valueOf(d);
           const h = Math.max((v / max) * height, v > 0 ? 0.6 : 0);
           const x = i * (barW + gap);
-          const label = `${d.date}: ${useCost ? formatUsd(d.costUsd) : formatTokens(total(d.tokens))}`;
+          const label = `${d.date} · ${formatTokens(total(d.tokens))} tokens · ${formatUsd(d.costUsd)}`;
           return (
-            <rect key={d.date} x={x} y={height - h} width={barW} height={h} rx={0.5} className="usageBar">
-              <title>{label}</title>
-            </rect>
+            <g key={d.date} onMouseEnter={() => setHover(i)}>
+              {/* full-height hit area so thin bars are still easy to hover */}
+              <rect x={x} y={0} width={barW + gap} height={height} fill="transparent" />
+              <rect
+                x={x}
+                y={height - h}
+                width={barW}
+                height={h}
+                rx={0.5}
+                className={`usageBar ${hover === i ? "active" : ""}`}
+              >
+                <title>{label}</title>
+              </rect>
+            </g>
           );
         })}
       </svg>

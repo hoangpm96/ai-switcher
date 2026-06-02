@@ -986,9 +986,6 @@ button.danger:hover:not(:disabled) {
   font-size: 16px;
   font-weight: 700;
 }
-.estimateBadge {
-  cursor: help;
-}
 
 .usageEmpty {
   align-items: center;
@@ -1043,10 +1040,62 @@ button.danger:hover:not(:disabled) {
   margin-bottom: 16px;
 }
 .usageChartHead {
+  align-items: baseline;
   color: var(--text-2);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   font-size: 12px;
   font-weight: 600;
+  justify-content: space-between;
   margin-bottom: 6px;
+}
+.usageChartReadout {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+.usageChartReadout strong {
+  color: var(--accent);
+}
+.usageChartHint {
+  color: var(--text-3);
+  font-weight: 400;
+}
+.usageBar.active {
+  fill: var(--accent-press);
+}
+
+/* Usage sub-tabs (Claude / Codex) */
+.usageTabs {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 3px;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  margin-bottom: 16px;
+  padding: 3px;
+}
+.usageTabs button {
+  background: transparent;
+  border-color: transparent;
+  font-size: 13px;
+  font-weight: 600;
+  justify-content: center;
+  min-height: 32px;
+}
+.usageTabs button.selected {
+  background: var(--surface);
+  border-color: var(--line);
+  box-shadow: var(--shadow-card);
+}
+.usageTabs .estimateMini {
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 6px;
 }
 .usageChartSvg {
   width: 100%;
