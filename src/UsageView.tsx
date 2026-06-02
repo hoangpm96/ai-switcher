@@ -165,8 +165,8 @@ function StatTile({ label, value, sub, big }: { label: string; value: string; su
 
 /** Simple inline SVG bar chart of the last CHART_DAYS days (cost when priced, else tokens). */
 // Totals/tables follow the selected range, but the bar chart stays readable by showing at most
-// the 30 most recent days (so 90d / all time don't render hundreds of slivers).
-const CHART_MAX_BARS = 30;
+// the 45 most recent days (so 90d / all time don't render hundreds of slivers).
+const CHART_MAX_BARS = 45;
 
 function TrendChart({ daily, priceUnavailable }: { daily: DayUsage[]; priceUnavailable: boolean }) {
   const days = daily.slice(-CHART_MAX_BARS);
