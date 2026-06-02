@@ -4,37 +4,43 @@ import { AlertTriangle, BarChart3, Loader2, RefreshCw } from "lucide-react";
 import { api } from "./tauri";
 import type { DayUsage, ModelUsage, SessionUsage, TokenBreakdown, ToolUsage, UsageReport } from "./types";
 
-const CHART_DAYS = 30;
+const RANGES: { label: string; days: number }[] = [
+  { label: "7d", days: 7 },
+  { label: "30d", days: 30 },
+  { label: "90d", days: 90 },
+  { label: "All", days: 0 },
+];
 
 export function UsageView() {
   const [report, setReport] = useState<UsageReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string>("claude");
+  const [range, setRange] = useState(30);
 
   const load = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
-      setReport(await api.getUsage());
+      setReport(await api.getUsage(range));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
-  }, []);
+  }, [range]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  // The background poller pushes a fresh report every 5 minutes.
+  // The background poller refreshes the cache every 5 minutes → refetch with the current range.
   useEffect(() => {
-    const unlisten = listen<UsageReport>("usage-changed", (event) => setReport(event.payload));
+    const unlisten = listen("usage-changed", () => void load());
     return () => {
       void unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [load]);
 
   return (
     <section className="panel">
@@ -44,6 +50,18 @@ export function UsageView() {
           <PriceStatus report={report} />
         </div>
         <div className="actions">
+          <div className="usageRange" role="group" aria-label="Time range">
+            {RANGES.map((r) => (
+              <button
+                key={r.days}
+                className={range === r.days ? "selected" : ""}
+                onClick={() => setRange(r.days)}
+                disabled={busy}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
           <button onClick={load} disabled={busy}>
             {busy ? <Loader2 className="spin" /> : <RefreshCw />}
             Refresh
@@ -147,7 +165,7 @@ function StatTile({ label, value, sub, big }: { label: string; value: string; su
 
 /** Simple inline SVG bar chart of the last CHART_DAYS days (cost when priced, else tokens). */
 function TrendChart({ daily, priceUnavailable }: { daily: DayUsage[]; priceUnavailable: boolean }) {
-  const days = daily.slice(-CHART_DAYS);
+  const days = daily;
   const [hover, setHover] = useState<number | null>(null);
   if (days.length === 0) return null;
 

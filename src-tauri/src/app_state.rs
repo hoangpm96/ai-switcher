@@ -103,12 +103,13 @@ impl ManagedState {
     /// Build the token-usage report (Usage tab): incrementally scan every Claude/Codex config
     /// dir on the machine, aggregate per tool, and price it via the LiteLLM cache. Antigravity
     /// is excluded (no token logs). Cheap to call repeatedly thanks to the per-file cursor cache.
-    pub fn usage_report(&self) -> UsageReport {
+    pub fn usage_report(&self, range_days: u32) -> UsageReport {
         crate::usage::build_report(
             &self.store.usage_cache_path(),
             &self.store.price_cache_path(),
             &self.config_dirs(&ToolId::Claude),
             &self.config_dirs(&ToolId::Codex),
+            range_days,
         )
     }
 

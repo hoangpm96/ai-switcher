@@ -102,11 +102,13 @@ fn save_cache(path: &Path, cache: &UsageCache) {
 // ---------------------------------------------------------------------------
 
 /// Scan the given config dirs incrementally, persist the cache, then build the report.
+/// `range_days` limits the totals/chart/tables to the last N local days (0 = all time).
 pub fn build_report(
     cache_path: &Path,
     price_cache_path: &Path,
     claude_dirs: &[PathBuf],
     codex_dirs: &[PathBuf],
+    range_days: u32,
 ) -> UsageReport {
     let mut cache = load_cache(cache_path);
 
@@ -136,7 +138,7 @@ pub fn build_report(
     save_cache(cache_path, &cache);
 
     let prices = load_price_table(price_cache_path);
-    build_report_from_cache(&cache, &prices)
+    build_report_from_cache(&cache, &prices, range_days)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,11 +468,12 @@ fn sum_cost(items: impl Iterator<Item = Option<f64>>) -> Option<f64> {
 // Report building
 // ---------------------------------------------------------------------------
 
-fn build_report_from_cache(cache: &UsageCache, prices: &PriceTable) -> UsageReport {
+fn build_report_from_cache(cache: &UsageCache, prices: &PriceTable, range_days: u32) -> UsageReport {
     let today = today_local();
+    let cutoff = cutoff_date(range_days);
     let tools = [ToolId::Claude, ToolId::Codex]
         .into_iter()
-        .map(|tool_id| tool_usage(cache, prices, &tool_id, &today))
+        .map(|tool_id| tool_usage(cache, prices, &tool_id, &today, cutoff.as_deref()))
         .collect();
 
     UsageReport {
@@ -481,11 +484,31 @@ fn build_report_from_cache(cache: &UsageCache, prices: &PriceTable) -> UsageRepo
     }
 }
 
+/// The earliest local date to include for a range, or None for all time. `range_days == 7` means
+/// today plus the previous 6 days.
+fn cutoff_date(range_days: u32) -> Option<String> {
+    if range_days == 0 {
+        return None;
+    }
+    let today = chrono::Local::now().date_naive();
+    let cutoff = today.checked_sub_days(chrono::Days::new((range_days - 1) as u64))?;
+    Some(cutoff.format("%Y-%m-%d").to_string())
+}
+
+/// Whether a bucket/session date falls within the range. `unknown` dates are only kept for all time.
+fn in_range(date: &str, cutoff: Option<&str>) -> bool {
+    match cutoff {
+        None => true,
+        Some(cutoff) => date != "unknown" && date >= cutoff,
+    }
+}
+
 fn tool_usage(
     cache: &UsageCache,
     prices: &PriceTable,
     tool_id: &ToolId,
     today: &str,
+    cutoff: Option<&str>,
 ) -> ToolUsage {
     let tool = tool_id.as_str();
     let prefix = format!("{tool}|");
@@ -502,6 +525,10 @@ fn tool_usage(
         let _ = parts.next();
         let date = parts.next().unwrap_or("unknown").to_string();
         let model = parts.next().unwrap_or("unknown").to_string();
+
+        if !in_range(&date, cutoff) {
+            continue;
+        }
 
         total.add(tokens);
         daily.entry(date.clone()).or_default().add(tokens);
@@ -539,7 +566,7 @@ fn tool_usage(
     let mut sessions: Vec<SessionUsage> = cache
         .sessions
         .values()
-        .filter(|record| record.tool == tool)
+        .filter(|record| record.tool == tool && in_range(&record.date, cutoff))
         .map(|record| SessionUsage {
             id: record.id.clone(),
             date: record.date.clone(),
@@ -634,6 +661,43 @@ mod tests {
 
 
     #[test]
+    fn range_filter_limits_to_recent_days() {
+        let base = std::env::temp_dir().join(format!("aisw_range_{}", std::process::id()));
+        let projects = base.join("default/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let today = chrono::Local::now().date_naive();
+        let old = today.checked_sub_days(chrono::Days::new(100)).unwrap();
+        let line = |id: &str, date: chrono::NaiveDate, input: u64, output: u64| {
+            format!(
+                r#"{{"message":{{"model":"claude-x","id":"{id}","role":"assistant","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}},"timestamp":"{date}T12:00:00+00:00"}}"#
+            )
+        };
+        std::fs::write(
+            projects.join("conv.jsonl"),
+            format!("{}\n{}\n", line("m_today", today, 10, 5), line("m_old", old, 1000, 500)),
+        )
+        .unwrap();
+
+        let prices = base.join("prices.json");
+        let dirs = vec![base.join("default")];
+
+        // 7-day range → only the recent line. (Use a fresh cache per call to re-aggregate.)
+        let cache7 = base.join("usage7.json");
+        let r7 = build_report(&cache7, &prices, &dirs, &[], 7);
+        let claude7 = r7.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude7.total.total(), 15);
+
+        // All time → both lines.
+        let cacheAll = base.join("usageAll.json");
+        let rAll = build_report(&cacheAll, &prices, &dirs, &[], 0);
+        let claudeAll = rAll.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claudeAll.total.total(), 1515);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn dedups_symlinked_files_across_config_dirs() {
         // The shared-session symlinks make one physical file reachable from several config dirs.
         // build_report must count it once, not once per dir.
@@ -654,7 +718,7 @@ mod tests {
         let cache = base.join("usage.json");
         let prices = base.join("prices.json"); // missing → no cost, fine for token assert
         let claude_dirs = vec![base.join("default"), base.join("profile")];
-        let report = build_report(&cache, &prices, &claude_dirs, &[]);
+        let report = build_report(&cache, &prices, &claude_dirs, &[], 0);
         let _ = std::fs::remove_dir_all(&base);
 
         let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();

@@ -1066,6 +1066,29 @@ button.danger:hover:not(:disabled) {
   fill: var(--accent-press);
 }
 
+/* Usage time-range selector */
+.usageRange {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+}
+.usageRange button {
+  background: transparent;
+  border-color: transparent;
+  font-size: 12px;
+  font-weight: 600;
+  min-height: 28px;
+  padding: 0 10px;
+}
+.usageRange button.selected {
+  background: var(--surface);
+  border-color: var(--line);
+  box-shadow: var(--shadow-card);
+}
+
 /* Usage sub-tabs (Claude / Codex) */
 .usageTabs {
   background: var(--surface-2);

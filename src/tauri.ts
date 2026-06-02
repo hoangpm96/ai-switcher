@@ -172,5 +172,5 @@ export const api = {
   antigravityNewLogin: () => invoke<AppSnapshot>("antigravity_new_login"),
   setAutoSwitch: (enabled: boolean, threshold: number) =>
     invoke<AppSnapshot>("set_auto_switch", { enabled, threshold }),
-  getUsage: () => invoke<UsageReport>("get_usage"),
+  getUsage: (rangeDays: number) => invoke<UsageReport>("get_usage", { rangeDays }),
 };

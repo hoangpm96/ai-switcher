@@ -97,9 +97,10 @@ fn set_auto_switch(
 }
 
 /// Token usage + cost report for the Usage tab (Claude + Codex, aggregated per tool).
+/// `range_days` limits the totals to the last N local days (0 = all time).
 #[tauri::command]
-fn get_usage(state: State<'_, ManagedState>) -> UsageReport {
-    state.usage_report()
+fn get_usage(state: State<'_, ManagedState>, range_days: u32) -> UsageReport {
+    state.usage_report(range_days)
 }
 
 pub fn run() {
@@ -139,9 +140,10 @@ pub fn run() {
                 for tool_id in [ToolId::Claude, ToolId::Codex] {
                     let _ = state.refresh_tool(tool_id, Some(&handle));
                 }
-                // Keep the token-usage cache warm and push it to any open Usage tab.
-                let report = state.usage_report();
-                let _ = handle.emit("usage-changed", report);
+                // Keep the token-usage cache warm and nudge any open Usage tab to refetch
+                // (with whatever range the user has selected).
+                let _ = state.usage_report(0);
+                let _ = handle.emit("usage-changed", ());
             });
             Ok(())
         })
