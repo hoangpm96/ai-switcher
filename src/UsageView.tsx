@@ -98,7 +98,7 @@ export function UsageView() {
           {(() => {
             const tool = report.tools.find((t) => t.toolId === selected) ?? report.tools[0];
             return tool ? (
-              <ToolUsageSection tool={tool} priceUnavailable={report.priceStatus === "unavailable"} />
+              <ToolUsageSection tool={tool} range={range} priceUnavailable={report.priceStatus === "unavailable"} />
             ) : null;
           })()}
         </>
@@ -126,7 +126,7 @@ function PriceStatus({ report }: { report: UsageReport | null }) {
   return <span className="badge ok" title="LiteLLM prices loaded">Live prices</span>;
 }
 
-function ToolUsageSection({ tool, priceUnavailable }: { tool: ToolUsage; priceUnavailable: boolean }) {
+function ToolUsageSection({ tool, range, priceUnavailable }: { tool: ToolUsage; range: number; priceUnavailable: boolean }) {
   const empty = total(tool.total) === 0;
   return (
     <div className="usageToolBody">
@@ -144,7 +144,7 @@ function ToolUsageSection({ tool, priceUnavailable }: { tool: ToolUsage; priceUn
             <StatTile label="Cache read" value={formatTokens(tool.total.cacheRead)} sub="reused tokens" />
           </div>
 
-          <TrendChart daily={tool.daily} priceUnavailable={priceUnavailable} />
+          <TrendChart daily={tool.daily} range={range} priceUnavailable={priceUnavailable} />
           <ModelTable models={tool.byModel} />
           <SessionTable sessions={tool.sessions} />
         </>
@@ -168,9 +168,26 @@ function StatTile({ label, value, sub, big }: { label: string; value: string; su
 // the 45 most recent days (so 90d / all time don't render hundreds of slivers).
 const CHART_MAX_BARS = 45;
 
-function TrendChart({ daily, priceUnavailable }: { daily: DayUsage[]; priceUnavailable: boolean }) {
-  const days = daily.slice(-CHART_MAX_BARS);
+function TrendChart({
+  daily,
+  range,
+  priceUnavailable,
+}: {
+  daily: DayUsage[];
+  range: number;
+  priceUnavailable: boolean;
+}) {
   const [hover, setHover] = useState<number | null>(null);
+
+  // Build a continuous calendar window ending today so days with no usage still show as a 0 bar
+  // (otherwise "7d" would render fewer bars than 7 when some days went unused).
+  const windowLen = range > 0 ? Math.min(range, CHART_MAX_BARS) : CHART_MAX_BARS;
+  const byDate = new Map(daily.map((d) => [d.date, d] as const));
+  const today = localToday();
+  const days: DayUsage[] = Array.from({ length: windowLen }, (_, i) => {
+    const date = addDays(today, -(windowLen - 1 - i));
+    return byDate.get(date) ?? { date, tokens: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }, costUsd: null };
+  });
   if (days.length === 0) return null;
 
   const useCost = !priceUnavailable && days.some((d) => d.costUsd != null);
@@ -313,6 +330,23 @@ function formatUsd(n: number | null) {
   if (n == null) return "—";
   if (n > 0 && n < 0.01) return `$${n.toFixed(4)}`;
   return `$${n.toFixed(2)}`;
+}
+
+function localToday() {
+  return fmtDay(new Date());
+}
+
+function addDays(date: string, n: number) {
+  const d = new Date(`${date}T00:00:00`);
+  d.setDate(d.getDate() + n);
+  return fmtDay(d);
+}
+
+function fmtDay(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function formatDate(value: string) {
