@@ -1,0 +1,30 @@
+[package]
+name = "ai-account-switcher"
+version = "0.1.0"
+description = "Desktop account manager for AI coding tools"
+authors = ["Hoang Phan"]
+edition = "2021"
+
+[lib]
+name = "ai_account_switcher_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5.0"
+keyring = { version = "3.6", features = ["apple-native"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tauri = { version = "2.11.2", features = [] }
+tauri-plugin-dialog = "2.7.1"
+tauri-plugin-notification = "2.3.3"
+tauri-plugin-opener = "2.5.4"
+tauri-plugin-single-instance = "2.4.2"
+thiserror = "2.0"
+toml_edit = "0.22"
+uuid = { version = "1.11", features = ["v4", "serde"] }

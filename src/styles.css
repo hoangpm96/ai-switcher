@@ -1,0 +1,961 @@
+/* ============================================================
+   AI Account Switcher — native macOS look, auto light/dark
+   ============================================================ */
+
+:root {
+  /* Surfaces */
+  --bg-window: #ececee;
+  --bg-sidebar: rgba(0, 0, 0, 0.015);
+  --surface: #ffffff;
+  --surface-2: #f6f6f8;
+  --surface-hover: #f0f0f3;
+
+  /* Text */
+  --text: #1d1d1f;
+  --text-2: #6e6e73;
+  --text-3: #8e8e93;
+
+  /* Lines */
+  --line: rgba(0, 0, 0, 0.09);
+  --line-strong: rgba(0, 0, 0, 0.16);
+
+  /* Accent + status (Apple system colors) */
+  --accent: #0a84ff;
+  --accent-press: #0060df;
+  --accent-soft: rgba(10, 132, 255, 0.12);
+  --green: #34c759;
+  --amber: #ff9f0a;
+  --red: #ff3b30;
+  --green-soft: rgba(52, 199, 89, 0.16);
+  --amber-soft: rgba(255, 159, 10, 0.18);
+  --red-soft: rgba(255, 59, 48, 0.16);
+
+  /* Elevation */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.06), 0 1px 1px rgba(0, 0, 0, 0.04);
+  --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.22), 0 2px 8px rgba(0, 0, 0, 0.12);
+
+  --radius: 12px;
+  --radius-sm: 8px;
+
+  color: var(--text);
+  background: var(--bg-window);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-window: #1c1c1e;
+    --bg-sidebar: rgba(255, 255, 255, 0.02);
+    --surface: #2c2c2e;
+    --surface-2: #242426;
+    --surface-hover: #3a3a3c;
+
+    --text: #f5f5f7;
+    --text-2: #a1a1a6;
+    --text-3: #8e8e93;
+
+    --line: rgba(255, 255, 255, 0.1);
+    --line-strong: rgba(255, 255, 255, 0.18);
+
+    --accent: #0a84ff;
+    --accent-press: #409cff;
+    --accent-soft: rgba(10, 132, 255, 0.22);
+    --green-soft: rgba(52, 199, 89, 0.22);
+    --amber-soft: rgba(255, 159, 10, 0.22);
+    --red-soft: rgba(255, 59, 48, 0.24);
+
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-pop: 0 16px 50px rgba(0, 0, 0, 0.55);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+/* ---------- Buttons ---------- */
+
+button {
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 500;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 12px;
+  transition: background 0.12s ease, border-color 0.12s ease, transform 0.05s ease;
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+button svg {
+  height: 15px;
+  width: 15px;
+}
+
+button.primary,
+button.accent {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled),
+button.accent:hover:not(:disabled) {
+  background: var(--accent-press);
+}
+
+button.danger {
+  color: var(--red);
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--red-soft);
+  border-color: transparent;
+}
+
+.iconButton {
+  justify-content: center;
+  min-width: 32px;
+  padding: 0;
+}
+
+/* ---------- Shell + titlebar ---------- */
+
+.shell {
+  /* Exactly one screen tall, no whole-page scroll — sidebar & panel scroll independently. */
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0 22px 22px;
+}
+
+.topbar {
+  -webkit-app-region: drag;
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  /* Sticky top + opaque background so scrolled content doesn't bleed into the traffic-lights area */
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  margin: 0 -22px 16px;
+  padding: 14px 22px 12px 64px; /* padding-left leaves room for the macOS traffic lights */
+  min-height: 34px;
+  background: var(--bg-window);
+  border-bottom: 1px solid var(--line);
+}
+
+.topbar button {
+  -webkit-app-region: no-drag;
+}
+
+.topbar h1 {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.topbar .sub {
+  color: var(--text-3);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* ---------- Banners ---------- */
+
+.notice,
+.error,
+.toast,
+.drift {
+  align-items: center;
+  border-radius: var(--radius-sm);
+  display: flex;
+  font-size: 13px;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+}
+
+.notice {
+  background: var(--amber-soft);
+  border: 1px solid transparent;
+}
+
+.notice button {
+  margin-left: auto;
+}
+
+.error {
+  /* Floating error toast: takes no layout space, floats bottom-center (above the green toast) */
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 110;
+  margin: 0;
+  max-width: calc(100vw - 48px);
+  width: max-content;
+  transform: translateX(-50%);
+  animation: floatIn 0.18s ease forwards;
+  background: var(--red-soft);
+  border: 1px solid var(--red);
+  box-shadow: var(--shadow-pop);
+}
+
+.error svg:first-child {
+  color: var(--red);
+}
+
+.error button {
+  margin-left: 4px;
+}
+
+@keyframes floatIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 10px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+.toast {
+  /* Floating toast: takes no layout space, floats at the bottom-center of the screen */
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 100;
+  margin: 0;
+  max-width: calc(100vw - 48px);
+  width: max-content;
+  animation: toastPop 4s forwards;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-pop);
+}
+
+.toast svg {
+  color: var(--green);
+}
+
+.drift {
+  background: var(--accent-soft);
+  border: 1px solid transparent;
+}
+
+.notice svg,
+.error svg,
+.toast svg,
+.drift svg {
+  flex-shrink: 0;
+  height: 16px;
+  width: 16px;
+}
+
+/* ---------- Workspace layout ---------- */
+
+.workspace {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 220px minmax(0, 1fr);
+  /* Fill the remaining height of the shell; let the two child panes scroll. */
+  flex: 1;
+  min-height: 0;
+}
+
+.sidebar {
+  align-content: start;
+  background: var(--bg-sidebar);
+  display: grid;
+  gap: 4px;
+  /* Stays put while the panel scrolls; only scrolls itself when taller than the viewport. */
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.toolTab {
+  align-items: flex-start;
+  background: transparent;
+  border: 1px solid transparent;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  justify-content: center;
+  min-height: 54px;
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.toolTab:hover:not(.selected) {
+  background: var(--surface-hover);
+}
+
+.toolTab span {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.toolTab small {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.toolTab.selected {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+
+.toolTab.selected small {
+  color: rgba(255, 255, 255, 0.82);
+}
+
+/* ---------- Panel ---------- */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  padding: 20px;
+  /* Right pane scrolls on its own, independent of the sidebar. */
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.panelHead {
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.titleRow {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.titleRow h2 {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.status,
+.badge {
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 3px 9px;
+  white-space: nowrap;
+}
+
+.ok {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.muted {
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+.warn {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.bad {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+/* ---------- Account grid + cards ---------- */
+
+.accountGrid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+}
+
+.account {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.account.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), var(--shadow-card);
+}
+
+.account.exhausted {
+  border-color: var(--amber);
+}
+
+.accountTop {
+  align-items: flex-start;
+  display: flex;
+  justify-content: space-between;
+}
+
+.accountIdentity {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.avatar {
+  background: var(--surface-2);
+  border-radius: 50%;
+  flex: none;
+  height: 36px;
+  object-fit: cover;
+  width: 36px;
+}
+
+.avatarFallback {
+  align-items: center;
+  color: var(--text-2);
+  display: flex;
+  font-size: 15px;
+  font-weight: 600;
+  justify-content: center;
+}
+
+.accountName {
+  align-items: center;
+  display: flex;
+  gap: 7px;
+}
+
+.accountName h3 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.dot {
+  background: var(--green);
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px var(--green-soft);
+  flex-shrink: 0;
+  height: 8px;
+  width: 8px;
+}
+
+.fingerprint {
+  color: var(--text-3);
+  display: block;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+  margin-top: 3px;
+}
+
+/* Quota bars */
+
+.quotaBox {
+  display: grid;
+  gap: 12px;
+}
+
+.quotaTitle {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.quotaLine {
+  display: grid;
+  gap: 5px;
+}
+
+.quotaMeta {
+  align-items: baseline;
+  color: var(--text-2);
+  display: flex;
+  font-size: 12.5px;
+  justify-content: space-between;
+}
+
+.quotaMeta strong {
+  color: var(--text);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar {
+  background: var(--surface-2);
+  border-radius: 999px;
+  height: 7px;
+  overflow: hidden;
+}
+
+.bar span {
+  border-radius: 999px;
+  display: block;
+  height: 100%;
+  transition: width 0.3s ease;
+}
+
+.bar[data-level="low"] span {
+  background: var(--green);
+}
+
+.bar[data-level="mid"] span {
+  background: var(--amber);
+}
+
+.bar[data-level="high"] span {
+  background: var(--red);
+}
+
+.bar[data-level="unknown"] span {
+  background: var(--text-3);
+}
+
+.quotaLine small {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.quotaError {
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+.cardActions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.cardActions > button:first-child {
+  margin-right: auto;
+}
+
+/* ---------- Empty state ---------- */
+
+.empty {
+  align-items: center;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--text-3);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  grid-column: 1 / -1;
+  justify-content: center;
+  min-height: 220px;
+  padding: 24px;
+  text-align: center;
+}
+
+.empty strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.empty span {
+  font-size: 13px;
+  max-width: 320px;
+}
+
+.empty svg {
+  color: var(--text-3);
+  height: 30px;
+  width: 30px;
+}
+
+/* ---------- Modal ---------- */
+
+.modalBackdrop {
+  align-items: center;
+  background: rgb(0 0 0 / 0.32);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  position: fixed;
+  z-index: 50;
+}
+
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-pop);
+  display: grid;
+  gap: 16px;
+  padding: 22px;
+  width: min(440px, calc(100vw - 48px));
+}
+
+.modal h2 {
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.modal label {
+  display: grid;
+  font-size: 13px;
+  font-weight: 500;
+  gap: 7px;
+}
+
+.modal input {
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  min-height: 38px;
+  padding: 0 12px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.modal input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+.modalActions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+/* Segmented control */
+
+.segmented {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 3px;
+  grid-template-columns: 1fr 1fr;
+  padding: 3px;
+}
+
+.segmented button {
+  background: transparent;
+  border-color: transparent;
+  font-size: 12.5px;
+  justify-content: center;
+  min-height: 30px;
+}
+
+.segmented .selected {
+  background: var(--surface);
+  border-color: var(--line);
+  box-shadow: var(--shadow-card);
+}
+
+/* ---------- Animations ---------- */
+
+.spin {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes toastPop {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, 10px);
+  }
+  8%,
+  85% {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* Per-account launcher chip */
+.launcherRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  color: var(--muted, #8b8b9a);
+}
+.launcherRow svg {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+.launcherChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+  font-size: 12px;
+}
+.launcherChip code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.launcherChip svg {
+  width: 13px;
+  height: 13px;
+}
+.launcherChip.muted {
+  opacity: 0.7;
+}
+.hint {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted, #8b8b9a);
+  font-size: 11px;
+}
+
+/* Auto-switch bar */
+.autoSwitch {
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border, rgba(120, 120, 130, 0.25));
+  background: var(--bg-sidebar, rgba(120, 120, 130, 0.05));
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.autoSwitch.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.autoSwitchMain {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.autoSwitchIcon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.autoSwitchIcon svg {
+  width: 17px;
+  height: 17px;
+}
+.autoSwitchText {
+  flex: 1;
+  min-width: 0;
+}
+.autoSwitchText strong {
+  display: block;
+  font-size: 13.5px;
+}
+.autoSwitchText small {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted, #8b8b9a);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.autoSwitchText code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+/* Standard iOS switch (track 51×31, thumb 27) — overrides the global button */
+.switchTrack {
+  position: relative;
+  display: block;
+  box-sizing: border-box;
+  width: 51px;
+  height: 31px;
+  min-height: 0;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--border, rgba(120, 120, 130, 0.4));
+  cursor: pointer;
+  transition: background 0.18s ease;
+}
+.switchTrack.on {
+  background: var(--accent);
+}
+.switchTrack:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.switchThumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: transform 0.18s ease;
+}
+.switchTrack.on .switchThumb {
+  transform: translateX(20px);
+}
+
+.autoSwitchOpts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border, rgba(120, 120, 130, 0.18));
+  font-size: 12px;
+  color: var(--muted, #8b8b9a);
+}
+.pill {
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border, rgba(120, 120, 130, 0.3));
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+}
+.pill.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.pill:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Auto-switch banner */
+.autoBanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 16px 12px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  font-size: 13px;
+}
+.autoBanner svg {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  color: var(--accent);
+}
+.autoBanner span {
+  flex: 1;
+}
+
+/* Help icon → tooltip (thay help-text) */
+.helpDot {
+  display: inline-grid;
+  place-items: center;
+  color: var(--muted, #8b8b9a);
+  cursor: help;
+}
+.helpDot svg {
+  width: 14px;
+  height: 14px;
+}
+.helpDot:hover {
+  color: var(--accent);
+}
+.labelRow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Account waiting for login */
+.pendingLogin {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12px;
+}
+.pendingLogin svg {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}

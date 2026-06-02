@@ -1,0 +1,50 @@
+name: Release
+
+# Build a universal macOS .dmg and attach it to a GitHub Release whenever a
+# version tag (e.g. v0.1.0) is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust (Intel + Apple Silicon targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "AI Account Switcher ${{ github.ref_name }}"
+          releaseBody: |
+            macOS build (universal).
+
+            The app is not code-signed. On first launch, right-click the app → Open,
+            or run `xattr -cr "/Applications/AI Account Switcher.app"`.
+          releaseDraft: true
+          prerelease: false
+          args: --target universal-apple-darwin
