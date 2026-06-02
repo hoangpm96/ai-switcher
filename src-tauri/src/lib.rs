@@ -1,14 +1,17 @@
 mod app_state;
 mod models;
+mod pricing;
 mod quota;
 mod store;
 mod tools;
+mod usage;
 
 use app_state::ManagedState;
 use models::{
     AddAccountInput, AppSnapshot, RenameAccountInput, SetLauncherInput, SwitchAccountInput, ToolId,
+    UsageReport,
 };
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 #[tauri::command]
 fn load_snapshot(state: State<'_, ManagedState>) -> Result<AppSnapshot, String> {
@@ -93,6 +96,12 @@ fn set_auto_switch(
         .map_err(display_error)
 }
 
+/// Token usage + cost report for the Usage tab (Claude + Codex, aggregated per tool).
+#[tauri::command]
+fn get_usage(state: State<'_, ManagedState>) -> UsageReport {
+    state.usage_report()
+}
+
 pub fn run() {
     let state = ManagedState::new().expect("failed to initialize app state");
     tauri::Builder::default()
@@ -116,7 +125,8 @@ pub fn run() {
             delete_account,
             accept_disclaimer,
             antigravity_new_login,
-            set_auto_switch
+            set_auto_switch,
+            get_usage
         ])
         .setup(|app| {
             // Background poller: periodically refresh quota + auto-switch if enabled.
@@ -129,6 +139,9 @@ pub fn run() {
                 for tool_id in [ToolId::Claude, ToolId::Codex] {
                     let _ = state.refresh_tool(tool_id, Some(&handle));
                 }
+                // Keep the token-usage cache warm and push it to any open Usage tab.
+                let report = state.usage_report();
+                let _ = handle.emit("usage-changed", report);
             });
             Ok(())
         })

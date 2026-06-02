@@ -52,6 +52,21 @@ impl Store {
         self.root.join("state.json")
     }
 
+    /// Incremental token-usage cache (per-file cursors + aggregated buckets).
+    pub fn usage_cache_path(&self) -> PathBuf {
+        self.root.join("usage.json")
+    }
+
+    /// Cached copy of LiteLLM's pricing dataset (refreshed at most daily).
+    pub fn price_cache_path(&self) -> PathBuf {
+        self.root.join("litellm_prices.json")
+    }
+
+    /// The tool's accounts root (`accounts/<tool>/`), holding one dir per profile account.
+    pub fn tool_accounts_root(&self, tool_id: &ToolId) -> PathBuf {
+        self.root.join("accounts").join(tool_id.as_str())
+    }
+
     pub fn account_dir(&self, tool_id: &ToolId, account_id: &str) -> PathBuf {
         self.root
             .join("accounts")

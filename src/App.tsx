@@ -1,5 +1,6 @@
 import {
   AlertTriangle,
+  BarChart3,
   Check,
   CircleHelp,
   Copy,
@@ -18,6 +19,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api } from "./tauri";
+import { UsageView } from "./UsageView";
 import type { Account, AddAccountInput, AppSnapshot, ToolId, ToolStatus } from "./types";
 
 const toolDescriptions: Record<ToolId, string> = {
@@ -39,6 +41,7 @@ const emptySnapshot: AppSnapshot = {
 export function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [selectedTool, setSelectedTool] = useState<ToolId>("claude");
+  const [view, setView] = useState<"accounts" | "usage">("accounts");
   const [toast, setToast] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [dialog, setDialog] = useState<"add" | "rename" | "launcher" | null>(null);
@@ -189,17 +192,33 @@ export function App() {
         <aside className="sidebar">
           {snapshot.tools.map((tool) => (
             <button
-              className={`toolTab ${tool.id === selectedTool ? "selected" : ""}`}
+              className={`toolTab ${view === "accounts" && tool.id === selectedTool ? "selected" : ""}`}
               key={tool.id}
-              onClick={() => setSelectedTool(tool.id)}
+              onClick={() => {
+                setView("accounts");
+                setSelectedTool(tool.id);
+              }}
             >
               <span>{tool.name}</span>
               <small>{tool.installed ? activeLabel(tool) : "Tool not installed"}</small>
             </button>
           ))}
+          <div className="sideDivider" />
+          <button
+            className={`toolTab ${view === "usage" ? "selected" : ""}`}
+            onClick={() => setView("usage")}
+          >
+            <span className="usageTabLabel">
+              <BarChart3 />
+              Usage
+            </span>
+            <small>Token &amp; cost</small>
+          </button>
         </aside>
 
-        {currentTool && (
+        {view === "usage" && <UsageView />}
+
+        {view === "accounts" && currentTool && (
           <section className="panel">
             <div className="panelHead">
               <div>

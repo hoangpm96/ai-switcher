@@ -942,6 +942,167 @@ button.danger:hover:not(:disabled) {
   gap: 6px;
 }
 
+/* ---------- Usage tab ---------- */
+
+.sideDivider {
+  height: 1px;
+  margin: 6px 8px;
+  background: var(--line);
+}
+
+.usageTabLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.usageTabLabel svg {
+  width: 15px;
+  height: 15px;
+}
+
+.usageLead {
+  color: var(--text-2);
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin-bottom: 16px;
+  max-width: 640px;
+}
+
+.usageTool {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 16px;
+  background: var(--surface-2);
+}
+
+.usageToolHead {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.usageToolHead h3 {
+  font-size: 16px;
+  font-weight: 700;
+}
+.estimateBadge {
+  cursor: help;
+}
+
+.usageEmpty {
+  align-items: center;
+  color: var(--text-3);
+  display: flex;
+  gap: 10px;
+  font-size: 13px;
+  padding: 8px 2px;
+}
+.usageEmpty svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.usageStats {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  margin-bottom: 16px;
+}
+.statTile {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 3px;
+  padding: 10px 12px;
+}
+.statLabel {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.statValue {
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.statTile.big .statValue {
+  color: var(--accent);
+}
+.statSub {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+.usageChart {
+  margin-bottom: 16px;
+}
+.usageChartHead {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.usageChartSvg {
+  width: 100%;
+  height: 56px;
+  display: block;
+}
+.usageBar {
+  fill: var(--accent);
+}
+.usageBar:hover {
+  fill: var(--accent-press);
+}
+.usageChartAxis {
+  color: var(--text-3);
+  display: flex;
+  font-size: 10.5px;
+  justify-content: space-between;
+  margin-top: 4px;
+}
+
+.usageTable {
+  margin-bottom: 14px;
+}
+.usageTableHead {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.usageTable table {
+  border-collapse: collapse;
+  font-size: 12.5px;
+  width: 100%;
+}
+.usageTable th {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 4px 8px;
+  text-align: left;
+  text-transform: uppercase;
+}
+.usageTable td {
+  border-top: 1px solid var(--line);
+  padding: 6px 8px;
+}
+.usageTable .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.usageTable code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
+}
+
 /* Account waiting for login */
 .pendingLogin {
   display: flex;

@@ -180,3 +180,92 @@ pub struct SetLauncherInput {
     pub account_id: String,
     pub name: String,
 }
+
+// ---------------------------------------------------------------------------
+// Token usage tracking (Usage tab) — aggregates token counts + cost from the
+// CLIs' local JSONL logs. Claude's logs undercount badly (see usage.rs), so its
+// numbers are flagged `estimate: true`; Codex's cumulative token_count is accurate.
+// ---------------------------------------------------------------------------
+
+/// A split of tokens by billing category (unified across Claude + Codex).
+/// For Codex `cache_creation` is always 0 (it has no prompt-cache-write tier);
+/// `input` is the non-cached input (cached input is counted in `cache_read`).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenBreakdown {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+impl TokenBreakdown {
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_creation
+    }
+
+    pub fn add(&mut self, other: &TokenBreakdown) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_creation += other.cache_creation;
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayUsage {
+    /// Local date `YYYY-MM-DD`.
+    pub date: String,
+    pub tokens: TokenBreakdown,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    pub model: String,
+    pub tokens: TokenBreakdown,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUsage {
+    /// Short session id (the JSONL file stem).
+    pub id: String,
+    /// Local date `YYYY-MM-DD` of the last activity in the session.
+    pub date: String,
+    pub model: String,
+    pub tokens: TokenBreakdown,
+    pub cost_usd: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolUsage {
+    pub tool_id: ToolId,
+    pub display_name: String,
+    /// true = the numbers are an estimate (Claude's JSONL undercounts tokens).
+    pub estimate: bool,
+    pub total: TokenBreakdown,
+    pub total_cost_usd: Option<f64>,
+    pub today: TokenBreakdown,
+    pub today_cost_usd: Option<f64>,
+    /// Per local-day totals, oldest → newest.
+    pub daily: Vec<DayUsage>,
+    /// Per-model totals, most tokens first.
+    pub by_model: Vec<ModelUsage>,
+    /// Recent sessions, newest first (capped).
+    pub sessions: Vec<SessionUsage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageReport {
+    pub tools: Vec<ToolUsage>,
+    pub generated_at: String,
+    /// "live" (just fetched), "cached" (LiteLLM cache on disk), or "unavailable".
+    pub price_status: String,
+    pub price_updated_at: Option<String>,
+}

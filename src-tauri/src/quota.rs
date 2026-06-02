@@ -188,7 +188,7 @@ pub(crate) fn claude_version() -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn curl_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {
+pub(crate) fn curl_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {
     let mut command = Command::new("curl");
     command
         .arg("--silent")

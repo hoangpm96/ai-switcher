@@ -6,6 +6,7 @@ import type {
   SetLauncherInput,
   SwitchAccountInput,
   ToolId,
+  UsageReport,
 } from "./types";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -76,6 +77,69 @@ const demoSnapshot: AppSnapshot = {
   ],
 };
 
+const tb = (input: number, output: number, cacheRead: number, cacheCreation = 0) => ({
+  input,
+  output,
+  cacheRead,
+  cacheCreation,
+});
+
+const demoUsage: UsageReport = {
+  generatedAt: "2026-06-02T08:00:00Z",
+  priceStatus: "live",
+  priceUpdatedAt: "2026-06-02T00:00:00Z",
+  tools: [
+    {
+      toolId: "claude",
+      displayName: "Claude Code",
+      estimate: true,
+      total: tb(120_000, 480_000, 5_200_000, 1_300_000),
+      totalCostUsd: 12.84,
+      today: tb(8_000, 32_000, 410_000, 95_000),
+      todayCostUsd: 1.12,
+      daily: [
+        { date: "2026-05-28", tokens: tb(20000, 80000, 900000, 210000), costUsd: 2.1 },
+        { date: "2026-05-29", tokens: tb(15000, 60000, 700000, 160000), costUsd: 1.6 },
+        { date: "2026-05-30", tokens: tb(31000, 120000, 1300000, 320000), costUsd: 3.2 },
+        { date: "2026-05-31", tokens: tb(26000, 96000, 1100000, 260000), costUsd: 2.7 },
+        { date: "2026-06-01", tokens: tb(20000, 92000, 790000, 255000), costUsd: 2.12 },
+        { date: "2026-06-02", tokens: tb(8000, 32000, 410000, 95000), costUsd: 1.12 },
+      ],
+      byModel: [
+        { model: "claude-opus-4-8", tokens: tb(70000, 300000, 3200000, 800000), costUsd: 9.1 },
+        { model: "claude-sonnet-4-5", tokens: tb(50000, 180000, 2000000, 500000), costUsd: 3.74 },
+      ],
+      sessions: [
+        { id: "7e5d3164", date: "2026-06-02", model: "claude-opus-4-8", tokens: tb(8000, 32000, 410000, 95000), costUsd: 1.12 },
+        { id: "a1b2c3d4", date: "2026-06-01", model: "claude-sonnet-4-5", tokens: tb(12000, 40000, 380000, 120000), costUsd: 0.95 },
+      ],
+    },
+    {
+      toolId: "codex",
+      displayName: "Codex",
+      estimate: false,
+      total: tb(900_000, 240_000, 3_100_000, 0),
+      totalCostUsd: 6.42,
+      today: tb(60_000, 18_000, 210_000, 0),
+      todayCostUsd: 0.51,
+      daily: [
+        { date: "2026-05-29", tokens: tb(160000, 42000, 560000, 0), costUsd: 1.1 },
+        { date: "2026-05-30", tokens: tb(220000, 60000, 780000, 0), costUsd: 1.6 },
+        { date: "2026-05-31", tokens: tb(180000, 48000, 640000, 0), costUsd: 1.3 },
+        { date: "2026-06-01", tokens: tb(280000, 72000, 910000, 0), costUsd: 1.91 },
+        { date: "2026-06-02", tokens: tb(60000, 18000, 210000, 0), costUsd: 0.51 },
+      ],
+      byModel: [
+        { model: "gpt-5.5", tokens: tb(700000, 190000, 2400000, 0), costUsd: 5.0 },
+        { model: "gpt-5", tokens: tb(200000, 50000, 700000, 0), costUsd: 1.42 },
+      ],
+      sessions: [
+        { id: "019e887b", date: "2026-06-02", model: "gpt-5.5", tokens: tb(60000, 18000, 210000, 0), costUsd: 0.51 },
+      ],
+    },
+  ],
+};
+
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri) {
     return tauriInvoke<T>(command, args);
@@ -84,6 +148,9 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   await new Promise((resolve) => window.setTimeout(resolve, 120));
   if (command === "load_snapshot" || command === "refresh_tool") {
     return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "get_usage") {
+    return structuredClone(demoUsage) as T;
   }
   if (command === "accept_disclaimer") {
     demoSnapshot.disclaimerAccepted = true;
@@ -105,4 +172,5 @@ export const api = {
   antigravityNewLogin: () => invoke<AppSnapshot>("antigravity_new_login"),
   setAutoSwitch: (enabled: boolean, threshold: number) =>
     invoke<AppSnapshot>("set_auto_switch", { enabled, threshold }),
+  getUsage: () => invoke<UsageReport>("get_usage"),
 };

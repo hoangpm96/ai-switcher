@@ -1,6 +1,6 @@
 use crate::models::{
     Account, AccountState, AddAccountInput, AppSnapshot, RenameAccountInput, SetLauncherInput,
-    SwitchAccountInput, ToolId, ToolStatus,
+    SwitchAccountInput, ToolId, ToolStatus, UsageReport,
 };
 use crate::quota::read_quota;
 use crate::store::{normalize_account_states, Store, StoredState};
@@ -98,6 +98,33 @@ impl ManagedState {
             .lock()
             .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
         Ok(build_snapshot(&self.store, &data))
+    }
+
+    /// Build the token-usage report (Usage tab): incrementally scan every Claude/Codex config
+    /// dir on the machine, aggregate per tool, and price it via the LiteLLM cache. Antigravity
+    /// is excluded (no token logs). Cheap to call repeatedly thanks to the per-file cursor cache.
+    pub fn usage_report(&self) -> UsageReport {
+        crate::usage::build_report(
+            &self.store.usage_cache_path(),
+            &self.store.price_cache_path(),
+            &self.config_dirs(&ToolId::Claude),
+            &self.config_dirs(&ToolId::Codex),
+        )
+    }
+
+    /// Every config dir to scan for a tool: the machine default (`~/.claude`, `~/.codex`) plus
+    /// every per-account profile dir under the app's accounts root.
+    fn config_dirs(&self, tool_id: &ToolId) -> Vec<std::path::PathBuf> {
+        let mut dirs = vec![default_config_dir(tool_id)];
+        if let Ok(entries) = std::fs::read_dir(self.store.tool_accounts_root(tool_id)) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+        }
+        dirs
     }
 
     /// Scan EVERY account in `NeedsLogin`: any that already has a token (the user finished

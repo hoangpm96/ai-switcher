@@ -74,3 +74,54 @@ export interface SetLauncherInput {
   accountId: string;
   name: string;
 }
+
+// --- Token usage tracking (Usage tab) ---
+
+export interface TokenBreakdown {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheCreation: number;
+}
+
+export interface DayUsage {
+  date: string;
+  tokens: TokenBreakdown;
+  costUsd: number | null;
+}
+
+export interface ModelUsage {
+  model: string;
+  tokens: TokenBreakdown;
+  costUsd: number | null;
+}
+
+export interface SessionUsage {
+  id: string;
+  date: string;
+  model: string;
+  tokens: TokenBreakdown;
+  costUsd: number | null;
+}
+
+export interface ToolUsage {
+  toolId: ToolId;
+  displayName: string;
+  /** true = numbers are an estimate (Claude's JSONL undercounts tokens). */
+  estimate: boolean;
+  total: TokenBreakdown;
+  totalCostUsd: number | null;
+  today: TokenBreakdown;
+  todayCostUsd: number | null;
+  daily: DayUsage[];
+  byModel: ModelUsage[];
+  sessions: SessionUsage[];
+}
+
+export interface UsageReport {
+  tools: ToolUsage[];
+  generatedAt: string;
+  /** "live" | "cached" | "unavailable" */
+  priceStatus: string;
+  priceUpdatedAt: string | null;
+}
