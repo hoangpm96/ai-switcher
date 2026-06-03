@@ -1,6 +1,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
   AddAccountInput,
+  AddApiAccountInput,
   AppSnapshot,
   RenameAccountInput,
   SetLauncherInput,
@@ -152,6 +153,18 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   if (command === "get_usage") {
     return structuredClone(demoUsage) as T;
   }
+  if (command === "fetch_gateway_models") {
+    return [
+      "cx/gpt-5.5-codex",
+      "cx/gpt-5.5-codex-high",
+      "cx/gpt-5.4",
+      "kr/claude-sonnet-4.5",
+      "gc/gemini-3-pro-preview",
+    ] as T;
+  }
+  if (command === "add_api_account") {
+    return structuredClone(demoSnapshot) as T;
+  }
   if (command === "accept_disclaimer") {
     demoSnapshot.disclaimerAccepted = true;
     return structuredClone(demoSnapshot) as T;
@@ -163,6 +176,9 @@ export const api = {
   loadSnapshot: () => invoke<AppSnapshot>("load_snapshot"),
   refreshTool: (toolId: ToolId) => invoke<AppSnapshot>("refresh_tool", { toolId }),
   addAccount: (input: AddAccountInput) => invoke<AppSnapshot>("add_account", { input }),
+  addApiAccount: (input: AddApiAccountInput) => invoke<AppSnapshot>("add_api_account", { input }),
+  fetchGatewayModels: (baseUrl: string, apiKey: string) =>
+    invoke<string[]>("fetch_gateway_models", { baseUrl, apiKey }),
   renameAccount: (input: RenameAccountInput) => invoke<AppSnapshot>("rename_account", { input }),
   switchAccount: (input: SwitchAccountInput) => invoke<AppSnapshot>("switch_account", { input }),
   setLauncher: (input: SetLauncherInput) => invoke<AppSnapshot>("set_launcher", { input }),

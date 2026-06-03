@@ -95,6 +95,28 @@ impl QuotaInfo {
     }
 }
 
+/// API/proxy provider config for an account that runs a CLI tool through an external
+/// gateway (API key) instead of a subscription OAuth login. The API key itself is NOT
+/// stored here — it lives in a file inside the account's profile dir (`api_key`).
+///
+/// One account = one pinned gateway model: Codex's `/model` picker can't resolve gateway
+/// ids, so the launcher forces `-m <model>` and the account runs only this model. Use a
+/// separate account for a different model/effort.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiProvider {
+    /// Gateway base URL, e.g. `https://your-gateway.com/v1`. Models are listed at `{base_url}/models`.
+    pub base_url: String,
+    /// The gateway model id the account runs (written as `model = "…"` and forced via `-m`).
+    /// `alias` reads accounts saved by the earlier `defaultModel` schema; an unknown `modelMap`
+    /// key from that schema is simply ignored on load.
+    #[serde(alias = "defaultModel")]
+    pub model: String,
+    /// Add `--dangerously-bypass-approvals-and-sandbox` to the account's launcher. Default off.
+    #[serde(default)]
+    pub bypass: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -118,6 +140,10 @@ pub struct Account {
     /// confusing fingerprint. Computed when building the snapshot, not stored in state.json.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
+    /// Present when the account runs through an external API/proxy gateway instead of a
+    /// subscription login. Such accounts have no quota (the gateway exposes none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_provider: Option<ApiProvider>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -156,6 +182,23 @@ pub struct AddAccountInput {
 pub enum AddMode {
     Import,
     Login,
+}
+
+/// Add an account that runs the CLI through an external API/proxy gateway (no OAuth login).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddApiAccountInput {
+    pub tool_id: ToolId,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// Optional custom command (e.g. `codex-p`). Without one the account is used via the bare
+    /// command after pressing Use.
+    #[serde(default)]
+    pub launcher: Option<String>,
+    #[serde(default)]
+    pub bypass: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

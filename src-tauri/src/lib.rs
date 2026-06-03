@@ -8,8 +8,8 @@ mod usage;
 
 use app_state::ManagedState;
 use models::{
-    AddAccountInput, AppSnapshot, RenameAccountInput, SetLauncherInput, SwitchAccountInput, ToolId,
-    UsageReport,
+    AddAccountInput, AddApiAccountInput, AppSnapshot, RenameAccountInput, SetLauncherInput,
+    SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -38,6 +38,21 @@ fn add_account(
     input: AddAccountInput,
 ) -> Result<AppSnapshot, String> {
     state.add_account(&app, input).map_err(display_error)
+}
+
+#[tauri::command]
+fn add_api_account(
+    state: State<'_, ManagedState>,
+    input: AddApiAccountInput,
+) -> Result<AppSnapshot, String> {
+    state.add_api_account(input).map_err(display_error)
+}
+
+/// List the gateway's models (`{base_url}/models`) so the Add dialog can offer a default model +
+/// mapping targets. Stateless — just proxies the HTTP call.
+#[tauri::command]
+fn fetch_gateway_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
+    tools::fetch_gateway_models(&base_url, &api_key).map_err(display_error)
 }
 
 #[tauri::command]
@@ -120,6 +135,8 @@ pub fn run() {
             load_snapshot,
             refresh_tool,
             add_account,
+            add_api_account,
+            fetch_gateway_models,
             rename_account,
             switch_account,
             set_launcher,

@@ -23,7 +23,23 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./tauri";
 import { UsageView } from "./UsageView";
 import logoUrl from "./assets/logo.svg";
-import type { Account, AddAccountInput, AppSnapshot, ToolId, ToolStatus } from "./types";
+import type {
+  Account,
+  AddAccountInput,
+  AddApiAccountInput,
+  AppSnapshot,
+  ToolId,
+  ToolStatus,
+} from "./types";
+
+/** Host shown on an API account card (best-effort parse of the gateway URL). */
+function gatewayHost(baseUrl: string) {
+  try {
+    return new URL(baseUrl).host;
+  } catch {
+    return baseUrl;
+  }
+}
 
 const toolDescriptions: Record<ToolId, string> = {
   claude:
@@ -351,6 +367,11 @@ export function App() {
               setDialog(null);
             }
           }}
+          onSubmitApi={async (input) => {
+            if (await run("add", () => api.addApiAccount(input))) {
+              setDialog(null);
+            }
+          }}
         />
       )}
 
@@ -418,6 +439,7 @@ function AccountCard({
   onDelete: () => void;
 }) {
   const isAntigravity = tool.id === "antigravity";
+  const isApi = !!account.apiProvider;
   const isActive = account.id === tool.activeAccountId || account.state === "active";
   const exhausted = account.state === "exhausted";
   const needsLogin = account.state === "needs-login";
@@ -439,22 +461,37 @@ function AccountCard({
               {isActive && <span className="dot" aria-hidden />}
               <h3>{account.name}</h3>
             </div>
-            {!isAntigravity && (
-              <span
-                className="fingerprint"
-                title={account.isDefault ? undefined : account.fingerprint}
-              >
-                {account.isDefault ? "Machine default" : shortFingerprint(account.fingerprint)}
+            {isApi ? (
+              <span className="fingerprint" title={account.apiProvider!.baseUrl}>
+                via {gatewayHost(account.apiProvider!.baseUrl)}
               </span>
+            ) : (
+              !isAntigravity && (
+                <span
+                  className="fingerprint"
+                  title={account.isDefault ? undefined : account.fingerprint}
+                >
+                  {account.isDefault ? "Machine default" : shortFingerprint(account.fingerprint)}
+                </span>
+              )
             )}
           </div>
         </div>
-        <span className={`badge ${badgeClass(account.state)}`}>
-          {exhausted ? "Out of quota" : isActive ? "In use" : stateLabel(account.state)}
-        </span>
+        <div className="badgeRow">
+          {isApi && <span className="badge api">API</span>}
+          <span className={`badge ${badgeClass(account.state)}`}>
+            {exhausted ? "Out of quota" : isActive ? "In use" : stateLabel(account.state)}
+          </span>
+        </div>
       </div>
 
-      <Quota quota={account.quota} />
+      {isApi ? (
+        <p className="apiMeta">
+          Model <code>{account.apiProvider!.model}</code>
+        </p>
+      ) : (
+        <Quota quota={account.quota} />
+      )}
 
       {needsLogin && (
         <div className="pendingLogin">
@@ -621,15 +658,56 @@ function AddDialog({
   tool,
   onClose,
   onSubmit,
+  onSubmitApi,
 }: {
   tool: ToolStatus;
   onClose: () => void;
   onSubmit: (input: AddAccountInput) => Promise<void>;
+  onSubmitApi: (input: AddApiAccountInput) => Promise<void>;
 }) {
   const isCli = tool.id !== "antigravity";
+  // API/proxy accounts are supported for the CLI tools (Codex + Claude Code).
+  const canApi = tool.id === "codex" || tool.id === "claude";
+  const bypassFlag =
+    tool.id === "claude"
+      ? "--dangerously-skip-permissions"
+      : "--dangerously-bypass-approvals-and-sandbox";
+  const [kind, setKind] = useState<"login" | "api">("login");
+  const isApi = canApi && kind === "api";
+
   const [name, setName] = useState("");
   const [launcher, setLauncher] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+
+  // API-mode state.
+  const [baseUrl, setBaseUrl] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [models, setModels] = useState<string[]>([]);
+  const [fetching, setFetching] = useState(false);
+  const [model, setModel] = useState("");
+  const [bypass, setBypass] = useState(false);
+
+  const fetchModels = async () => {
+    if (!baseUrl.trim().startsWith("https://")) {
+      setMessage("Gateway URL must start with https://");
+      return;
+    }
+    if (!apiKey.trim()) {
+      setMessage("API key is required");
+      return;
+    }
+    setMessage(null);
+    setFetching(true);
+    try {
+      const list = await api.fetchGatewayModels(baseUrl.trim(), apiKey.trim());
+      setModels(list);
+      if (list.length > 0 && !model) setModel(list[0]);
+    } catch (err) {
+      setMessage(errorMessage(err));
+    } finally {
+      setFetching(false);
+    }
+  };
 
   const submit = async () => {
     if (name.trim().length > 20) {
@@ -648,10 +726,54 @@ function AddDialog({
     });
   };
 
+  const submitApi = async () => {
+    if (name.trim().length > 20) {
+      setMessage("Account name is limited to 20 characters");
+      return;
+    }
+    if (models.length === 0) {
+      setMessage("Fetch the gateway models first");
+      return;
+    }
+    if (!model) {
+      setMessage("Pick a model");
+      return;
+    }
+    await onSubmitApi({
+      toolId: tool.id,
+      name: name.trim(),
+      baseUrl: baseUrl.trim(),
+      apiKey: apiKey.trim(),
+      model,
+      launcher: launcher.trim() || undefined,
+      bypass,
+    });
+  };
+
   return (
     <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
       <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
         <h2>{isCli ? `Add ${tool.name} account` : "Save the signed-in Antigravity IDE account"}</h2>
+
+        {canApi && (
+          <div className="kindToggle">
+            <button
+              type="button"
+              className={kind === "login" ? "active" : ""}
+              onClick={() => setKind("login")}
+            >
+              Subscription (login)
+            </button>
+            <button
+              type="button"
+              className={kind === "api" ? "active" : ""}
+              onClick={() => setKind("api")}
+            >
+              API / Proxy
+            </button>
+          </div>
+        )}
+
         <label>
           Account name
           <input
@@ -662,7 +784,8 @@ function AddDialog({
             placeholder="Auto-generated if left blank"
           />
         </label>
-        {isCli && (
+
+        {isCli && !isApi && (
           <label>
             <span className="labelRow">
               Custom command (required)
@@ -680,6 +803,89 @@ function AddDialog({
             />
           </label>
         )}
+
+        {isApi && (
+          <>
+            <label>
+              Gateway URL
+              <input
+                value={baseUrl}
+                onChange={(event) => setBaseUrl(event.target.value)}
+                placeholder="https://your-gateway.com/v1"
+              />
+            </label>
+            <label>
+              API key
+              <input
+                type="password"
+                value={apiKey}
+                onChange={(event) => setApiKey(event.target.value)}
+                placeholder="sk-…"
+              />
+            </label>
+            <button type="button" className="fetchModels" onClick={fetchModels} disabled={fetching}>
+              {fetching ? <Loader2 className="spin" /> : <RefreshCw />}
+              {models.length > 0 ? `Models loaded (${models.length})` : "Fetch models"}
+            </button>
+
+            {models.length > 0 && (
+              <>
+                <label>
+                  <span className="labelRow">
+                    Model (required)
+                    <span
+                      className="helpDot"
+                      title="The gateway model this account runs. The CLI's model picker can't switch gateway models — add a separate account for a different model."
+                    >
+                      <CircleHelp />
+                    </span>
+                  </span>
+                  <select value={model} onChange={(event) => setModel(event.target.value)}>
+                    {models.map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <p className="hint">
+                  One account = one model. The gateway only knows its own model ids — for another
+                  model, add another account.
+                </p>
+
+                <label>
+                  <span className="labelRow">
+                    Custom command (optional)
+                    <span
+                      className="helpDot"
+                      title={`A separate command (e.g. ${tool.id}-p) to use this account in its own terminal. Forces the ${tool.id}- prefix.`}
+                    >
+                      <CircleHelp />
+                    </span>
+                  </span>
+                  <input
+                    value={launcher}
+                    onChange={(event) => setLauncher(event.target.value)}
+                    placeholder={`${tool.id}-p`}
+                  />
+                </label>
+
+                <label className="checkRow">
+                  <input
+                    type="checkbox"
+                    checked={bypass}
+                    onChange={(event) => setBypass(event.target.checked)}
+                  />
+                  <span>
+                    Bypass approvals &amp; sandbox in the custom command
+                    <small>Adds {bypassFlag}. Off by default.</small>
+                  </span>
+                </label>
+              </>
+            )}
+          </>
+        )}
+
         {!isCli && (
           <p className="hint">
             Make sure Antigravity IDE is signed into the account you want to save, then click Save.
@@ -690,8 +896,8 @@ function AddDialog({
         {message && <p className="quotaError">{message}</p>}
         <div className="modalActions">
           <button onClick={onClose}>Cancel</button>
-          <button className="primary" onClick={submit}>
-            {isCli ? "Create & login" : "Save this account"}
+          <button className="primary" onClick={isApi ? submitApi : submit}>
+            {isApi ? "Create account" : isCli ? "Create & login" : "Save this account"}
           </button>
         </div>
       </section>

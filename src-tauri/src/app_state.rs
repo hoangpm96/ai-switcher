@@ -1,15 +1,16 @@
 use crate::models::{
-    Account, AccountState, AddAccountInput, AppSnapshot, RenameAccountInput, SetLauncherInput,
-    SwitchAccountInput, ToolId, ToolStatus, UsageReport,
+    Account, AccountState, AddAccountInput, AddApiAccountInput, ApiProvider, AppSnapshot,
+    RenameAccountInput, SetLauncherInput, SwitchAccountInput, ToolId, ToolStatus, UsageReport,
 };
 use crate::quota::read_quota;
 use crate::store::{normalize_account_states, Store, StoredState};
 use crate::tools::{
     antigravity_capture, antigravity_current_token, antigravity_new_login, antigravity_open_ide,
     antigravity_quit_ide, antigravity_restore, antigravity_saved_profile, antigravity_saved_token,
-    clear_active_profile,
+    clear_active_profile, create_profile,
     default_config_dir, delete_account_files, full_launcher_name, install_shell_hook, is_installed,
     launch_profile_login, launcher_name_collides_with_system, remove_launcher, write_active_profile,
+    write_api_key_file, write_api_launcher, write_claude_proxy_settings, write_codex_proxy_config,
     write_launcher,
 };
 use anyhow::{Context, Result};
@@ -156,7 +157,10 @@ impl ManagedState {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             for account in data.accounts.iter_mut().filter(|account| {
-                account.tool_id == tool_id && account.state != AccountState::NeedsLogin
+                account.tool_id == tool_id
+                    && account.state != AccountState::NeedsLogin
+                    // API/proxy accounts have no quota to read.
+                    && account.api_provider.is_none()
             }) {
                 let config_dir = account_config_dir(&self.store, account);
                 account.quota = Some(read_quota(&account.tool_id, &config_dir));
@@ -379,6 +383,7 @@ impl ManagedState {
                 launcher_command: None,
                 is_default: false,
                 avatar_url: None,
+                api_provider: None,
             });
             self.store.save(&data)?;
         }
@@ -423,12 +428,99 @@ impl ManagedState {
                 launcher_command: Some(full_launcher),
                 is_default: false,
                 avatar_url: None,
+                api_provider: None,
             });
             self.store.save(&data)?;
         }
 
         // Background poll: login done (token appears) → NeedsLogin to Idle + read quota.
         spawn_login_watch(app.clone(), input.tool_id.clone(), id);
+        self.snapshot()
+    }
+
+    /// Add an API/proxy account (Codex): create the profile, write the gateway config + key, and an
+    /// optional custom command. No OAuth login → the account is ready (Idle) immediately, with no quota.
+    pub fn add_api_account(&self, input: AddApiAccountInput) -> Result<AppSnapshot> {
+        if !matches!(input.tool_id, ToolId::Codex | ToolId::Claude) {
+            anyhow::bail!("API/proxy accounts are only supported for Codex and Claude Code");
+        }
+        validate_name(&input.tool_id, None, &input.name, self)?;
+
+        let base_url = input.base_url.trim().to_string();
+        if !base_url.starts_with("https://") {
+            anyhow::bail!("Gateway URL must start with https://");
+        }
+        let api_key = input.api_key.trim().to_string();
+        if api_key.is_empty() {
+            anyhow::bail!("API key is required");
+        }
+        let model = input.model.trim().to_string();
+        if model.is_empty() {
+            anyhow::bail!("Pick a model");
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let name = normalized_or_default_name(&input.tool_id, &input.name, self)?;
+
+        // Validate the optional launcher up front (collision/charset) before writing anything.
+        let full_launcher = match input
+            .launcher
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(raw) => Some(self.validated_launcher(&input.tool_id, &id, raw)?),
+            None => None,
+        };
+
+        let profile = create_profile(&input.tool_id, &self.store, &id)?;
+        match input.tool_id {
+            ToolId::Codex => {
+                write_codex_proxy_config(&profile, &name, &base_url, &model)
+                    .context("Couldn't write the Codex config")?;
+                write_api_key_file(&profile, &api_key).context("Couldn't store the API key")?;
+            }
+            ToolId::Claude => {
+                write_claude_proxy_settings(&profile, &base_url, &api_key, &model)
+                    .context("Couldn't write the Claude settings")?;
+                // Skip the first-run wizard so the bare command / launcher start straight into a session.
+                crate::tools::seed_onboarding(&input.tool_id, &profile);
+            }
+            ToolId::Antigravity => unreachable!("guarded above"),
+        }
+        if let Some(full) = &full_launcher {
+            write_api_launcher(&input.tool_id, &self.store, &id, full, &model, input.bypass)
+                .context("Couldn't create the account's custom command")?;
+        }
+
+        let timestamp = now();
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.accounts.push(Account {
+                id,
+                tool_id: input.tool_id.clone(),
+                name,
+                state: AccountState::Idle,
+                fingerprint: "api".to_string(),
+                created_at: timestamp.clone(),
+                updated_at: timestamp,
+                last_used_at: None,
+                // API/proxy gateways expose no quota — hide the bars.
+                quota: None,
+                launcher_command: full_launcher,
+                is_default: false,
+                avatar_url: None,
+                api_provider: Some(ApiProvider {
+                    base_url,
+                    model,
+                    bypass: input.bypass,
+                }),
+            });
+            self.store.save(&data)?;
+        }
         self.snapshot()
     }
 
@@ -468,21 +560,43 @@ impl ManagedState {
             anyhow::bail!("Command name is empty");
         }
         let full = self.validated_launcher(&input.tool_id, &input.account_id, raw)?;
-        let old_launcher = {
+        let (old_launcher, api) = {
             let data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            data.accounts
+            let account = data
+                .accounts
                 .iter()
                 .find(|a| a.tool_id == input.tool_id && a.id == input.account_id)
-                .context("Account not found")?
-                .launcher_command
-                .clone()
+                .context("Account not found")?;
+            (
+                account.launcher_command.clone(),
+                account
+                    .api_provider
+                    .as_ref()
+                    .map(|p| (p.model.clone(), p.bypass)),
+            )
         };
 
-        write_launcher(&input.tool_id, &self.store, &input.account_id, &full)
-            .context("Couldn't create the custom command")?;
+        // API/proxy accounts need a launcher that exports the key + pins the model (+ optional bypass).
+        match api {
+            Some((model, bypass)) => {
+                write_api_launcher(
+                    &input.tool_id,
+                    &self.store,
+                    &input.account_id,
+                    &full,
+                    &model,
+                    bypass,
+                )
+                .context("Couldn't create the custom command")?;
+            }
+            None => {
+                write_launcher(&input.tool_id, &self.store, &input.account_id, &full)
+                    .context("Couldn't create the custom command")?;
+            }
+        }
         if let Some(old) = old_launcher.filter(|old| old != &full) {
             remove_launcher(&old);
         }
@@ -727,6 +841,7 @@ fn migrate_defaults(accounts: &mut Vec<Account>) {
             launcher_command: None,
             is_default: true,
             avatar_url: None,
+            api_provider: None,
         });
     }
 }

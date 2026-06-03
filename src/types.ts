@@ -17,6 +17,15 @@ export interface QuotaInfo {
   error: string | null;
 }
 
+export interface ApiProvider {
+  /** Gateway base URL, e.g. `https://your-gateway.com/v1`. */
+  baseUrl: string;
+  /** Gateway model id the account runs (one model per account). */
+  model: string;
+  /** Add `--dangerously-bypass-approvals-and-sandbox` to the launcher. */
+  bypass: boolean;
+}
+
 export interface Account {
   id: string;
   toolId: ToolId;
@@ -33,6 +42,8 @@ export interface Account {
   isDefault: boolean;
   /** Google avatar (Antigravity only) — shown instead of the fingerprint. */
   avatarUrl?: string | null;
+  /** Present when the account runs through an external API/proxy gateway (no quota). */
+  apiProvider?: ApiProvider | null;
 }
 
 export interface ToolStatus {
@@ -56,6 +67,16 @@ export interface AddAccountInput {
   mode: "import" | "login";
   /** Custom command name (required for Claude/Codex). */
   launcher?: string;
+}
+
+export interface AddApiAccountInput {
+  toolId: ToolId;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  launcher?: string;
+  bypass: boolean;
 }
 
 export interface RenameAccountInput {

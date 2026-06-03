@@ -1222,3 +1222,101 @@ button.danger:hover:not(:disabled) {
   height: 15px;
   flex: none;
 }
+
+/* ---------- API / proxy accounts ---------- */
+
+.badgeRow {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.badge.api {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.apiMeta {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.apiMeta code {
+  background: var(--surface-2);
+  border-radius: 5px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 1px 6px;
+}
+
+/* Login / API toggle in the Add dialog — same look as .segmented */
+.kindToggle {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 3px;
+  grid-template-columns: 1fr 1fr;
+  padding: 3px;
+}
+
+.kindToggle button {
+  background: transparent;
+  border-color: transparent;
+  font-size: 12.5px;
+  justify-content: center;
+  min-height: 30px;
+}
+
+.kindToggle button.active {
+  background: var(--surface);
+  border-color: var(--line);
+  box-shadow: var(--shadow-card);
+}
+
+/* Keep a tall Add-API form usable */
+.modal {
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+}
+
+.modal select {
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  min-height: 38px;
+  padding: 0 10px;
+}
+
+.modal select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+.fetchModels {
+  justify-content: center;
+}
+
+.checkRow {
+  align-items: start;
+  display: flex;
+  font-size: 13px;
+  gap: 9px;
+}
+
+.checkRow input {
+  margin-top: 3px;
+  min-height: 0;
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.checkRow small {
+  color: var(--text-3);
+  display: block;
+  font-weight: 400;
+  margin-top: 2px;
+}

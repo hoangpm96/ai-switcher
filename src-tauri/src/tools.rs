@@ -552,6 +552,188 @@ pub fn remove_launcher(name: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// API / proxy accounts (Codex) — run the CLI through an external gateway with an API key
+// instead of a subscription OAuth login. The account is a normal profile dir, but instead
+// of `auth.json` it holds a `config.toml` (model_provider = proxy) plus an `api_key` file.
+// Switch/launcher reuse the same machinery; the only extra is exporting the API key.
+// ---------------------------------------------------------------------------
+
+/// The file holding the raw API key inside an account's profile dir (chmod 600).
+fn api_key_path(profile: &Path) -> PathBuf {
+    profile.join("api_key")
+}
+
+/// Normalize a gateway base URL: trim whitespace and any trailing slash.
+fn normalize_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_string()
+}
+
+/// List the gateway's available models, returning the `data[].id` strings. Tries `{base}/models`
+/// first, then `{base}/v1/models` (Claude's base URL often omits the `/v1` that the models
+/// endpoint needs). Reuses the app's curl helper (same as quota reads).
+pub fn fetch_gateway_models(base_url: &str, api_key: &str) -> Result<Vec<String>> {
+    let base = normalize_base_url(base_url);
+    let mut candidates = vec![format!("{base}/models")];
+    if !base.ends_with("/v1") {
+        candidates.push(format!("{base}/v1/models"));
+    }
+    let auth = format!("Bearer {}", api_key.trim());
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for url in candidates {
+        match crate::quota::curl_get(&url, &[("Authorization", auth.as_str())]) {
+            Ok(body) => {
+                let value: serde_json::Value = serde_json::from_str(&body)
+                    .context("The gateway returned an unexpected response")?;
+                let ids = value
+                    .get("data")
+                    .and_then(|data| data.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    anyhow::bail!("The gateway returned no models");
+                }
+                return Ok(ids);
+            }
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Couldn't fetch models")))
+        .context("Couldn't fetch models — check the gateway URL and API key")
+}
+
+/// Write the API key into the profile dir (owner read/write only).
+pub fn write_api_key_file(profile: &Path, api_key: &str) -> Result<()> {
+    fs::create_dir_all(profile)?;
+    let path = api_key_path(profile);
+    fs::write(&path, api_key.trim().as_bytes())?;
+    set_owner_only_permissions(&path)?;
+    Ok(())
+}
+
+/// Escape a value for a TOML basic string (between double quotes).
+fn toml_basic_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+/// Write the Codex `config.toml` for an API/proxy account: point the provider at the gateway
+/// and pin the model. `provider_name` is shown by Codex `/status`. Written once at creation;
+/// Codex may later append its own keys (project trust, etc.) — the launcher re-forces the model
+/// via `-m`, so config drift doesn't break the account.
+pub fn write_codex_proxy_config(
+    profile: &Path,
+    provider_name: &str,
+    base_url: &str,
+    model: &str,
+) -> Result<()> {
+    fs::create_dir_all(profile)?;
+    let mut toml = String::new();
+    toml.push_str("# Managed by AI Account Switcher — API/proxy account.\n");
+    toml.push_str(&format!("model = {}\n", toml_basic_string(model)));
+    toml.push_str("model_provider = \"proxy\"\n\n");
+    toml.push_str("[model_providers.proxy]\n");
+    toml.push_str(&format!("name = {}\n", toml_basic_string(provider_name)));
+    toml.push_str(&format!(
+        "base_url = {}\n",
+        toml_basic_string(&normalize_base_url(base_url))
+    ));
+    toml.push_str("wire_api = \"responses\"\n");
+    toml.push_str("env_key = \"OPENAI_API_KEY\"\n");
+    toml.push_str("supports_websockets = false\n\n");
+    toml.push_str("[notice]\n");
+    toml.push_str("hide_full_access_warning = true\n");
+    fs::write(profile.join("config.toml"), toml)?;
+    Ok(())
+}
+
+/// Write the Claude Code `settings.json` for an API/proxy account: Claude reads `env` from the
+/// config dir's settings and applies the gateway base URL, bearer token, and model. Codex uses a
+/// config.toml + key file instead; Claude is env-driven, so everything lives here.
+pub fn write_claude_proxy_settings(
+    profile: &Path,
+    base_url: &str,
+    token: &str,
+    model: &str,
+) -> Result<()> {
+    fs::create_dir_all(profile)?;
+    let settings = serde_json::json!({
+        "env": {
+            "ANTHROPIC_BASE_URL": normalize_base_url(base_url),
+            "ANTHROPIC_AUTH_TOKEN": token.trim(),
+            "ANTHROPIC_MODEL": model,
+        }
+    });
+    let path = profile.join("settings.json");
+    fs::write(&path, serde_json::to_string_pretty(&settings)?)?;
+    set_owner_only_permissions(&path)?;
+    Ok(())
+}
+
+/// Create/overwrite the launcher for an API/proxy account.
+/// - Codex: export the key + force the gateway model with `-m` (Codex rewrites `model` in config
+///   when the user touches its picker, so pinning on the command line keeps it working).
+/// - Claude: auth/base/model come from the profile's settings.json env, so the launcher only sets
+///   the config dir.
+/// `bypass` adds the tool's skip-approvals flag.
+pub fn write_api_launcher(
+    tool_id: &ToolId,
+    store: &Store,
+    account_id: &str,
+    full_name: &str,
+    model: &str,
+    bypass: bool,
+) -> Result<()> {
+    let (binary, env_name) = match tool_id {
+        ToolId::Codex => ("codex", "CODEX_HOME"),
+        ToolId::Claude => ("claude", "CLAUDE_CONFIG_DIR"),
+        ToolId::Antigravity => anyhow::bail!("Antigravity doesn't support API/proxy accounts"),
+    };
+    let real_binary = command_path(binary).context("Tool is not installed")?;
+    let profile = store.account_dir(tool_id, account_id);
+
+    // Codex pins the key + model on the command line; Claude carries them in settings.json env.
+    let key_export = match tool_id {
+        ToolId::Codex => format!(
+            "export OPENAI_API_KEY=\"$(cat {})\"\n",
+            shell_quote(&api_key_path(&profile).to_string_lossy())
+        ),
+        _ => String::new(),
+    };
+    let model_flag = match tool_id {
+        ToolId::Codex => format!(" -m {}", shell_quote(model)),
+        _ => String::new(),
+    };
+    let bypass_flag = match (tool_id, bypass) {
+        (ToolId::Codex, true) => " --dangerously-bypass-approvals-and-sandbox",
+        (ToolId::Claude, true) => " --dangerously-skip-permissions",
+        _ => "",
+    };
+
+    let dir = launcher_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(full_name);
+    let script = format!(
+        "#!/bin/sh\n{marker}\nexport {env}={dir}\n{key}exec {bin}{model}{flag} \"$@\"\n",
+        marker = LAUNCHER_MARKER,
+        env = env_name,
+        dir = shell_quote(&profile.to_string_lossy()),
+        key = key_export,
+        bin = shell_quote(&real_binary.to_string_lossy()),
+        model = model_flag,
+        flag = bypass_flag,
+    );
+    fs::write(&path, script)?;
+    set_owner_executable_permissions(&path)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // "Active" account for the BARE `claude`/`codex` commands — via a shell hook, NOT by
 // wrapping the binary. The app writes the selected profile's path into the active file;
 // an idempotent hook block in ~/.zshrc (+ ~/.bashrc if present) reads that file and
@@ -598,7 +780,7 @@ pub fn install_shell_hook(store: &Store) -> Result<()> {
         "{begin}\n\
          aisw() {{\n\
         \x20 if [ -r {claude} ]; then export CLAUDE_CONFIG_DIR=\"$(cat {claude})\"; else unset CLAUDE_CONFIG_DIR; fi\n\
-        \x20 if [ -r {codex} ]; then export CODEX_HOME=\"$(cat {codex})\"; else unset CODEX_HOME; fi\n\
+        \x20 if [ -r {codex} ]; then export CODEX_HOME=\"$(cat {codex})\"; [ -r \"$CODEX_HOME/api_key\" ] && export OPENAI_API_KEY=\"$(cat \"$CODEX_HOME/api_key\")\"; else unset CODEX_HOME; fi\n\
         \x20 [ -n \"$1\" ] && echo \"AI Account Switcher: synced the account for this terminal.\"\n\
          }}\n\
          aisw >/dev/null 2>&1\n\
@@ -865,5 +1047,18 @@ fn set_owner_executable_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_owner_executable_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Owner read/write only (0600) — for the stored API key.
+#[cfg(unix)]
+fn set_owner_only_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
