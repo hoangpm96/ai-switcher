@@ -3,8 +3,10 @@ import type {
   AddAccountInput,
   AddApiAccountInput,
   AppSnapshot,
+  DetectionReport,
   RenameAccountInput,
   SetLauncherInput,
+  SetToolSetupInput,
   SwitchAccountInput,
   ToolId,
   UsageReport,
@@ -23,6 +25,24 @@ const demoSnapshot: AppSnapshot = {
   disclaimerAccepted: false,
   autoSwitch: false,
   autoSwitchThreshold: 100,
+  toolSetups: {
+    claude: {
+      binaryPath: "/Users/demo/.local/bin/claude",
+      defaultConfigDir: "/Users/demo/.claude",
+      binarySource: "path",
+      configSource: "default",
+      validatedAt: "2026-06-08T10:00:00Z",
+      validationWarnings: [],
+    },
+    codex: {
+      binaryPath: "/opt/homebrew/bin/codex",
+      defaultConfigDir: "/Users/demo/.codex",
+      binarySource: "path",
+      configSource: "default",
+      validatedAt: "2026-06-08T10:00:00Z",
+      validationWarnings: [],
+    },
+  },
   tools: [
     {
       id: "claude",
@@ -162,6 +182,49 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
       "gc/gemini-3-pro-preview",
     ] as T;
   }
+  if (command === "detect_tool_setup" || command === "validate_tool_setup") {
+    const toolId = (args?.toolId ?? (args?.input as { toolId?: ToolId } | undefined)?.toolId ?? "claude") as ToolId;
+    const setup = demoSnapshot.toolSetups[toolId];
+    return {
+      toolId,
+      configCandidates: setup?.defaultConfigDir
+        ? [{
+            path: setup.defaultConfigDir,
+            source: setup.configSource,
+            score: 10,
+            valid: true,
+            isAppManaged: false,
+            evidence: [{ label: "demo", found: true }],
+            warnings: [],
+          }]
+        : [],
+      binaryCandidates: setup?.binaryPath
+        ? [{
+            path: setup.binaryPath,
+            resolvedPath: setup.binaryPath,
+            source: setup.binarySource,
+            score: 10,
+            valid: true,
+            isAppLauncher: false,
+            evidence: [{ label: "demo", found: true }],
+            warnings: [],
+          }]
+        : [],
+      resolution: { kind: "resolved", setup, reason: "Demo setup" },
+    } as T;
+  }
+  if (command === "set_tool_setup") {
+    const input = args?.input as SetToolSetupInput;
+    demoSnapshot.toolSetups[input.toolId] = {
+      binaryPath: input.binaryPath,
+      defaultConfigDir: input.defaultConfigDir,
+      binarySource: "manual",
+      configSource: "manual",
+      validatedAt: new Date().toISOString(),
+      validationWarnings: [],
+    };
+    return structuredClone(demoSnapshot) as T;
+  }
   if (command === "add_api_account") {
     return structuredClone(demoSnapshot) as T;
   }
@@ -175,6 +238,8 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
 export const api = {
   loadSnapshot: () => invoke<AppSnapshot>("load_snapshot"),
   refreshTool: (toolId: ToolId) => invoke<AppSnapshot>("refresh_tool", { toolId }),
+  refreshAccount: (toolId: ToolId, accountId: string) =>
+    invoke<AppSnapshot>("refresh_account", { toolId, accountId }),
   addAccount: (input: AddAccountInput) => invoke<AppSnapshot>("add_account", { input }),
   addApiAccount: (input: AddApiAccountInput) => invoke<AppSnapshot>("add_api_account", { input }),
   fetchGatewayModels: (baseUrl: string, apiKey: string) =>
@@ -188,5 +253,9 @@ export const api = {
   antigravityNewLogin: () => invoke<AppSnapshot>("antigravity_new_login"),
   setAutoSwitch: (enabled: boolean, threshold: number) =>
     invoke<AppSnapshot>("set_auto_switch", { enabled, threshold }),
+  detectToolSetup: (toolId: ToolId) => invoke<DetectionReport>("detect_tool_setup", { toolId }),
+  validateToolSetup: (input: SetToolSetupInput) =>
+    invoke<DetectionReport>("validate_tool_setup", { input }),
+  setToolSetup: (input: SetToolSetupInput) => invoke<AppSnapshot>("set_tool_setup", { input }),
   getUsage: (rangeDays: number) => invoke<UsageReport>("get_usage", { rangeDays }),
 };

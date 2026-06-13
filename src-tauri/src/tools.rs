@@ -64,7 +64,9 @@ const AG_PROFILE_KEY: &str = "antigravity.profileUrl";
 fn ag_read_key_literal(db: &Path, key: &str) -> Option<String> {
     let out = Command::new("sqlite3")
         .arg(db)
-        .arg(format!("SELECT quote(value) FROM ItemTable WHERE key='{key}';"))
+        .arg(format!(
+            "SELECT quote(value) FROM ItemTable WHERE key='{key}';"
+        ))
         .output()
         .ok()?;
     if !out.status.success() {
@@ -112,25 +114,35 @@ pub fn antigravity_capture(store: &Store, account_id: &str) -> Result<String> {
 
 /// The account's saved token (literal) — used to detect the account in use.
 pub fn antigravity_saved_token(store: &Store, account_id: &str) -> Option<String> {
-    fs::read_to_string(store.account_dir(&ToolId::Antigravity, account_id).join("oauthToken.sql"))
-        .ok()
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
+    fs::read_to_string(
+        store
+            .account_dir(&ToolId::Antigravity, account_id)
+            .join("oauthToken.sql"),
+    )
+    .ok()
+    .map(|t| t.trim().to_string())
+    .filter(|t| !t.is_empty())
 }
 
 /// Saved avatar (profileUrl literal) — identifies the Google account, used for dedup:
 /// the same account has the same avatar even if the token blob differs (captured twice at different times).
 pub fn antigravity_saved_profile(store: &Store, account_id: &str) -> Option<String> {
-    fs::read_to_string(store.account_dir(&ToolId::Antigravity, account_id).join("profileUrl.sql"))
-        .ok()
-        .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty())
+    fs::read_to_string(
+        store
+            .account_dir(&ToolId::Antigravity, account_id)
+            .join("profileUrl.sql"),
+    )
+    .ok()
+    .map(|p| p.trim().to_string())
+    .filter(|p| !p.is_empty())
 }
 
 /// The real avatar URL (with SQL quoting removed) of the Antigravity account — for display in the UI.
 pub fn antigravity_avatar_url(store: &Store, account_id: &str) -> Option<String> {
     let literal = antigravity_saved_profile(store, account_id)?;
-    let inner = literal.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))?;
+    let inner = literal
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))?;
     Some(inner.replace("''", "'"))
 }
 
@@ -248,6 +260,14 @@ pub fn is_installed(tool_id: &ToolId) -> bool {
     }
 }
 
+pub fn command_name(tool_id: &ToolId) -> &'static str {
+    match tool_id {
+        ToolId::Claude => "claude",
+        ToolId::Codex => "codex",
+        ToolId::Antigravity => "antigravity-ide",
+    }
+}
+
 pub fn launch_login(tool_id: &ToolId) -> Result<()> {
     match tool_id {
         // Claude 2.x does NOT have `claude login` — it must be `claude auth login`.
@@ -272,10 +292,15 @@ pub fn launch_login(tool_id: &ToolId) -> Result<()> {
     }
 }
 
-pub fn create_profile(tool_id: &ToolId, store: &Store, account_id: &str) -> Result<PathBuf> {
+pub fn create_profile_with_default(
+    tool_id: &ToolId,
+    store: &Store,
+    account_id: &str,
+    default_config_dir: &Path,
+) -> Result<PathBuf> {
     let profile = store.account_dir(tool_id, account_id);
     fs::create_dir_all(&profile)?;
-    link_shared_sessions(tool_id, &profile);
+    link_shared_sessions_to(tool_id, &profile, default_config_dir);
     Ok(profile)
 }
 
@@ -291,40 +316,147 @@ fn shared_session_names(tool_id: &ToolId) -> &'static [&'static str] {
     }
 }
 
+/// Config/preferences that should be shared by normal OAuth accounts of the same tool.
+/// Credentials are deliberately excluded:
+/// - Claude credentials live in macOS Keychain under the profile-dir hash.
+/// - Codex credentials live in `auth.json` / `api_key`.
+///
+/// API/proxy accounts must NOT use this list because their `settings.json` / `config.toml`
+/// contains account-specific gateway settings.
+fn shared_config_names(tool_id: &ToolId) -> &'static [&'static str] {
+    match tool_id {
+        ToolId::Claude => &[
+            ".claude.json",
+            "settings.json",
+            "settings.local.json",
+            "plugins",
+            "rules",
+            "commands",
+            "agents",
+        ],
+        // SQLite databases are intentionally excluded: sharing a live .sqlite (+ WAL/SHM) between
+        // the default Codex process and a profile Codex process causes write-lock contention.
+        // When both run simultaneously, the profile process blocks waiting for the WAL write lock
+        // held by the default process, which causes the WebSocket initialisation to time out
+        // ("Reconnecting... 4/5"). Each account keeps its own memories and goals DBs.
+        ToolId::Codex => &["config.toml", "rules", "skills", "memories"],
+        ToolId::Antigravity => &[],
+    }
+}
+
+fn shared_target_to(tool_id: &ToolId, name: &str, default_config_dir: &Path) -> PathBuf {
+    if matches!(tool_id, ToolId::Claude) && name == ".claude.json" {
+        home_dir().join(".claude.json")
+    } else {
+        default_config_dir.join(name)
+    }
+}
+
 /// Share session/history across accounts: symlink the profile's chat-session entries
 /// to the original config dir (`~/.claude`, `~/.codex`). This lets any account resume
 /// a session created by another account, even in the same project. The token stays
 /// per-profile so quotas don't mix. Idempotent — safe to call again.
-pub fn link_shared_sessions(tool_id: &ToolId, profile: &Path) {
-    let names = shared_session_names(tool_id);
-    if names.is_empty() {
-        return;
+pub fn link_shared_sessions_to(tool_id: &ToolId, profile: &Path, default_config_dir: &Path) {
+    for name in shared_session_names(tool_id) {
+        link_shared_entry(tool_id, profile, name, true, default_config_dir);
     }
-    let home = default_config_dir(tool_id);
-    // Don't link to itself (Default account = ~/.claude, ~/.codex).
-    if profile == home {
-        return;
+}
+
+/// Share CLI config/memory across normal OAuth profiles. This keeps account switching focused on
+/// credentials/quota while user settings, skills, rules, and Codex memory stay consistent.
+pub fn link_shared_config_to(tool_id: &ToolId, profile: &Path, default_config_dir: &Path) {
+    // Remove any stale symlinks that were previously created but are no longer in the shared list
+    // (e.g. memories_1.sqlite was removed to fix SQLite lock contention).
+    remove_stale_shared_symlinks(tool_id, profile, default_config_dir);
+    for name in shared_config_names(tool_id) {
+        link_shared_entry(tool_id, profile, name, false, default_config_dir);
     }
-    for name in names {
-        let is_dir = *name != "history.jsonl";
-        let target = home.join(name);
-        let link = profile.join(name);
-        // If the link already points correctly, skip it.
-        if fs::read_link(&link).is_ok_and(|t| t == target) {
+}
+
+/// Remove symlinks in `profile` that point into `default_config_dir` but are no longer in the
+/// shared-config list. Called before re-applying the list so old symlinks don't linger.
+fn remove_stale_shared_symlinks(tool_id: &ToolId, profile: &Path, default_config_dir: &Path) {
+    let still_shared: std::collections::HashSet<&str> =
+        shared_config_names(tool_id).iter().copied().collect();
+    // Previously-shared Codex SQLite files that were removed from the list.
+    let formerly_shared: &[&str] = match tool_id {
+        ToolId::Codex => &[
+            "memories_1.sqlite",
+            "memories_1.sqlite-wal",
+            "memories_1.sqlite-shm",
+            "goals_1.sqlite",
+            "goals_1.sqlite-wal",
+            "goals_1.sqlite-shm",
+        ],
+        _ => &[],
+    };
+    for name in formerly_shared {
+        if still_shared.contains(name) {
             continue;
         }
-        // Remove whatever is occupying the spot (a real dir/file created by the CLI).
-        if link.is_dir() && fs::symlink_metadata(&link).is_ok_and(|m| !m.file_type().is_symlink()) {
-            // Merge the account's existing sessions into the shared store before deleting — don't lose old chats.
-            merge_dir_into(&link, &target);
-            let _ = fs::remove_dir_all(&link);
-        } else if link.exists() || fs::symlink_metadata(&link).is_ok() {
+        let link = profile.join(name);
+        let target = shared_target_to(tool_id, name, default_config_dir);
+        if fs::read_link(&link).is_ok_and(|t| t == target) {
             let _ = fs::remove_file(&link);
         }
-        // The directory (projects/sessions) must exist for the symlink to point into.
-        if is_dir {
+    }
+}
+
+fn link_shared_entry(
+    tool_id: &ToolId,
+    profile: &Path,
+    name: &str,
+    merge_dirs: bool,
+    default_config_dir: &Path,
+) {
+    // Don't link to itself (Default account = ~/.claude, ~/.codex).
+    if profile == default_config_dir {
+        return;
+    }
+
+    let target = shared_target_to(tool_id, name, default_config_dir);
+    let link = profile.join(name);
+    if link == target || fs::read_link(&link).is_ok_and(|t| t == target) {
+        return;
+    }
+
+    let is_real_dir =
+        link.is_dir() && fs::symlink_metadata(&link).is_ok_and(|m| !m.file_type().is_symlink());
+    if is_real_dir {
+        if target.exists() || merge_dirs {
+            merge_dir_into(&link, &target);
+        } else {
+            let _ = fs::rename(&link, &target);
+        }
+        let _ = fs::remove_dir_all(&link);
+    } else if link.is_file()
+        && fs::symlink_metadata(&link).is_ok_and(|m| !m.file_type().is_symlink())
+    {
+        if !target.exists() {
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::rename(&link, &target);
+        }
+        let _ = fs::remove_file(&link);
+    } else if link.exists() || fs::symlink_metadata(&link).is_ok() {
+        let _ = fs::remove_file(&link);
+    }
+
+    if !target.exists() {
+        if let Some(parent) = target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let looks_like_dir = !name.contains('.')
+            || matches!(
+                name,
+                "plugins" | "rules" | "skills" | "memories" | "commands" | "agents"
+            );
+        if looks_like_dir {
             let _ = fs::create_dir_all(&target);
         }
+    }
+    if target.exists() {
         let _ = create_symlink(&target, &link);
     }
 }
@@ -390,7 +522,10 @@ pub fn seed_onboarding(tool_id: &ToolId, profile: &Path) {
         .cloned()
         .unwrap_or_else(|| serde_json::Value::from("dark"));
 
-    obj.insert("hasCompletedOnboarding".into(), serde_json::Value::Bool(true));
+    obj.insert(
+        "hasCompletedOnboarding".into(),
+        serde_json::Value::Bool(true),
+    );
     obj.insert("lastOnboardingVersion".into(), last_version);
     obj.entry("theme").or_insert(theme);
 
@@ -399,18 +534,33 @@ pub fn seed_onboarding(tool_id: &ToolId, profile: &Path) {
     }
 }
 
-pub fn launch_profile_login(tool_id: &ToolId, store: &Store, account_id: &str) -> Result<()> {
-    let profile = create_profile(tool_id, store, account_id)?;
+pub fn launch_profile_login(
+    tool_id: &ToolId,
+    store: &Store,
+    account_id: &str,
+    default_config_dir: &Path,
+    binary_path: &Path,
+) -> Result<()> {
+    let profile = create_profile_with_default(tool_id, store, account_id, default_config_dir)?;
+    link_shared_config_to(tool_id, &profile, default_config_dir);
     // Login only writes the token into the account's own config dir. It does NOT touch the
     // original `claude`/`codex` binaries. The account is used via its own command `claude-<name>`
     // (created by write_launcher); the original `claude` command is always the machine Default.
     match tool_id {
-        ToolId::Claude => {
-            run_profile_login_command("claude", "CLAUDE_CONFIG_DIR", &profile, &["auth", "login"], tool_id)
-        }
-        ToolId::Codex => {
-            run_profile_login_command("codex", "CODEX_HOME", &profile, &["login"], tool_id)
-        }
+        ToolId::Claude => run_profile_login_command(
+            binary_path,
+            "CLAUDE_CONFIG_DIR",
+            &profile,
+            &["auth", "login"],
+            tool_id,
+        ),
+        ToolId::Codex => run_profile_login_command(
+            binary_path,
+            "CODEX_HOME",
+            &profile,
+            &["login"],
+            tool_id,
+        ),
         ToolId::Antigravity => launch_login(tool_id),
     }
 }
@@ -519,13 +669,13 @@ pub fn write_launcher(
     store: &Store,
     account_id: &str,
     full_name: &str,
+    real_binary: &Path,
 ) -> Result<()> {
-    let (binary, env_name) = match tool_id {
-        ToolId::Claude => ("claude", "CLAUDE_CONFIG_DIR"),
-        ToolId::Codex => ("codex", "CODEX_HOME"),
+    let env_name = match tool_id {
+        ToolId::Claude => "CLAUDE_CONFIG_DIR",
+        ToolId::Codex => "CODEX_HOME",
         ToolId::Antigravity => anyhow::bail!("Antigravity doesn't support custom commands"),
     };
-    let real_binary = command_path(binary).context("Tool is not installed")?;
     let profile = store.account_dir(tool_id, account_id);
 
     let dir = launcher_dir();
@@ -688,13 +838,13 @@ pub fn write_api_launcher(
     full_name: &str,
     model: &str,
     bypass: bool,
+    real_binary: &Path,
 ) -> Result<()> {
-    let (binary, env_name) = match tool_id {
-        ToolId::Codex => ("codex", "CODEX_HOME"),
-        ToolId::Claude => ("claude", "CLAUDE_CONFIG_DIR"),
+    let env_name = match tool_id {
+        ToolId::Codex => "CODEX_HOME",
+        ToolId::Claude => "CLAUDE_CONFIG_DIR",
         ToolId::Antigravity => anyhow::bail!("Antigravity doesn't support API/proxy accounts"),
     };
-    let real_binary = command_path(binary).context("Tool is not installed")?;
     let profile = store.account_dir(tool_id, account_id);
 
     // Codex pins the key + model on the command line; Claude carries them in settings.json env.
@@ -806,8 +956,7 @@ pub fn install_shell_hook(store: &Store) -> Result<()> {
 /// Replace the block between the markers (if present) or append; create the file if it doesn't exist.
 fn upsert_block(rc: &Path, block: &str) -> Result<()> {
     let current = fs::read_to_string(rc).unwrap_or_default();
-    let next = if let (Some(start), Some(end)) =
-        (current.find(HOOK_BEGIN), current.find(HOOK_END))
+    let next = if let (Some(start), Some(end)) = (current.find(HOOK_BEGIN), current.find(HOOK_END))
     {
         let end = end + HOOK_END.len();
         let mut out = String::with_capacity(current.len());
@@ -864,9 +1013,7 @@ fn run_login_command(binary: &str, args: &[&str]) -> Result<()> {
         script.push(' ');
         script.push_str(&shell_quote(arg));
     }
-    script.push_str(
-        "; echo; echo 'After signing in, return to AI Account Switcher.'",
-    );
+    script.push_str("; echo; echo 'After signing in, return to AI Account Switcher.'");
 
     open_terminal_script(&script)
 }
@@ -878,9 +1025,15 @@ mod tests {
     #[test]
     fn launcher_name_enforces_prefix_and_charset() {
         // typed without the prefix → prefix gets added
-        assert_eq!(full_launcher_name(&ToolId::Claude, "abc").unwrap(), "claude-abc");
+        assert_eq!(
+            full_launcher_name(&ToolId::Claude, "abc").unwrap(),
+            "claude-abc"
+        );
         // typed with the prefix → kept as-is
-        assert_eq!(full_launcher_name(&ToolId::Codex, "codex-work").unwrap(), "codex-work");
+        assert_eq!(
+            full_launcher_name(&ToolId::Codex, "codex-work").unwrap(),
+            "codex-work"
+        );
         // invalid characters → error
         assert!(full_launcher_name(&ToolId::Claude, "a b").is_err());
         assert!(full_launcher_name(&ToolId::Claude, "ABC").is_err());
@@ -891,13 +1044,12 @@ mod tests {
 }
 
 fn run_profile_login_command(
-    binary: &str,
+    command: &Path,
     env_name: &str,
     profile: &Path,
     login_args: &[&str],
     tool_id: &ToolId,
 ) -> Result<()> {
-    let command = command_path(binary).unwrap_or_else(|| PathBuf::from(binary));
     let args = login_args
         .iter()
         .map(|arg| shell_quote(arg))
@@ -991,7 +1143,7 @@ pub fn command_path(binary: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.exists())
 }
 
-fn common_bin_dirs() -> Vec<PathBuf> {
+pub(crate) fn common_bin_dirs() -> Vec<PathBuf> {
     let home = home_dir();
     vec![
         home.join(".local/bin"),

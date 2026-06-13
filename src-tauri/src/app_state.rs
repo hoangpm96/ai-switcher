@@ -1,17 +1,18 @@
 use crate::models::{
     Account, AccountState, AddAccountInput, AddApiAccountInput, ApiProvider, AppSnapshot,
-    RenameAccountInput, SetLauncherInput, SwitchAccountInput, ToolId, ToolStatus, UsageReport,
+    DetectionReport, QuotaInfo, RenameAccountInput, SetLauncherInput, SetToolSetupInput,
+    SwitchAccountInput, ToolId, ToolStatus, UsageReport,
 };
 use crate::quota::read_quota;
 use crate::store::{normalize_account_states, Store, StoredState};
 use crate::tools::{
     antigravity_capture, antigravity_current_token, antigravity_new_login, antigravity_open_ide,
     antigravity_quit_ide, antigravity_restore, antigravity_saved_profile, antigravity_saved_token,
-    clear_active_profile, create_profile,
-    default_config_dir, delete_account_files, full_launcher_name, install_shell_hook, is_installed,
-    launch_profile_login, launcher_name_collides_with_system, remove_launcher, write_active_profile,
-    write_api_key_file, write_api_launcher, write_claude_proxy_settings, write_codex_proxy_config,
-    write_launcher,
+    clear_active_profile, create_profile_with_default, default_config_dir, delete_account_files,
+    full_launcher_name, install_shell_hook, is_installed, launch_profile_login,
+    launcher_name_collides_with_system, link_shared_config_to, link_shared_sessions_to,
+    remove_launcher, write_active_profile, write_api_key_file, write_api_launcher,
+    write_claude_proxy_settings, write_codex_proxy_config, write_launcher,
 };
 use anyhow::{Context, Result};
 use std::sync::Mutex;
@@ -29,6 +30,7 @@ impl ManagedState {
         let store = Store::new()?;
         let mut data = store.load()?;
         migrate_defaults(&mut data.accounts);
+        autodetect_missing_tool_setups(&store, &mut data);
         store.save(&data)?;
         let managed = Self {
             store,
@@ -60,18 +62,26 @@ impl ManagedState {
             // Seed the onboarding flag + link the shared session for every profile (idempotent)
             // — ensures accounts logged in from a previous session also skip the wizard and
             // share the session store with Default.
-            for dir in &valid_dirs {
-                crate::tools::seed_onboarding(&tool_id, dir);
-                crate::tools::link_shared_sessions(&tool_id, dir);
+            for account in data
+                .accounts
+                .iter()
+                .filter(|a| a.tool_id == tool_id && !a.is_default)
+            {
+                let dir = self.store.account_dir(&tool_id, &account.id);
+                crate::tools::seed_onboarding(&tool_id, &dir);
+                if let Some(default_dir) = configured_default_config_dir(&data, &tool_id) {
+                    link_shared_sessions_to(&tool_id, &dir, &default_dir);
+                    if account.api_provider.is_none() {
+                        link_shared_config_to(&tool_id, &dir, &default_dir);
+                    }
+                }
             }
 
             // Clear active if it points to a profile that belongs to no account.
             let active = self.store.active_profile_path(&tool_id);
             if let Ok(target) = std::fs::read_to_string(&active) {
                 let target = target.trim();
-                if !target.is_empty()
-                    && !valid_dirs.iter().any(|d| d.to_string_lossy() == target)
-                {
+                if !target.is_empty() && !valid_dirs.iter().any(|d| d.to_string_lossy() == target) {
                     let _ = clear_active_profile(&tool_id, &self.store);
                     changed = true;
                 }
@@ -101,6 +111,42 @@ impl ManagedState {
         Ok(build_snapshot(&self.store, &data))
     }
 
+    pub fn detect_tool_setup(&self, tool_id: ToolId) -> DetectionReport {
+        crate::detection::detect_tool_setup(&tool_id, &self.store)
+    }
+
+    pub fn validate_tool_setup(&self, input: SetToolSetupInput) -> DetectionReport {
+        let mut report = crate::detection::detect_tool_setup(&input.tool_id, &self.store);
+        let config = crate::detection::validate_config_dir(
+            &input.tool_id,
+            &self.store,
+            &input.default_config_dir,
+        );
+        let binary = crate::detection::validate_binary_path(&input.tool_id, &input.binary_path);
+        report.config_candidates.insert(0, config);
+        report.binary_candidates.insert(0, binary);
+        report
+    }
+
+    pub fn set_tool_setup(&self, input: SetToolSetupInput) -> Result<AppSnapshot> {
+        let (setup, _) = crate::detection::setup_from_manual(
+            &input.tool_id,
+            &self.store,
+            input.binary_path,
+            input.default_config_dir,
+        );
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.tool_setups
+                .insert(input.tool_id.as_str().to_string(), setup);
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
     /// Build the token-usage report (Usage tab): incrementally scan every Claude/Codex config
     /// dir on the machine, aggregate per tool, and price it via the LiteLLM cache. Antigravity
     /// is excluded (no token logs). Cheap to call repeatedly thanks to the per-file cursor cache.
@@ -117,7 +163,13 @@ impl ManagedState {
     /// Every config dir to scan for a tool: the machine default (`~/.claude`, `~/.codex`) plus
     /// every per-account profile dir under the app's accounts root.
     fn config_dirs(&self, tool_id: &ToolId) -> Vec<std::path::PathBuf> {
-        let mut dirs = vec![default_config_dir(tool_id)];
+        let default_dir = self
+            .data
+            .lock()
+            .ok()
+            .map(|data| resolved_default_config_dir(&data, tool_id))
+            .unwrap_or_else(|| default_config_dir(tool_id));
+        let mut dirs = vec![default_dir];
         if let Ok(entries) = std::fs::read_dir(self.store.tool_accounts_root(tool_id)) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -151,40 +203,167 @@ impl ManagedState {
     }
 
     pub fn refresh_tool(&self, tool_id: ToolId, app: Option<&AppHandle>) -> Result<AppSnapshot> {
-        let (auto_switch, threshold) = {
+        // Phase 1: collect (account_id, config_dir) — brief lock, no HTTP.
+        let accounts_info: Vec<(String, std::path::PathBuf)> = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let default_config_dir = resolved_default_config_dir(&data, &tool_id);
+            data.accounts
+                .iter()
+                .filter(|a| {
+                    a.tool_id == tool_id
+                        && a.state != AccountState::NeedsLogin
+                        && a.api_provider.is_none()
+                })
+                .map(|a| {
+                    (
+                        a.id.clone(),
+                        account_config_dir_with_default(&self.store, a, &default_config_dir),
+                    )
+                })
+                .collect()
+        };
+        // Mutex released — HTTP calls run in parallel without blocking other operations.
+
+        // Phase 2: fetch all quotas in parallel (no mutex held).
+        let results: Vec<(String, QuotaInfo)> = {
+            let handles: Vec<_> = accounts_info
+                .into_iter()
+                .map(|(account_id, config_dir)| {
+                    let tid = tool_id.clone();
+                    std::thread::spawn(move || (account_id, read_quota(&tid, &config_dir)))
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        };
+
+        // Phase 3: write all quotas back — brief lock.
+        let exhausted_accounts: Vec<Account> = {
             let mut data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            for account in data.accounts.iter_mut().filter(|account| {
-                account.tool_id == tool_id
-                    && account.state != AccountState::NeedsLogin
-                    // API/proxy accounts have no quota to read.
-                    && account.api_provider.is_none()
-            }) {
-                let config_dir = account_config_dir(&self.store, account);
-                account.quota = Some(read_quota(&account.tool_id, &config_dir));
+            let timestamp = now();
+            let mut exhausted = Vec::new();
+            for (account_id, quota) in results {
+                if let Some(account) = data
+                    .accounts
+                    .iter_mut()
+                    .find(|a| a.tool_id == tool_id && a.id == account_id)
+                {
+                    account.quota = Some(quota);
+                    account.updated_at = timestamp.clone();
+                    account.state = if is_exhausted(account) {
+                        AccountState::Exhausted
+                    } else if account.state == AccountState::Exhausted {
+                        AccountState::Idle
+                    } else {
+                        account.state.clone()
+                    };
+                    if account.state == AccountState::Exhausted {
+                        exhausted.push(account.clone());
+                    }
+                }
+            }
+            self.store.save(&data)?;
+            exhausted
+        };
+
+        if let Some(app) = app {
+            for account in &exhausted_accounts {
+                notify_exhausted(app, account);
+            }
+        }
+
+        let (auto_switch, threshold) = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            (data.auto_switch, data.auto_switch_threshold)
+        };
+        if auto_switch {
+            self.maybe_auto_switch(&tool_id, threshold, app)?;
+        }
+        self.snapshot()
+    }
+
+    /// Refresh quota for a single account. Releases the mutex during the HTTP call so other
+    /// operations (switch, add) are not blocked while waiting for the network.
+    pub fn refresh_single_account(
+        &self,
+        tool_id: &ToolId,
+        account_id: &str,
+        app: Option<&AppHandle>,
+    ) -> Result<AppSnapshot> {
+        // Phase 1: get config_dir — brief lock.
+        let config_dir: Option<std::path::PathBuf> = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let default_dir = resolved_default_config_dir(&data, tool_id);
+            data.accounts
+                .iter()
+                .find(|a| {
+                    a.tool_id == *tool_id
+                        && a.id == account_id
+                        && a.state != AccountState::NeedsLogin
+                        && a.api_provider.is_none()
+                })
+                .map(|a| account_config_dir_with_default(&self.store, a, &default_dir))
+        };
+        let Some(config_dir) = config_dir else {
+            return self.snapshot();
+        };
+
+        // Phase 2: HTTP call — no mutex held.
+        let quota = read_quota(tool_id, &config_dir);
+
+        // Phase 3: write back — brief lock.
+        let exhausted: Option<Account> = {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let mut result = None;
+            if let Some(account) = data
+                .accounts
+                .iter_mut()
+                .find(|a| a.tool_id == *tool_id && a.id == account_id)
+            {
+                account.quota = Some(quota);
                 account.updated_at = now();
                 account.state = if is_exhausted(account) {
                     AccountState::Exhausted
                 } else if account.state == AccountState::Exhausted {
-                    // quota recovered (below 100%) → drop the exhausted state.
                     AccountState::Idle
                 } else {
                     account.state.clone()
                 };
                 if account.state == AccountState::Exhausted {
-                    if let Some(app) = app {
-                        notify_exhausted(app, account);
-                    }
+                    result = Some(account.clone());
                 }
             }
             self.store.save(&data)?;
-            (data.auto_switch, data.auto_switch_threshold)
+            result
         };
 
+        if let (Some(app), Some(account)) = (app, exhausted) {
+            notify_exhausted(app, &account);
+        }
+
+        let (auto_switch, threshold) = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            (data.auto_switch, data.auto_switch_threshold)
+        };
         if auto_switch {
-            self.maybe_auto_switch(&tool_id, threshold, app)?;
+            self.maybe_auto_switch(tool_id, threshold, app)?;
         }
         self.snapshot()
     }
@@ -294,7 +473,16 @@ impl ManagedState {
         // .claude.json, so it must be seeded AFTERWARD) — so interactive mode skips the wizard.
         // Re-link the shared session after login too (login may create the real dir).
         crate::tools::seed_onboarding(tool_id, &config_dir);
-        crate::tools::link_shared_sessions(tool_id, &config_dir);
+        if let Some(default_dir) = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            configured_default_config_dir(&data, tool_id)
+        } {
+            link_shared_sessions_to(tool_id, &config_dir, &default_dir);
+            link_shared_config_to(tool_id, &config_dir, &default_dir);
+        }
         let mut data = self
             .data
             .lock()
@@ -350,7 +538,10 @@ impl ManagedState {
                 if account.tool_id != ToolId::Antigravity {
                     return false;
                 }
-                match (&new_profile, antigravity_saved_profile(&self.store, &account.id)) {
+                match (
+                    &new_profile,
+                    antigravity_saved_profile(&self.store, &account.id),
+                ) {
                     (Some(new), Some(existing)) => *new == existing,
                     _ => antigravity_saved_token(&self.store, &account.id) == new_token,
                 }
@@ -363,7 +554,10 @@ impl ManagedState {
         }
 
         let name = normalized_or_default_name(&ToolId::Antigravity, &input.name, self)?;
-        let quota = read_quota(&ToolId::Antigravity, &default_config_dir(&ToolId::Antigravity));
+        let quota = read_quota(
+            &ToolId::Antigravity,
+            &default_config_dir(&ToolId::Antigravity),
+        );
         let timestamp = now();
         {
             let mut data = self
@@ -390,7 +584,11 @@ impl ManagedState {
         self.snapshot()
     }
 
-    fn create_profile_account(&self, app: &AppHandle, input: AddAccountInput) -> Result<AppSnapshot> {
+    fn create_profile_account(
+        &self,
+        app: &AppHandle,
+        input: AddAccountInput,
+    ) -> Result<AppSnapshot> {
         // A launcher is required for Claude/Codex — it's the ONLY way to use the account.
         let raw_launcher = input
             .launcher
@@ -402,9 +600,25 @@ impl ManagedState {
         let full_launcher = self.validated_launcher(&input.tool_id, &id, raw_launcher)?;
         let name = normalized_or_default_name(&input.tool_id, &input.name, self)?;
 
-        launch_profile_login(&input.tool_id, &self.store, &id)
+        let default_dir = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            configured_default_config_dir(&data, &input.tool_id)
+        }
+        .context("CLI setup is ambiguous — choose the tool's binary and default config first")?;
+        let binary_path = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            configured_binary_path(&data, &input.tool_id)
+        }
+        .context("CLI setup is ambiguous — choose the tool's binary first")?;
+        launch_profile_login(&input.tool_id, &self.store, &id, &default_dir, &binary_path)
             .context("Login not completed, account not added")?;
-        write_launcher(&input.tool_id, &self.store, &id, &full_launcher)
+        write_launcher(&input.tool_id, &self.store, &id, &full_launcher, &binary_path)
             .context("Couldn't create the account's custom command")?;
 
         let timestamp = now();
@@ -473,7 +687,23 @@ impl ManagedState {
             None => None,
         };
 
-        let profile = create_profile(&input.tool_id, &self.store, &id)?;
+        let default_dir = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            configured_default_config_dir(&data, &input.tool_id)
+        }
+        .context("CLI setup is ambiguous — choose the tool's binary and default config first")?;
+        let profile = create_profile_with_default(&input.tool_id, &self.store, &id, &default_dir)?;
+        let binary_path = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            configured_binary_path(&data, &input.tool_id)
+        }
+        .context("CLI setup is ambiguous — choose the tool's binary first")?;
         match input.tool_id {
             ToolId::Codex => {
                 write_codex_proxy_config(&profile, &name, &base_url, &model)
@@ -489,7 +719,15 @@ impl ManagedState {
             ToolId::Antigravity => unreachable!("guarded above"),
         }
         if let Some(full) = &full_launcher {
-            write_api_launcher(&input.tool_id, &self.store, &id, full, &model, input.bypass)
+            write_api_launcher(
+                &input.tool_id,
+                &self.store,
+                &id,
+                full,
+                &model,
+                input.bypass,
+                &binary_path,
+            )
                 .context("Couldn't create the account's custom command")?;
         }
 
@@ -582,6 +820,14 @@ impl ManagedState {
         // API/proxy accounts need a launcher that exports the key + pins the model (+ optional bypass).
         match api {
             Some((model, bypass)) => {
+                let binary_path = {
+                    let data = self
+                        .data
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+                    configured_binary_path(&data, &input.tool_id)
+                }
+                .context("CLI setup is ambiguous — choose the tool's binary first")?;
                 write_api_launcher(
                     &input.tool_id,
                     &self.store,
@@ -589,11 +835,26 @@ impl ManagedState {
                     &full,
                     &model,
                     bypass,
+                    &binary_path,
                 )
                 .context("Couldn't create the custom command")?;
             }
             None => {
-                write_launcher(&input.tool_id, &self.store, &input.account_id, &full)
+                let binary_path = {
+                    let data = self
+                        .data
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+                    configured_binary_path(&data, &input.tool_id)
+                }
+                .context("CLI setup is ambiguous — choose the tool's binary first")?;
+                write_launcher(
+                    &input.tool_id,
+                    &self.store,
+                    &input.account_id,
+                    &full,
+                    &binary_path,
+                )
                     .context("Couldn't create the custom command")?;
             }
         }
@@ -668,11 +929,9 @@ impl ManagedState {
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             let timestamp = now();
             normalize_account_states(&mut data.accounts, &input.tool_id, Some(&input.account_id));
-            for account in data
-                .accounts
-                .iter_mut()
-                .filter(|account| account.tool_id == input.tool_id && account.id == input.account_id)
-            {
+            for account in data.accounts.iter_mut().filter(|account| {
+                account.tool_id == input.tool_id && account.id == input.account_id
+            }) {
                 account.state = if is_exhausted(account) {
                     AccountState::Exhausted
                 } else {
@@ -761,12 +1020,7 @@ impl ManagedState {
 
     /// Normalize + validate the command name: enforce the prefix and charset, no collision with
     /// another account's launcher, and no overriding a system binary.
-    fn validated_launcher(
-        &self,
-        tool_id: &ToolId,
-        account_id: &str,
-        raw: &str,
-    ) -> Result<String> {
+    fn validated_launcher(&self, tool_id: &ToolId, account_id: &str, raw: &str) -> Result<String> {
         let full = full_launcher_name(tool_id, raw)?;
         {
             let data = self
@@ -806,12 +1060,35 @@ fn spawn_login_watch(app: AppHandle, tool_id: ToolId, account_id: String) {
 
 /// The account's config dir for reading quota: profile accounts read from their own directory,
 /// the rest (default, antigravity import) read from the machine's default config dir.
-fn account_config_dir(store: &Store, account: &Account) -> std::path::PathBuf {
+fn account_config_dir_with_default(
+    store: &Store,
+    account: &Account,
+    default_config_dir: &std::path::Path,
+) -> std::path::PathBuf {
     if account.fingerprint.starts_with("profile:") {
         store.account_dir(&account.tool_id, &account.id)
     } else {
-        default_config_dir(&account.tool_id)
+        default_config_dir.to_path_buf()
     }
+}
+
+fn resolved_default_config_dir(data: &StoredState, tool_id: &ToolId) -> std::path::PathBuf {
+    configured_default_config_dir(data, tool_id).unwrap_or_else(|| default_config_dir(tool_id))
+}
+
+fn configured_default_config_dir(
+    data: &StoredState,
+    tool_id: &ToolId,
+) -> Option<std::path::PathBuf> {
+    data.tool_setups
+        .get(tool_id.as_str())
+        .and_then(|setup| setup.default_config_dir.clone())
+}
+
+fn configured_binary_path(data: &StoredState, tool_id: &ToolId) -> Option<std::path::PathBuf> {
+    data.tool_setups
+        .get(tool_id.as_str())
+        .and_then(|setup| setup.binary_path.clone())
 }
 
 /// Drop the old-style "system-default" account, ensuring each CLI tool has one machine Default
@@ -872,7 +1149,7 @@ fn build_snapshot(store: &Store, data: &StoredState) -> AppSnapshot {
             ToolStatus {
                 id: tool_id.clone(),
                 name: tool_id.display_name().to_string(),
-                installed: is_installed(&tool_id),
+                installed: is_installed_resolved(data, &tool_id),
                 active_account_id,
                 accounts,
             }
@@ -884,7 +1161,28 @@ fn build_snapshot(store: &Store, data: &StoredState) -> AppSnapshot {
         disclaimer_accepted: data.disclaimer_accepted,
         auto_switch: data.auto_switch,
         auto_switch_threshold: data.auto_switch_threshold,
+        tool_setups: data.tool_setups.clone(),
     }
+}
+
+fn autodetect_missing_tool_setups(store: &Store, data: &mut StoredState) {
+    for tool_id in [ToolId::Claude, ToolId::Codex] {
+        if data.tool_setups.contains_key(tool_id.as_str()) {
+            continue;
+        }
+        let report = crate::detection::detect_tool_setup(&tool_id, store);
+        if let Some(setup) = report.resolution.setup {
+            data.tool_setups.insert(tool_id.as_str().to_string(), setup);
+        }
+    }
+}
+
+fn is_installed_resolved(data: &StoredState, tool_id: &ToolId) -> bool {
+    data.tool_setups
+        .get(tool_id.as_str())
+        .and_then(|setup| setup.binary_path.as_ref())
+        .is_some_and(|path| path.exists())
+        || is_installed(tool_id)
 }
 
 /// The account the PLAIN COMMAND is using. For Claude/Codex this is the real source of truth:
@@ -892,11 +1190,7 @@ fn build_snapshot(store: &Store, data: &StoredState) -> AppSnapshot {
 /// NOT inferred from `state==Active` (an exhausted account is still the one the plain command uses,
 /// but its state is Exhausted, so inferring from state would be wrong). Empty/missing file = machine Default.
 /// Antigravity is copy-swap (no active file), so it still follows `state==Active`.
-fn active_account_id_for(
-    store: &Store,
-    tool_id: &ToolId,
-    accounts: &[Account],
-) -> Option<String> {
+fn active_account_id_for(store: &Store, tool_id: &ToolId, accounts: &[Account]) -> Option<String> {
     if matches!(tool_id, ToolId::Antigravity) {
         // The account in use = the account whose token matches the IDE's current token in state.vscdb.
         let current = antigravity_current_token()?;

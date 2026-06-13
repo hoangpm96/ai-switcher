@@ -13,15 +13,15 @@ use std::time::{Duration, Instant};
 /// hash of this path, so the correct dir must be passed to read each account's quota.
 pub fn read_quota(tool_id: &ToolId, config_dir: &Path) -> QuotaInfo {
     let result = match tool_id {
-        ToolId::Codex => read_codex_quota(),
+        ToolId::Codex => read_codex_quota(config_dir),
         ToolId::Claude => read_claude_quota(config_dir),
         ToolId::Antigravity => read_antigravity_quota(),
     };
 
-    result.unwrap_or_else(|_| match tool_id {
+    result.unwrap_or_else(|e| match tool_id {
         // Antigravity only exposes quota while the IDE is open (language server runs locally).
         ToolId::Antigravity => QuotaInfo::with_message("Open Antigravity IDE to read quota"),
-        other => QuotaInfo::unavailable(other.display_name()),
+        _ => QuotaInfo::with_message(format!("Couldn't read quota: {e:#}")),
     })
 }
 
@@ -193,19 +193,31 @@ pub(crate) fn curl_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {
     command
         .arg("--silent")
         .arg("--show-error")
-        .arg("--fail") // exit != 0 when HTTP >= 400 (e.g. 401/429)
         .arg("--max-time")
-        .arg("20");
+        .arg("20")
+        .arg("-w")
+        .arg("\n%{http_code}"); // append status code as last line
     for (key, value) in headers {
         command.arg("-H").arg(format!("{key}: {value}"));
     }
     command.arg(url);
 
     let output = command.output().context("couldn't run curl")?;
-    if !output.status.success() {
-        anyhow::bail!("HTTP request failed");
+    let full = String::from_utf8_lossy(&output.stdout);
+    // Split off the status code appended by -w.
+    let (body, status_str) = full
+        .rsplit_once('\n')
+        .context("unexpected curl output format")?;
+    let status: u16 = status_str.trim().parse().unwrap_or(0);
+
+    if status == 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("network error: {}", stderr.trim());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    if status >= 400 {
+        anyhow::bail!("HTTP {status}");
+    }
+    Ok(body.to_owned())
 }
 
 fn curl_post(url: &str, headers: &[(&str, &str)], body: &str) -> Result<String> {
@@ -422,13 +434,19 @@ fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo>
 // We take the last rate_limits entry from the most recent rollout file that has data.
 // ---------------------------------------------------------------------------
 
-fn read_codex_quota() -> Result<QuotaInfo> {
-    // Prefer the local rollout file (offline, no request cost). Newer Codex versions
-    // sometimes write rate_limits = null into the rollout → fall back to the wham/usage endpoint.
-    match read_codex_rollout_quota() {
-        Ok(quota) => Ok(quota),
-        Err(_) => read_codex_usage_endpoint(),
+fn read_codex_quota(config_dir: &Path) -> Result<QuotaInfo> {
+    // Rollout files live in ~/.codex/sessions. Profile accounts symlink their sessions/
+    // back to ~/.codex/sessions, so all accounts share the same rollout files. Reading
+    // rollout for a profile account returns the last active account's limits, not this
+    // account's. Only use rollout for the default account (~/.codex); go straight to the
+    // per-account usage endpoint for all others.
+    let is_default = config_dir == home_dir().join(".codex");
+    if is_default {
+        if let Ok(quota) = read_codex_rollout_quota() {
+            return Ok(quota);
+        }
     }
+    read_codex_usage_endpoint(config_dir)
 }
 
 fn read_codex_rollout_quota() -> Result<QuotaInfo> {
@@ -439,11 +457,11 @@ fn read_codex_rollout_quota() -> Result<QuotaInfo> {
 }
 
 /// Fallback: calls `GET https://chatgpt.com/backend-api/wham/usage` with the JWT in
-/// `~/.codex/auth.json` (`tokens.access_token`). Returns rate_limit.primary_window
+/// `<config_dir>/auth.json` (`tokens.access_token`). Returns rate_limit.primary_window
 /// (5h, limit_window_seconds 18000) + secondary_window (weekly, 604800), each with
 /// `used_percent` + `reset_at` (unix seconds).
-fn read_codex_usage_endpoint() -> Result<QuotaInfo> {
-    let token = codex_access_token().context("couldn't get Codex's access_token")?;
+fn read_codex_usage_endpoint(config_dir: &Path) -> Result<QuotaInfo> {
+    let token = codex_access_token(config_dir).context("couldn't get Codex's access_token")?;
     let body = curl_get(
         "https://chatgpt.com/backend-api/wham/usage",
         &[
@@ -456,8 +474,8 @@ fn read_codex_usage_endpoint() -> Result<QuotaInfo> {
     quota_from_codex_endpoint(&value)
 }
 
-fn codex_access_token() -> Option<String> {
-    let raw = std::fs::read_to_string(home_dir().join(".codex/auth.json")).ok()?;
+fn codex_access_token(config_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(config_dir.join("auth.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
         .get("tokens")

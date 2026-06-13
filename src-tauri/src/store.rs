@@ -1,7 +1,8 @@
-use crate::models::{Account, AccountState, ToolId};
+use crate::models::{Account, AccountState, ToolId, ToolSetup};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -16,6 +17,9 @@ pub struct StoredState {
     /// The % used that triggers auto-switch (default 100 = fully exhausted).
     #[serde(default = "default_threshold")]
     pub auto_switch_threshold: f64,
+    /// Resolved CLI binary/config dirs per tool. Missing = detect on startup / ask user.
+    #[serde(default)]
+    pub tool_setups: BTreeMap<String, ToolSetup>,
 }
 
 fn default_threshold() -> f64 {
@@ -29,6 +33,7 @@ impl Default for StoredState {
             accounts: Vec::new(),
             auto_switch: false,
             auto_switch_threshold: default_threshold(),
+            tool_setups: BTreeMap::new(),
         }
     }
 }

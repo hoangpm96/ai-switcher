@@ -677,9 +677,28 @@ button.danger:hover:not(:disabled) {
   width: min(440px, calc(100vw - 48px));
 }
 
+.setupModal {
+  width: min(760px, calc(100vw - 48px));
+}
+
+.modalTitleRow {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
 .modal h2 {
   font-size: 17px;
   font-weight: 700;
+}
+
+.modalSub {
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.45;
+  margin-top: 5px;
+  max-width: 600px;
 }
 
 .modal label {
@@ -687,6 +706,18 @@ button.danger:hover:not(:disabled) {
   font-size: 13px;
   font-weight: 500;
   gap: 7px;
+}
+
+.modal label small {
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.modal label code {
+  color: var(--text-2);
+  font-size: 11.5px;
 }
 
 .modal input {
@@ -708,6 +739,227 @@ button.danger:hover:not(:disabled) {
   display: flex;
   gap: 10px;
   justify-content: flex-end;
+}
+
+.cliSetup {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+}
+
+.settingsList {
+  display: grid;
+  gap: 10px;
+}
+
+.settingsList .cliSetup {
+  margin-bottom: 0;
+}
+
+.settingsSection {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.settingsSectionHead {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.settingsSectionHead > svg {
+  color: var(--accent);
+  flex: none;
+}
+
+.settingsSectionHead div {
+  display: grid;
+  gap: 3px;
+}
+
+.settingsSectionHead strong {
+  font-size: 13px;
+}
+
+.settingsSectionHead small {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.compactNote {
+  align-items: center;
+  background: var(--accent-soft);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  display: inline-flex;
+  font-size: 12px;
+  gap: 7px;
+  margin-bottom: 12px;
+  padding: 7px 9px;
+  width: fit-content;
+}
+
+.compactNote svg {
+  color: var(--accent);
+  height: 14px;
+  width: 14px;
+}
+
+.cliSetup.needsSetup {
+  border-color: rgba(252, 211, 77, 0.45);
+}
+
+.cliSetup > svg {
+  color: var(--accent);
+  flex: none;
+}
+
+.cliSetupText {
+  display: grid;
+  flex: 1;
+  gap: 3px;
+  min-width: 0;
+}
+
+.cliSetupText strong {
+  font-size: 13px;
+}
+
+.cliSetupText small {
+  color: var(--text-2);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.setupCurrent {
+  display: grid;
+  gap: 10px;
+}
+
+.readonlyPath {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+}
+
+.readonlyPath span {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.readonlyPath code {
+  color: var(--text);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.setupSummary {
+  align-items: center;
+  background: var(--green-soft);
+  border: 1px solid rgba(52, 211, 153, 0.28);
+  border-radius: var(--radius-sm);
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+.setupSummary > svg {
+  color: var(--green);
+  flex: none;
+}
+
+.setupSummary div {
+  display: grid;
+  gap: 3px;
+}
+
+.setupSummary strong {
+  font-size: 13px;
+}
+
+.setupSummary small {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.candidateGrid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.candidateList {
+  align-content: start;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  min-width: 0;
+  overflow: auto;
+  padding: 10px;
+}
+
+.candidateList > strong {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.candidate,
+.candidate:hover:not(:disabled) {
+  align-items: stretch;
+  background: var(--surface);
+  border-color: var(--line);
+  display: grid;
+  gap: 4px;
+  height: auto;
+  justify-content: stretch;
+  min-height: 0;
+  padding: 9px;
+  text-align: left;
+  width: 100%;
+}
+
+.candidate.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.candidate.weak {
+  opacity: 0.72;
+}
+
+.candidatePath {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.candidateMeta,
+.candidateWarn,
+.candidateEmpty {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.candidateWarn {
+  color: var(--amber);
 }
 
 /* Segmented control */

@@ -59,6 +59,65 @@ export interface AppSnapshot {
   disclaimerAccepted: boolean;
   autoSwitch: boolean;
   autoSwitchThreshold: number;
+  toolSetups: Record<string, ToolSetup>;
+}
+
+export type DetectionSource = "env" | "default" | "path" | "appManaged" | "manual" | "fallback";
+
+export interface ToolSetup {
+  binaryPath?: string | null;
+  defaultConfigDir?: string | null;
+  binarySource: DetectionSource;
+  configSource: DetectionSource;
+  validatedAt?: string | null;
+  validationWarnings: string[];
+}
+
+export interface ValidationEvidence {
+  label: string;
+  found: boolean;
+}
+
+export interface ConfigCandidate {
+  path: string;
+  source: DetectionSource;
+  score: number;
+  valid: boolean;
+  isAppManaged: boolean;
+  evidence: ValidationEvidence[];
+  warnings: string[];
+}
+
+export interface BinaryCandidate {
+  path: string;
+  resolvedPath?: string | null;
+  source: DetectionSource;
+  score: number;
+  valid: boolean;
+  isAppLauncher: boolean;
+  evidence: ValidationEvidence[];
+  warnings: string[];
+}
+
+export type ResolutionKind = "resolved" | "needsUserChoice" | "needsManualInput";
+
+export interface DetectionResolution {
+  kind: ResolutionKind;
+  setup?: ToolSetup | null;
+  reason: string;
+}
+
+export interface DetectionReport {
+  toolId: ToolId;
+  configCandidates: ConfigCandidate[];
+  binaryCandidates: BinaryCandidate[];
+  resolution: DetectionResolution;
+}
+
+export interface SetToolSetupInput {
+  toolId: ToolId;
+  binaryPath: string;
+  defaultConfigDir: string;
 }
 
 export interface AddAccountInput {

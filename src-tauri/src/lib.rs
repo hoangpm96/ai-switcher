@@ -1,4 +1,5 @@
 mod app_state;
+mod detection;
 mod models;
 mod pricing;
 mod quota;
@@ -8,8 +9,8 @@ mod usage;
 
 use app_state::ManagedState;
 use models::{
-    AddAccountInput, AddApiAccountInput, AppSnapshot, RenameAccountInput, SetLauncherInput,
-    SwitchAccountInput, ToolId, UsageReport,
+    AddAccountInput, AddApiAccountInput, AppSnapshot, DetectionReport, RenameAccountInput,
+    SetLauncherInput, SetToolSetupInput, SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -21,14 +22,31 @@ fn load_snapshot(state: State<'_, ManagedState>) -> Result<AppSnapshot, String> 
 }
 
 #[tauri::command]
-fn refresh_tool(
+async fn refresh_tool(app: tauri::AppHandle, tool_id: ToolId) -> Result<AppSnapshot, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app2.state::<ManagedState>()
+            .refresh_tool(tool_id, Some(&app2))
+            .map_err(display_error)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn refresh_account(
     app: tauri::AppHandle,
-    state: State<'_, ManagedState>,
     tool_id: ToolId,
+    account_id: String,
 ) -> Result<AppSnapshot, String> {
-    state
-        .refresh_tool(tool_id, Some(&app))
-        .map_err(display_error)
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app2.state::<ManagedState>()
+            .refresh_single_account(&tool_id, &account_id, Some(&app2))
+            .map_err(display_error)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -111,6 +129,27 @@ fn set_auto_switch(
         .map_err(display_error)
 }
 
+#[tauri::command]
+fn detect_tool_setup(state: State<'_, ManagedState>, tool_id: ToolId) -> DetectionReport {
+    state.detect_tool_setup(tool_id)
+}
+
+#[tauri::command]
+fn validate_tool_setup(
+    state: State<'_, ManagedState>,
+    input: SetToolSetupInput,
+) -> DetectionReport {
+    state.validate_tool_setup(input)
+}
+
+#[tauri::command]
+fn set_tool_setup(
+    state: State<'_, ManagedState>,
+    input: SetToolSetupInput,
+) -> Result<AppSnapshot, String> {
+    state.set_tool_setup(input).map_err(display_error)
+}
+
 /// Token usage + cost report for the Usage tab (Claude + Codex, aggregated per tool).
 /// `range_days` limits the totals to the last N local days (0 = all time).
 #[tauri::command]
@@ -134,6 +173,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_snapshot,
             refresh_tool,
+            refresh_account,
             add_account,
             add_api_account,
             fetch_gateway_models,
@@ -144,6 +184,9 @@ pub fn run() {
             accept_disclaimer,
             antigravity_new_login,
             set_auto_switch,
+            detect_tool_setup,
+            validate_tool_setup,
+            set_tool_setup,
             get_usage
         ])
         .setup(|app| {

@@ -10,6 +10,7 @@ import {
   Pencil,
   RefreshCw,
   RotateCcw,
+  Settings,
   ShieldAlert,
   Terminal,
   Trash2,
@@ -28,6 +29,11 @@ import type {
   AddAccountInput,
   AddApiAccountInput,
   AppSnapshot,
+  BinaryCandidate,
+  ConfigCandidate,
+  DetectionReport,
+  SetToolSetupInput,
+  ToolSetup,
   ToolId,
   ToolStatus,
 } from "./types";
@@ -55,20 +61,23 @@ const emptySnapshot: AppSnapshot = {
   disclaimerAccepted: true,
   autoSwitch: false,
   autoSwitchThreshold: 100,
+  toolSetups: {},
 };
 
 export function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [selectedTool, setSelectedTool] = useState<ToolId>("claude");
-  const [view, setView] = useState<"accounts" | "usage">("accounts");
+  const [view, setView] = useState<"accounts" | "usage" | "settings">("accounts");
   const [toast, setToast] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [dialog, setDialog] = useState<"add" | "rename" | "launcher" | null>(null);
+  const [refreshingAccounts, setRefreshingAccounts] = useState<Set<string>>(new Set());
+  const [dialog, setDialog] = useState<"add" | "rename" | "launcher" | "setup" | null>(null);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [switchNotice, setSwitchNotice] = useState<string | null>(null);
   const [autoSwitchBanner, setAutoSwitchBanner] = useState<string | null>(null);
   const [version, setVersion] = useState("");
+  const [setupPrompted, setSetupPrompted] = useState<Set<ToolId>>(new Set());
 
   useEffect(() => {
     getVersion()
@@ -112,6 +121,17 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!snapshot.disclaimerAccepted || dialog) return;
+    const needsSetup = snapshot.tools.find(
+      (tool) => tool.id !== "antigravity" && tool.installed && !snapshot.toolSetups[tool.id] && !setupPrompted.has(tool.id),
+    );
+    if (!needsSetup) return;
+    setSelectedTool(needsSetup.id);
+    setDialog("setup");
+    setSetupPrompted((prev) => new Set(prev).add(needsSetup.id));
+  }, [dialog, setupPrompted, snapshot]);
+
   const currentTool = useMemo(
     () => snapshot.tools.find((tool) => tool.id === selectedTool) ?? snapshot.tools[0],
     [selectedTool, snapshot.tools],
@@ -151,7 +171,47 @@ export function App() {
     }
   };
 
-  const refresh = () => run("refresh", () => api.refreshTool(selectedTool));
+  const refreshOneAccount = async (toolId: ToolId, accountId: string) => {
+    setRefreshingAccounts((prev) => new Set([...prev, accountId]));
+    try {
+      const updated = await api.refreshAccount(toolId, accountId);
+      // Merge only the refreshed account into the current snapshot so concurrent
+      // refreshes don't clobber each other's results.
+      setSnapshot((prev) => {
+        const updatedAccount = updated.tools
+          .find((t) => t.id === toolId)
+          ?.accounts.find((a) => a.id === accountId);
+        if (!updatedAccount) return prev;
+        return {
+          ...prev,
+          tools: prev.tools.map((t) =>
+            t.id !== toolId
+              ? t
+              : { ...t, accounts: t.accounts.map((a) => (a.id !== accountId ? a : updatedAccount)) },
+          ),
+        };
+      });
+    } catch {
+      // quota error is surfaced inside account.quota.error — no global toast needed
+    } finally {
+      setRefreshingAccounts((prev) => {
+        const next = new Set(prev);
+        next.delete(accountId);
+        return next;
+      });
+    }
+  };
+
+  const refresh = () => {
+    const tool = snapshot.tools.find((t) => t.id === selectedTool);
+    if (!tool) return;
+    // Fire all account refreshes in parallel so each card updates independently.
+    for (const account of tool.accounts) {
+      if (account.state !== "needs-login" && !account.apiProvider) {
+        void refreshOneAccount(selectedTool, account.id);
+      }
+    }
+  };
 
   const switchAccount = (tool: ToolStatus, account: Account) =>
     run(
@@ -234,6 +294,16 @@ export function App() {
               </span>
               <small>Token &amp; cost</small>
             </button>
+            <button
+              className={`toolTab ${view === "settings" ? "selected" : ""}`}
+              onClick={() => setView("settings")}
+            >
+              <span className="usageTabLabel">
+                <Settings />
+                Settings
+              </span>
+              <small>CLI paths</small>
+            </button>
           </div>
 
           <div className="sidebarFoot">
@@ -253,6 +323,20 @@ export function App() {
         </aside>
 
         {view === "usage" && <UsageView />}
+
+        {view === "settings" && (
+          <SettingsView
+            snapshot={snapshot}
+            busy={busy !== null}
+            onSetup={(toolId) => {
+              setSelectedTool(toolId);
+              setDialog("setup");
+            }}
+            onAutoSwitchChange={(enabled, threshold) =>
+              run("autoSwitch", () => api.setAutoSwitch(enabled, threshold))
+            }
+          />
+        )}
 
         {view === "accounts" && currentTool && (
           <section className="panel">
@@ -292,8 +376,15 @@ export function App() {
                   <LogIn />
                   {currentTool.id === "antigravity" ? "Save current account" : "Add account"}
                 </button>
-                <button onClick={refresh} disabled={busy !== null}>
-                  <RefreshCw />
+                <button
+                  onClick={refresh}
+                  disabled={busy !== null || refreshingAccounts.size > 0}
+                >
+                  {refreshingAccounts.size > 0 ? (
+                    <Loader2 className="spin" />
+                  ) : (
+                    <RefreshCw />
+                  )}
                   Refresh quota
                 </button>
               </div>
@@ -309,15 +400,11 @@ export function App() {
               </div>
             )}
 
-            {currentTool.id !== "antigravity" && (
-              <AutoSwitchBar
-                enabled={snapshot.autoSwitch}
-                threshold={snapshot.autoSwitchThreshold}
-                busy={busy !== null}
-                onChange={(enabled, threshold) =>
-                  run("autoSwitch", () => api.setAutoSwitch(enabled, threshold))
-                }
-              />
+            {currentTool.id !== "antigravity" && snapshot.autoSwitch && (
+              <div className="compactNote">
+                <Zap />
+                <span>Auto-switch at {snapshot.autoSwitchThreshold}% quota</span>
+              </div>
             )}
 
             <div className="accountGrid">
@@ -350,6 +437,8 @@ export function App() {
                     onDelete={() =>
                       run("delete", () => api.deleteAccount(currentTool.id, account.id))
                     }
+                    onRefreshQuota={() => void refreshOneAccount(currentTool.id, account.id)}
+                    refreshingQuota={refreshingAccounts.has(account.id)}
                   />
                 ))
               )}
@@ -415,7 +504,101 @@ export function App() {
           }}
         />
       )}
+
+      {dialog === "setup" && currentTool && currentTool.id !== "antigravity" && (
+        <CliSetupDialog
+          tool={currentTool}
+          currentSetup={snapshot.toolSetups[currentTool.id]}
+          onClose={() => setDialog(null)}
+          onSave={async (input) => {
+            if (await run("setup", () => api.setToolSetup(input), "CLI setup saved")) {
+              setDialog(null);
+            }
+          }}
+        />
+      )}
     </main>
+  );
+}
+
+function SettingsView({
+  snapshot,
+  busy,
+  onSetup,
+  onAutoSwitchChange,
+}: {
+  snapshot: AppSnapshot;
+  busy: boolean;
+  onSetup: (toolId: ToolId) => void;
+  onAutoSwitchChange: (enabled: boolean, threshold: number) => void;
+}) {
+  const cliTools = snapshot.tools.filter((tool) => tool.id !== "antigravity");
+  return (
+    <section className="panel">
+      <div className="panelHead">
+        <div>
+          <div className="titleRow">
+            <h2>Settings</h2>
+            <span className="status ok">CLI paths</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="settingsList">
+        {cliTools.map((tool) => (
+          <CliSetupBar
+            key={tool.id}
+            tool={tool}
+            setup={snapshot.toolSetups[tool.id]}
+            onOpen={() => onSetup(tool.id)}
+          />
+        ))}
+
+        <div className="settingsSection">
+          <div className="settingsSectionHead">
+            <Zap />
+            <div>
+              <strong>Auto-switch</strong>
+              <small>Switch the bare command when the active account reaches the quota threshold.</small>
+            </div>
+          </div>
+          <AutoSwitchBar
+            enabled={snapshot.autoSwitch}
+            threshold={snapshot.autoSwitchThreshold}
+            busy={busy}
+            onChange={onAutoSwitchChange}
+          />
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function CliSetupBar({
+  tool,
+  setup,
+  onOpen,
+}: {
+  tool: ToolStatus;
+  setup: ToolSetup | undefined;
+  onOpen: () => void;
+}) {
+  const ready = !!setup?.binaryPath && !!setup?.defaultConfigDir;
+  return (
+    <div className={`cliSetup ${ready ? "ready" : "needsSetup"}`}>
+      <Terminal />
+      <div className="cliSetupText">
+        <strong>{ready ? "CLI setup resolved" : "CLI setup needs review"}</strong>
+        <small>
+          {ready
+            ? `${shortPath(setup!.binaryPath!)} · ${shortPath(setup!.defaultConfigDir!)}`
+            : `Set where ${tool.name} is installed and where its main config lives.`}
+        </small>
+      </div>
+      <button type="button" onClick={onOpen}>
+        {ready ? "Review" : "Setup"}
+      </button>
+    </div>
   );
 }
 
@@ -428,6 +611,8 @@ function AccountCard({
   onSetLauncher,
   onCopy,
   onDelete,
+  onRefreshQuota,
+  refreshingQuota,
 }: {
   account: Account;
   tool: ToolStatus;
@@ -437,6 +622,8 @@ function AccountCard({
   onSetLauncher: () => void;
   onCopy: (text: string) => void;
   onDelete: () => void;
+  onRefreshQuota: () => void;
+  refreshingQuota: boolean;
 }) {
   const isAntigravity = tool.id === "antigravity";
   const isApi = !!account.apiProvider;
@@ -528,6 +715,16 @@ function AccountCard({
         <button onClick={onSwitch} disabled={isActive || needsLogin || busy !== null}>
           <RotateCcw /> Use
         </button>
+        {!isApi && !needsLogin && (
+          <button
+            className="iconButton"
+            onClick={onRefreshQuota}
+            disabled={refreshingQuota || busy !== null}
+            title="Refresh quota"
+          >
+            {refreshingQuota ? <Loader2 className="spin" /> : <RefreshCw />}
+          </button>
+        )}
         {tool.id !== "antigravity" && !account.isDefault && (
           <button
             className="iconButton"
@@ -957,6 +1154,196 @@ function NameDialog({
   );
 }
 
+function CliSetupDialog({
+  tool,
+  currentSetup,
+  onClose,
+  onSave,
+}: {
+  tool: ToolStatus;
+  currentSetup: ToolSetup | undefined;
+  onClose: () => void;
+  onSave: (input: SetToolSetupInput) => Promise<void>;
+}) {
+  const [report, setReport] = useState<DetectionReport | null>(null);
+  const [binaryPath, setBinaryPath] = useState(currentSetup?.binaryPath ?? "");
+  const [configDir, setConfigDir] = useState(currentSetup?.defaultConfigDir ?? "");
+  const [message, setMessage] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [manual, setManual] = useState(false);
+
+  const detect = useCallback(async () => {
+    setLoading(true);
+    setMessage(null);
+    try {
+      const next = await api.detectToolSetup(tool.id);
+      setReport(next);
+      if (next.resolution.setup?.binaryPath) setBinaryPath(next.resolution.setup.binaryPath);
+      if (next.resolution.setup?.defaultConfigDir) setConfigDir(next.resolution.setup.defaultConfigDir);
+      if (!next.resolution.setup) {
+        setManual(true);
+        setMessage(next.resolution.reason);
+      }
+    } catch (err) {
+      setMessage(errorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [tool.id]);
+
+  useEffect(() => {
+    void detect();
+  }, [detect]);
+
+  const save = async () => {
+    if (!binaryPath.trim() || !configDir.trim()) {
+      setMessage("Both binary path and config directory are required");
+      return;
+    }
+    await onSave({
+      toolId: tool.id,
+      binaryPath: binaryPath.trim(),
+      defaultConfigDir: configDir.trim(),
+    });
+  };
+
+  const binaryChoices = report?.binaryCandidates ?? [];
+  const configChoices = report?.configCandidates ?? [];
+  const simpleRecommendation =
+    binaryChoices.length <= 1 &&
+    configChoices.length <= 1 &&
+    Boolean(binaryPath.trim()) &&
+    Boolean(configDir.trim());
+  const canEditPaths = manual || !simpleRecommendation;
+
+  return (
+    <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal setupModal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modalTitleRow">
+          <div>
+            <h2>{tool.name} paths</h2>
+            <p className="modalSub">
+              Review the paths detected for this CLI.
+            </p>
+          </div>
+          <button className="iconButton" onClick={detect} disabled={loading} title="Re-detect">
+            <RefreshCw className={loading ? "spin" : ""} />
+          </button>
+        </div>
+
+        <div className="setupCurrent">
+          {canEditPaths ? (
+            <>
+              <label>
+                CLI executable
+                <input value={binaryPath} onChange={(event) => setBinaryPath(event.target.value)} />
+              </label>
+              <label>
+                Main config folder
+                <input value={configDir} onChange={(event) => setConfigDir(event.target.value)} />
+              </label>
+            </>
+          ) : (
+            <>
+              <ReadOnlyPath label="CLI executable" value={binaryPath} />
+              <ReadOnlyPath label="Main config folder" value={configDir} />
+            </>
+          )}
+        </div>
+
+        {simpleRecommendation && (
+          <div className="setupSummary">
+            <Check />
+            <div>
+              <strong>Recommended paths found</strong>
+              <small>No extra choice is needed.</small>
+            </div>
+          </div>
+        )}
+
+        {report && !simpleRecommendation && (
+          <div className="candidateGrid">
+            <CandidateList
+              title="Detected binaries"
+              kind="binary"
+              items={report.binaryCandidates}
+              selected={binaryPath}
+              onSelect={setBinaryPath}
+            />
+            <CandidateList
+              title="Detected config folders"
+              kind="config"
+              items={report.configCandidates}
+              selected={configDir}
+              onSelect={setConfigDir}
+            />
+          </div>
+        )}
+
+        {message && <p className="quotaError">{message}</p>}
+        <div className="modalActions">
+          {!canEditPaths && (
+            <button type="button" onClick={() => setManual(true)}>
+              Enter manually
+            </button>
+          )}
+          <button onClick={onClose}>Cancel</button>
+          <button className="primary" onClick={save}>
+            {simpleRecommendation ? "Save recommended paths" : "Save paths"}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ReadOnlyPath({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="readonlyPath">
+      <span>{label}</span>
+      <code>{value}</code>
+    </div>
+  );
+}
+
+function CandidateList({
+  title,
+  kind,
+  items,
+  selected,
+  onSelect,
+}: {
+  title: string;
+  kind: "binary" | "config";
+  items: Array<BinaryCandidate | ConfigCandidate>;
+  selected: string;
+  onSelect: (path: string) => void;
+}) {
+  return (
+    <div className="candidateList">
+      <strong>{title}</strong>
+      {items.length === 0 ? (
+        <span className="candidateEmpty">Nothing detected. Enter the path manually above.</span>
+      ) : (
+        items.map((item, index) => (
+          <button
+            key={`${item.source}:${item.path}`}
+            type="button"
+            className={`candidate ${selected === item.path ? "selected" : ""} ${item.valid ? "" : "weak"}`}
+            onClick={() => onSelect(item.path)}
+          >
+            <span className="candidatePath">{item.path}</span>
+            <span className="candidateMeta">
+              {candidateLabel(item, index, kind)}
+            </span>
+            {item.warnings.length > 0 && <span className="candidateWarn">{item.warnings[0]}</span>}
+          </button>
+        ))
+      )}
+    </div>
+  );
+}
+
 function activeLabel(tool: ToolStatus) {
   const account = tool.accounts.find((item) => item.id === tool.activeAccountId);
   const name = !account || account.isDefault ? "Machine default" : account.name;
@@ -985,6 +1372,32 @@ function shortFingerprint(fingerprint: string) {
   const match = fingerprint.match(/^([^:]+):([0-9a-f]{8})/i);
   if (match) return `${match[1]}:${match[2]}…`;
   return `${fingerprint.slice(0, 18)}…`;
+}
+
+function shortPath(path: string) {
+  const home = "/Users/";
+  if (path.startsWith(home)) {
+    const parts = path.split("/");
+    if (parts.length > 3) return `~/${parts.slice(3).join("/")}`;
+  }
+  return path.length > 58 ? `…${path.slice(-55)}` : path;
+}
+
+function sourceLabel(source: string) {
+  if (source === "env") return "from environment";
+  if (source === "default") return "standard location";
+  if (source === "path") return "found in PATH";
+  if (source === "manual") return "manual";
+  return source;
+}
+
+function candidateLabel(item: BinaryCandidate | ConfigCandidate, index: number, kind: "binary" | "config") {
+  const tags = [index === 0 && item.valid ? "Recommended" : null, sourceLabel(item.source)]
+    .filter(Boolean)
+    .join(" · ");
+  if (!item.valid) return `${tags} · needs review`;
+  if (kind === "config" && item.source === "default") return `${tags} · main config`;
+  return tags;
 }
 
 function formatTime(value: string) {

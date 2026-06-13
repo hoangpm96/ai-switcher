@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -57,24 +58,6 @@ pub struct QuotaInfo {
 }
 
 impl QuotaInfo {
-    pub fn unavailable(tool_name: &str) -> Self {
-        Self {
-            five_hour: QuotaWindow {
-                label: "5-hour limit".to_string(),
-                percent_used: None,
-                reset_at: None,
-            },
-            weekly: QuotaWindow {
-                label: "Weekly limit".to_string(),
-                percent_used: None,
-                reset_at: None,
-            },
-            models: None,
-            updated_at: Some(chrono::Utc::now().to_rfc3339()),
-            error: Some(format!("Couldn't read quota — check {tool_name}")),
-        }
-    }
-
     /// Empty QuotaInfo with a custom error message (e.g. "Open Antigravity IDE…").
     pub fn with_message(message: impl Into<String>) -> Self {
         Self {
@@ -164,6 +147,114 @@ pub struct AppSnapshot {
     pub disclaimer_accepted: bool,
     pub auto_switch: bool,
     pub auto_switch_threshold: f64,
+    #[serde(default)]
+    pub tool_setups: std::collections::BTreeMap<String, ToolSetup>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DetectionSource {
+    Env,
+    Default,
+    Path,
+    AppManaged,
+    Manual,
+    Fallback,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolSetup {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_config_dir: Option<PathBuf>,
+    pub binary_source: DetectionSource,
+    pub config_source: DetectionSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validated_at: Option<String>,
+    #[serde(default)]
+    pub validation_warnings: Vec<String>,
+}
+
+impl Default for ToolSetup {
+    fn default() -> Self {
+        Self {
+            binary_path: None,
+            default_config_dir: None,
+            binary_source: DetectionSource::Fallback,
+            config_source: DetectionSource::Fallback,
+            validated_at: None,
+            validation_warnings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationEvidence {
+    pub label: String,
+    pub found: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigCandidate {
+    pub path: PathBuf,
+    pub source: DetectionSource,
+    pub score: u32,
+    pub valid: bool,
+    pub is_app_managed: bool,
+    pub evidence: Vec<ValidationEvidence>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinaryCandidate {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_path: Option<PathBuf>,
+    pub source: DetectionSource,
+    pub score: u32,
+    pub valid: bool,
+    pub is_app_launcher: bool,
+    pub evidence: Vec<ValidationEvidence>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResolutionKind {
+    Resolved,
+    NeedsUserChoice,
+    NeedsManualInput,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionResolution {
+    pub kind: ResolutionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<ToolSetup>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionReport {
+    pub tool_id: ToolId,
+    pub config_candidates: Vec<ConfigCandidate>,
+    pub binary_candidates: Vec<BinaryCandidate>,
+    pub resolution: DetectionResolution,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetToolSetupInput {
+    pub tool_id: ToolId,
+    pub binary_path: PathBuf,
+    pub default_config_dir: PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
