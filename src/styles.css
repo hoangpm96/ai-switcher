@@ -15,9 +15,12 @@
   --text-2: #b7ac9d;
   --text-3: #8a8073;
 
-  /* Lines */
-  --line: rgba(255, 255, 255, 0.08);
-  --line-strong: rgba(255, 255, 255, 0.15);
+  /* Lines — hairline borders kept faint; depth comes from the top edge-light + shadow. */
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.12);
+  /* Top edge-light: a 1px inset highlight that makes a dark surface read as raised. */
+  --edge: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  --edge-strong: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 
   /* Accent (warm orange) + status */
   --accent: #fb6a1a;
@@ -36,8 +39,8 @@
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.5), 0 10px 28px rgba(0, 0, 0, 0.3);
   --shadow-pop: 0 24px 64px rgba(0, 0, 0, 0.62), 0 4px 14px rgba(0, 0, 0, 0.45);
 
-  --radius: 12px;
-  --radius-sm: 8px;
+  --radius: 13px;
+  --radius-sm: 9px;
 
   color: var(--text);
   /* Warm radial glow from the top, over the deep base. */
@@ -77,9 +80,10 @@ p {
 
 button {
   align-items: center;
-  background: var(--surface);
-  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
   border-radius: var(--radius-sm);
+  box-shadow: var(--edge);
   color: var(--text);
   cursor: pointer;
   display: inline-flex;
@@ -93,6 +97,7 @@ button {
 
 button:hover:not(:disabled) {
   background: var(--surface-hover);
+  border-color: var(--line-strong);
 }
 
 button:active:not(:disabled) {
@@ -207,8 +212,8 @@ button.danger:hover:not(:disabled) {
   transform: translateX(-50%);
   animation: floatIn 0.18s ease forwards;
   background: var(--red-soft);
-  border: 1px solid var(--red);
-  box-shadow: var(--shadow-pop);
+  border: 1px solid rgba(251, 113, 133, 0.4);
+  box-shadow: var(--edge), var(--shadow-pop);
 }
 
 .error svg:first-child {
@@ -388,7 +393,7 @@ button.danger:hover:not(:disabled) {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
+  box-shadow: var(--edge), var(--shadow-card);
   padding: 20px;
   /* Right pane scrolls on its own, independent of the sidebar. */
   min-height: 0;
@@ -429,6 +434,25 @@ button.danger:hover:not(:disabled) {
   white-space: nowrap;
 }
 
+/* Auto-switch indicator chip in the panel title row. */
+.autoChip {
+  align-items: center;
+  background: var(--accent-soft);
+  border-radius: 999px;
+  color: var(--accent);
+  display: inline-flex;
+  font-size: 11.5px;
+  font-weight: 600;
+  gap: 4px;
+  padding: 3px 9px;
+  white-space: nowrap;
+}
+
+.autoChip svg {
+  height: 13px;
+  width: 13px;
+}
+
 .ok {
   background: var(--green-soft);
   color: var(--green);
@@ -461,20 +485,26 @@ button.danger:hover:not(:disabled) {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-card);
+  box-shadow: var(--edge), var(--shadow-card);
   display: grid;
-  gap: 14px;
-  padding: 16px;
+  gap: 11px;
+  padding: 13px 14px;
   transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
 
+.account:hover {
+  border-color: var(--line-strong);
+}
+
 .account.active {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 1px var(--accent), var(--shadow-card);
+  border-color: transparent;
+  /* Accent ring sits flush with the rounded corners — cleaner than a hard border. */
+  box-shadow: 0 0 0 1.5px var(--accent), var(--edge-strong), var(--shadow-card);
 }
 
 .account.exhausted {
-  border-color: var(--amber);
+  border-color: transparent;
+  box-shadow: 0 0 0 1.5px var(--amber), var(--edge), var(--shadow-card);
 }
 
 .accountTop {
@@ -487,6 +517,11 @@ button.danger:hover:not(:disabled) {
   align-items: center;
   display: flex;
   gap: 10px;
+  min-width: 0;
+}
+
+.identityText {
+  min-width: 0;
 }
 
 .avatar {
@@ -510,12 +545,58 @@ button.danger:hover:not(:disabled) {
 .accountName {
   align-items: center;
   display: flex;
-  gap: 7px;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .accountName h3 {
   font-size: 15px;
   font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Subscription tier badge (Plus / Pro / Max) next to the name. */
+.plan {
+  background: var(--accent-soft);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 2px 7px;
+  text-transform: uppercase;
+}
+
+/* Compact per-account launcher command, click to copy. */
+.cmdChip {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text-2);
+  display: inline-flex;
+  gap: 5px;
+  min-height: 0;
+  padding: 2px 7px;
+}
+
+.cmdChip code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+}
+
+.cmdChip svg {
+  color: var(--text-3);
+  height: 12px;
+  width: 12px;
+}
+
+.cmdChip:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--line-strong);
 }
 
 .dot {
@@ -539,7 +620,7 @@ button.danger:hover:not(:disabled) {
 
 .quotaBox {
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .quotaTitle {
@@ -552,21 +633,33 @@ button.danger:hover:not(:disabled) {
 
 .quotaLine {
   display: grid;
-  gap: 5px;
+  gap: 6px;
 }
 
 .quotaMeta {
   align-items: baseline;
   color: var(--text-2);
   display: flex;
-  font-size: 12.5px;
-  justify-content: space-between;
+  font-size: 13px;
+  gap: 8px;
+}
+
+.quotaLabel {
+  font-weight: 600;
+  margin-right: auto;
 }
 
 .quotaMeta strong {
   color: var(--text);
   font-size: 13px;
   font-variant-numeric: tabular-nums;
+}
+
+.quotaReset {
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .bar {
@@ -623,7 +716,8 @@ button.danger:hover:not(:disabled) {
 
 .empty {
   align-items: center;
-  border: 1px dashed var(--line-strong);
+  background: rgba(255, 255, 255, 0.012);
+  border: 1px dashed var(--line);
   border-radius: var(--radius);
   color: var(--text-3);
   display: flex;
@@ -668,9 +762,9 @@ button.danger:hover:not(:disabled) {
 
 .modal {
   background: var(--surface);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-strong);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-pop);
+  box-shadow: var(--edge-strong), var(--shadow-pop);
   display: grid;
   gap: 16px;
   padding: 22px;
@@ -720,16 +814,24 @@ button.danger:hover:not(:disabled) {
   font-size: 11.5px;
 }
 
-.modal input {
+.modal input,
+.modal select {
   background: var(--surface-2);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line);
   border-radius: var(--radius-sm);
+  box-shadow: var(--edge);
   min-height: 38px;
   padding: 0 12px;
   transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
 
-.modal input:focus {
+.modal input:hover:not(:focus),
+.modal select:hover {
+  border-color: var(--line-strong);
+}
+
+.modal input:focus,
+.modal select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
   outline: none;
@@ -746,6 +848,7 @@ button.danger:hover:not(:disabled) {
   background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
+  box-shadow: var(--edge);
   display: flex;
   gap: 10px;
   margin-bottom: 12px;
@@ -765,6 +868,7 @@ button.danger:hover:not(:disabled) {
   background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
+  box-shadow: var(--edge);
   display: grid;
   gap: 10px;
   padding: 12px;
@@ -793,26 +897,6 @@ button.danger:hover:not(:disabled) {
 .settingsSectionHead small {
   color: var(--text-2);
   font-size: 12px;
-}
-
-.compactNote {
-  align-items: center;
-  background: var(--accent-soft);
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  color: var(--text-2);
-  display: inline-flex;
-  font-size: 12px;
-  gap: 7px;
-  margin-bottom: 12px;
-  padding: 7px 9px;
-  width: fit-content;
-}
-
-.compactNote svg {
-  color: var(--accent);
-  height: 14px;
-  width: 14px;
 }
 
 .cliSetup.needsSetup {
@@ -1023,44 +1107,10 @@ button.danger:hover:not(:disabled) {
   }
 }
 
-/* Per-account launcher chip */
-.launcherRow {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 8px 0 4px;
-  color: var(--muted, #8b8b9a);
-}
-.launcherRow svg {
-  width: 15px;
-  height: 15px;
-  flex: none;
-}
-.launcherChip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 8px;
-  border-radius: 6px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(255, 255, 255, 0.04);
-  cursor: pointer;
-  font-size: 12px;
-}
-.launcherChip code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-.launcherChip svg {
-  width: 13px;
-  height: 13px;
-}
-.launcherChip.muted {
-  opacity: 0.7;
-}
 .hint {
   display: block;
   margin-top: 4px;
-  color: var(--muted, #8b8b9a);
+  color: var(--text-3);
   font-size: 11px;
 }
 
@@ -1068,9 +1118,10 @@ button.danger:hover:not(:disabled) {
 .autoSwitch {
   margin-bottom: 12px;
   padding: 12px 14px;
-  border-radius: 10px;
-  border: 1px solid var(--border, rgba(120, 120, 130, 0.25));
-  background: var(--bg-sidebar, rgba(120, 120, 130, 0.05));
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  box-shadow: var(--edge);
+  background: var(--surface-2);
   transition: border-color 0.15s ease, background 0.15s ease;
 }
 .autoSwitch.on {
@@ -1107,7 +1158,7 @@ button.danger:hover:not(:disabled) {
 .autoSwitchText small {
   display: block;
   margin-top: 2px;
-  color: var(--muted, #8b8b9a);
+  color: var(--text-2);
   font-size: 11.5px;
   line-height: 1.45;
 }
@@ -1128,7 +1179,8 @@ button.danger:hover:not(:disabled) {
   padding: 0;
   border: none;
   border-radius: 999px;
-  background: var(--border, rgba(120, 120, 130, 0.4));
+  background: var(--line-strong);
+  box-shadow: var(--edge);
   cursor: pointer;
   transition: background 0.18s ease;
 }
@@ -1160,21 +1212,26 @@ button.danger:hover:not(:disabled) {
   gap: 8px;
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid var(--border, rgba(120, 120, 130, 0.18));
+  border-top: 1px solid var(--line);
   font-size: 12px;
-  color: var(--muted, #8b8b9a);
+  color: var(--text-2);
 }
 .pill {
   padding: 4px 12px;
   border-radius: 999px;
-  border: 1px solid var(--border, rgba(120, 120, 130, 0.3));
-  background: transparent;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: var(--edge);
   cursor: pointer;
   font-size: 12px;
 }
+.pill:hover:not(:disabled):not(.active) {
+  border-color: var(--line-strong);
+}
 .pill.active {
   background: var(--accent);
-  border-color: var(--accent);
+  border-color: transparent;
+  box-shadow: none;
   color: #fff;
 }
 .pill:disabled {
@@ -1208,7 +1265,7 @@ button.danger:hover:not(:disabled) {
 .helpDot {
   display: inline-grid;
   place-items: center;
-  color: var(--muted, #8b8b9a);
+  color: var(--text-3);
   cursor: help;
 }
 .helpDot svg {

@@ -53,6 +53,10 @@ pub struct QuotaInfo {
     /// single overall window (Claude, Codex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Vec<QuotaWindow>>,
+    /// Subscription plan label parsed from the usage API (e.g. "Plus", "Pro", "Max").
+    /// None when the API doesn't report one. Shown as a small badge next to the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     pub updated_at: Option<String>,
     pub error: Option<String>,
 }
@@ -72,6 +76,7 @@ impl QuotaInfo {
                 reset_at: None,
             },
             models: None,
+            plan: None,
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             error: Some(message.into()),
         }
@@ -145,10 +150,29 @@ pub struct ToolStatus {
 pub struct AppSnapshot {
     pub tools: Vec<ToolStatus>,
     pub disclaimer_accepted: bool,
+    /// Legacy global switch fields kept for older UI/dev snapshots.
     pub auto_switch: bool,
     pub auto_switch_threshold: f64,
     #[serde(default)]
+    pub auto_switch_settings: std::collections::BTreeMap<String, AutoSwitchSetting>,
+    #[serde(default)]
     pub tool_setups: std::collections::BTreeMap<String, ToolSetup>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoSwitchSetting {
+    pub enabled: bool,
+    pub threshold: f64,
+}
+
+impl Default for AutoSwitchSetting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: 100.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -1,4 +1,5 @@
 export type ToolId = "claude" | "codex" | "antigravity";
+export type UsageToolId = ToolId | "all";
 
 export type AccountState = "idle" | "active" | "exhausted" | "needs-login";
 
@@ -13,6 +14,8 @@ export interface QuotaInfo {
   weekly: QuotaWindow;
   /** Per-model quota detail (Antigravity). Absent for Claude/Codex. */
   models?: QuotaWindow[] | null;
+  /** Subscription plan label (e.g. "Plus", "Pro", "Max"). Absent when the API omits it. */
+  plan?: string | null;
   updatedAt: string | null;
   error: string | null;
 }
@@ -59,7 +62,13 @@ export interface AppSnapshot {
   disclaimerAccepted: boolean;
   autoSwitch: boolean;
   autoSwitchThreshold: number;
+  autoSwitchSettings: Record<string, AutoSwitchSetting>;
   toolSetups: Record<string, ToolSetup>;
+}
+
+export interface AutoSwitchSetting {
+  enabled: boolean;
+  threshold: number;
 }
 
 export type DetectionSource = "env" | "default" | "path" | "appManaged" | "manual" | "fallback";
@@ -185,7 +194,7 @@ export interface SessionUsage {
 }
 
 export interface ToolUsage {
-  toolId: ToolId;
+  toolId: UsageToolId;
   displayName: string;
   /** true = numbers are an estimate (Claude's JSONL undercounts tokens). */
   estimate: boolean;

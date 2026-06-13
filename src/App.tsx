@@ -61,6 +61,7 @@ const emptySnapshot: AppSnapshot = {
   disclaimerAccepted: true,
   autoSwitch: false,
   autoSwitchThreshold: 100,
+  autoSwitchSettings: {},
   toolSetups: {},
 };
 
@@ -136,6 +137,12 @@ export function App() {
     () => snapshot.tools.find((tool) => tool.id === selectedTool) ?? snapshot.tools[0],
     [selectedTool, snapshot.tools],
   );
+  const currentAutoSwitch = currentTool
+    ? snapshot.autoSwitchSettings[currentTool.id] ?? {
+        enabled: snapshot.autoSwitch,
+        threshold: snapshot.autoSwitchThreshold,
+      }
+    : { enabled: false, threshold: 100 };
 
   useEffect(() => {
     if (currentTool && currentTool.id !== selectedTool) {
@@ -332,8 +339,8 @@ export function App() {
               setSelectedTool(toolId);
               setDialog("setup");
             }}
-            onAutoSwitchChange={(enabled, threshold) =>
-              run("autoSwitch", () => api.setAutoSwitch(enabled, threshold))
+            onAutoSwitchChange={(toolId, enabled, threshold) =>
+              run(`autoSwitch-${toolId}`, () => api.setAutoSwitchSetting(toolId, enabled, threshold))
             }
           />
         )}
@@ -347,6 +354,15 @@ export function App() {
                   <span className={`status ${currentTool.installed ? "ok" : "muted"}`}>
                     {currentTool.installed ? "Ready" : "Tool not installed"}
                   </span>
+                  {currentTool.id !== "antigravity" && currentAutoSwitch.enabled && (
+                    <span
+                      className="autoChip"
+                      title={`Auto-switch the bare ${currentTool.id} command at ${currentAutoSwitch.threshold}% quota`}
+                    >
+                      <Zap />
+                      Auto {currentAutoSwitch.threshold}%
+                    </span>
+                  )}
                   <span className="helpDot" title={toolDescriptions[currentTool.id]}>
                     <CircleHelp />
                   </span>
@@ -397,13 +413,6 @@ export function App() {
                 <button className="iconButton" onClick={() => setSwitchNotice(null)} title="Dismiss">
                   <X />
                 </button>
-              </div>
-            )}
-
-            {currentTool.id !== "antigravity" && snapshot.autoSwitch && (
-              <div className="compactNote">
-                <Zap />
-                <span>Auto-switch at {snapshot.autoSwitchThreshold}% quota</span>
               </div>
             )}
 
@@ -530,7 +539,7 @@ function SettingsView({
   snapshot: AppSnapshot;
   busy: boolean;
   onSetup: (toolId: ToolId) => void;
-  onAutoSwitchChange: (enabled: boolean, threshold: number) => void;
+  onAutoSwitchChange: (toolId: ToolId, enabled: boolean, threshold: number) => void;
 }) {
   const cliTools = snapshot.tools.filter((tool) => tool.id !== "antigravity");
   return (
@@ -559,15 +568,25 @@ function SettingsView({
             <Zap />
             <div>
               <strong>Auto-switch</strong>
-              <small>Switch the bare command when the active account reaches the quota threshold.</small>
+              <small>Configure quota fallback separately for each CLI.</small>
             </div>
           </div>
-          <AutoSwitchBar
-            enabled={snapshot.autoSwitch}
-            threshold={snapshot.autoSwitchThreshold}
-            busy={busy}
-            onChange={onAutoSwitchChange}
-          />
+          {cliTools.map((tool) => {
+            const setting = snapshot.autoSwitchSettings[tool.id] ?? {
+              enabled: snapshot.autoSwitch,
+              threshold: snapshot.autoSwitchThreshold,
+            };
+            return (
+              <AutoSwitchBar
+                key={tool.id}
+                tool={tool}
+                enabled={setting.enabled}
+                threshold={setting.threshold}
+                busy={busy}
+                onChange={(enabled, threshold) => onAutoSwitchChange(tool.id, enabled, threshold)}
+              />
+            );
+          })}
         </div>
       </div>
     </section>
@@ -643,24 +662,28 @@ function AccountCard({
                 {account.name.slice(0, 1).toUpperCase()}
               </span>
             ))}
-          <div>
+          <div className="identityText">
             <div className="accountName">
               {isActive && <span className="dot" aria-hidden />}
-              <h3>{account.name}</h3>
+              <h3 title={account.name}>{account.name}</h3>
+              {account.quota?.plan && <span className="plan">{account.quota.plan}</span>}
+              {account.launcherCommand && (
+                <button
+                  className="cmdChip"
+                  onClick={() => onCopy(account.launcherCommand!)}
+                  title={`Copy command: ${account.launcherCommand}`}
+                >
+                  <code>{account.launcherCommand}</code>
+                  <Copy />
+                </button>
+              )}
             </div>
             {isApi ? (
               <span className="fingerprint" title={account.apiProvider!.baseUrl}>
                 via {gatewayHost(account.apiProvider!.baseUrl)}
               </span>
             ) : (
-              !isAntigravity && (
-                <span
-                  className="fingerprint"
-                  title={account.isDefault ? undefined : account.fingerprint}
-                >
-                  {account.isDefault ? "Machine default" : shortFingerprint(account.fingerprint)}
-                </span>
-              )
+              account.isDefault && <span className="fingerprint">Machine default</span>
             )}
           </div>
         </div>
@@ -688,26 +711,6 @@ function AccountCard({
               ? "Waiting for sign-in in the Antigravity IDE window — the app will detect it."
               : "Waiting for login in Terminal — the app will detect it."}
           </span>
-        </div>
-      )}
-
-      {tool.id !== "antigravity" && !account.isDefault && !needsLogin && (
-        <div className="launcherRow">
-          <Terminal />
-          {account.launcherCommand ? (
-            <button
-              className="launcherChip"
-              onClick={() => onCopy(account.launcherCommand!)}
-              title="Copy the command to run this account in any terminal"
-            >
-              <code>{account.launcherCommand}</code>
-              <Copy />
-            </button>
-          ) : (
-            <button className="launcherChip muted" onClick={onSetLauncher}>
-              Set custom command
-            </button>
-          )}
         </div>
       )}
 
@@ -756,11 +759,13 @@ function AccountCard({
 }
 
 function AutoSwitchBar({
+  tool,
   enabled,
   threshold,
   busy,
   onChange,
 }: {
+  tool: ToolStatus;
   enabled: boolean;
   threshold: number;
   busy: boolean;
@@ -773,10 +778,9 @@ function AutoSwitchBar({
           <Zap />
         </span>
         <div className="autoSwitchText">
-          <strong>Auto-switch account when quota runs out</strong>
+          <strong>{tool.name}</strong>
           <small>
-            When the active account (bare command) is nearly out → auto-switch to the account with
-            the most quota left. Custom <code>claude-…</code> commands are unaffected. Applies in new terminals.
+            Switch the bare <code>{tool.id}</code> command to another account when quota is nearly out.
           </small>
         </div>
         <button
@@ -840,13 +844,17 @@ function QuotaBar({ label, percent, resetAt }: { label: string; percent: number 
   return (
     <div className="quotaLine">
       <div className="quotaMeta">
-        <span>{label}</span>
+        <span className="quotaLabel">{label}</span>
         <strong>{percent === null ? "?" : `${Math.round(value)}%`}</strong>
+        {resetAt && (
+          <span className="quotaReset" title={`Resets at ${formatTime(resetAt)}`}>
+            {formatReset(resetAt)}
+          </span>
+        )}
       </div>
       <div className="bar" data-level={level}>
         <span style={{ width: `${value}%` }} />
       </div>
-      <small>{resetAt ? `Resets at ${formatTime(resetAt)}` : "Reset time unknown"}</small>
     </div>
   );
 }
@@ -1365,15 +1373,6 @@ function badgeClass(state: Account["state"]) {
   return "muted";
 }
 
-function shortFingerprint(fingerprint: string) {
-  // Short fingerprints (e.g. Antigravity "fp:ab12cd…") are left as-is; only long ones
-  // like "profile:f8455f1c-77f6-40ee-..." are shortened to "profile:f8455f1c…" (full value in tooltip).
-  if (fingerprint.length <= 20) return fingerprint;
-  const match = fingerprint.match(/^([^:]+):([0-9a-f]{8})/i);
-  if (match) return `${match[1]}:${match[2]}…`;
-  return `${fingerprint.slice(0, 18)}…`;
-}
-
 function shortPath(path: string) {
   const home = "/Users/";
   if (path.startsWith(home)) {
@@ -1404,6 +1403,17 @@ function formatTime(value: string) {
   return new Intl.DateTimeFormat("en-US", {
     dateStyle: "short",
     timeStyle: "short",
+  }).format(new Date(value));
+}
+
+/** Compact reset stamp shown inline on a quota row, e.g. "06/07, 17:07". */
+function formatReset(value: string) {
+  return new Intl.DateTimeFormat("en-US", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
   }).format(new Date(value));
 }
 

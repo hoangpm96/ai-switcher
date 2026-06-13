@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, BarChart3, Loader2, RefreshCw } from "lucide-react";
 import { api } from "./tauri";
@@ -15,7 +15,7 @@ export function UsageView() {
   const [report, setReport] = useState<UsageReport | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string>("claude");
+  const [selected, setSelected] = useState<string>("all");
   const [range, setRange] = useState(30);
 
   const load = useCallback(async () => {
@@ -33,6 +33,11 @@ export function UsageView() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const usageTools = useMemo(() => {
+    if (!report) return [];
+    return [buildAllUsage(report.tools), ...report.tools];
+  }, [report]);
 
   // The background poller refreshes the cache every 5 minutes → refetch with the current range.
   useEffect(() => {
@@ -84,7 +89,7 @@ export function UsageView() {
       {report && (
         <>
           <div className="usageTabs">
-            {report.tools.map((tool) => (
+            {usageTools.map((tool) => (
               <button
                 key={tool.toolId}
                 className={tool.toolId === selected ? "selected" : ""}
@@ -96,7 +101,7 @@ export function UsageView() {
             ))}
           </div>
           {(() => {
-            const tool = report.tools.find((t) => t.toolId === selected) ?? report.tools[0];
+            const tool = usageTools.find((t) => t.toolId === selected) ?? usageTools[0];
             return tool ? (
               <ToolUsageSection tool={tool} range={range} priceUnavailable={report.priceStatus === "unavailable"} />
             ) : null;
@@ -314,6 +319,90 @@ function SessionTable({ sessions }: { sessions: SessionUsage[] }) {
 }
 
 // --- helpers ---
+
+function buildAllUsage(tools: ToolUsage[]): ToolUsage {
+  const daily = mergeByDate(tools.flatMap((tool) => tool.daily));
+  const byModel = mergeByModel(tools.flatMap((tool) => tool.byModel));
+  const sessions = tools
+    .flatMap((tool) =>
+      tool.sessions.map((session) => ({
+        ...session,
+        id: `${tool.toolId}:${session.id}`,
+        model: `${tool.displayName} / ${session.model}`,
+      })),
+    )
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, 20);
+
+  return {
+    toolId: "all",
+    displayName: "All",
+    estimate: tools.some((tool) => tool.estimate),
+    total: sumTokens(tools.map((tool) => tool.total)),
+    totalCostUsd: sumNullable(tools.map((tool) => tool.totalCostUsd)),
+    today: sumTokens(tools.map((tool) => tool.today)),
+    todayCostUsd: sumNullable(tools.map((tool) => tool.todayCostUsd)),
+    daily,
+    byModel,
+    sessions,
+  };
+}
+
+function mergeByDate(days: DayUsage[]): DayUsage[] {
+  const byDate = new Map<string, { tokens: TokenBreakdown; costs: (number | null)[] }>();
+  for (const day of days) {
+    const current = byDate.get(day.date) ?? { tokens: zeroTokens(), costs: [] };
+    current.tokens = addTokens(current.tokens, day.tokens);
+    current.costs.push(day.costUsd);
+    byDate.set(day.date, current);
+  }
+  return Array.from(byDate.entries())
+    .map(([date, item]) => ({
+      date,
+      tokens: item.tokens,
+      costUsd: sumNullable(item.costs),
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function mergeByModel(models: ModelUsage[]): ModelUsage[] {
+  const byModel = new Map<string, { tokens: TokenBreakdown; costs: (number | null)[] }>();
+  for (const model of models) {
+    const current = byModel.get(model.model) ?? { tokens: zeroTokens(), costs: [] };
+    current.tokens = addTokens(current.tokens, model.tokens);
+    current.costs.push(model.costUsd);
+    byModel.set(model.model, current);
+  }
+  return Array.from(byModel.entries())
+    .map(([model, item]) => ({
+      model,
+      tokens: item.tokens,
+      costUsd: sumNullable(item.costs),
+    }))
+    .sort((a, b) => total(b.tokens) - total(a.tokens));
+}
+
+function sumTokens(items: TokenBreakdown[]) {
+  return items.reduce(addTokens, zeroTokens());
+}
+
+function addTokens(a: TokenBreakdown, b: TokenBreakdown): TokenBreakdown {
+  return {
+    input: a.input + b.input,
+    output: a.output + b.output,
+    cacheRead: a.cacheRead + b.cacheRead,
+    cacheCreation: a.cacheCreation + b.cacheCreation,
+  };
+}
+
+function zeroTokens(): TokenBreakdown {
+  return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+}
+
+function sumNullable(values: (number | null)[]) {
+  const present = values.filter((value): value is number => value != null);
+  return present.length > 0 ? present.reduce((sum, value) => sum + value, 0) : null;
+}
 
 function total(t: TokenBreakdown) {
   return t.input + t.output + t.cacheRead + t.cacheCreation;

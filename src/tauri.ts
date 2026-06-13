@@ -25,6 +25,10 @@ const demoSnapshot: AppSnapshot = {
   disclaimerAccepted: false,
   autoSwitch: false,
   autoSwitchThreshold: 100,
+  autoSwitchSettings: {
+    claude: { enabled: false, threshold: 100 },
+    codex: { enabled: true, threshold: 95 },
+  },
   toolSetups: {
     claude: {
       binaryPath: "/Users/demo/.local/bin/claude",
@@ -225,6 +229,25 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
     };
     return structuredClone(demoSnapshot) as T;
   }
+  if (command === "set_auto_switch_setting") {
+    const toolId = args?.toolId as ToolId;
+    demoSnapshot.autoSwitchSettings[toolId] = {
+      enabled: Boolean(args?.enabled),
+      threshold: Number(args?.threshold ?? 100),
+    };
+    demoSnapshot.autoSwitch = Object.values(demoSnapshot.autoSwitchSettings).some((setting) => setting.enabled);
+    demoSnapshot.autoSwitchThreshold = demoSnapshot.autoSwitchSettings[toolId].threshold;
+    return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "set_auto_switch") {
+    const enabled = Boolean(args?.enabled);
+    const threshold = Number(args?.threshold ?? 100);
+    demoSnapshot.autoSwitch = enabled;
+    demoSnapshot.autoSwitchThreshold = threshold;
+    demoSnapshot.autoSwitchSettings.claude = { enabled, threshold };
+    demoSnapshot.autoSwitchSettings.codex = { enabled, threshold };
+    return structuredClone(demoSnapshot) as T;
+  }
   if (command === "add_api_account") {
     return structuredClone(demoSnapshot) as T;
   }
@@ -253,6 +276,8 @@ export const api = {
   antigravityNewLogin: () => invoke<AppSnapshot>("antigravity_new_login"),
   setAutoSwitch: (enabled: boolean, threshold: number) =>
     invoke<AppSnapshot>("set_auto_switch", { enabled, threshold }),
+  setAutoSwitchSetting: (toolId: ToolId, enabled: boolean, threshold: number) =>
+    invoke<AppSnapshot>("set_auto_switch_setting", { toolId, enabled, threshold }),
   detectToolSetup: (toolId: ToolId) => invoke<DetectionReport>("detect_tool_setup", { toolId }),
   validateToolSetup: (input: SetToolSetupInput) =>
     invoke<DetectionReport>("validate_tool_setup", { input }),

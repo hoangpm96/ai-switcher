@@ -1,7 +1,7 @@
 use crate::models::{
     Account, AccountState, AddAccountInput, AddApiAccountInput, ApiProvider, AppSnapshot,
-    DetectionReport, QuotaInfo, RenameAccountInput, SetLauncherInput, SetToolSetupInput,
-    SwitchAccountInput, ToolId, ToolStatus, UsageReport,
+    AutoSwitchSetting, DetectionReport, QuotaInfo, RenameAccountInput, SetLauncherInput,
+    SetToolSetupInput, SwitchAccountInput, ToolId, ToolStatus, UsageReport,
 };
 use crate::quota::read_quota;
 use crate::store::{normalize_account_states, Store, StoredState};
@@ -30,6 +30,7 @@ impl ManagedState {
         let store = Store::new()?;
         let mut data = store.load()?;
         migrate_defaults(&mut data.accounts);
+        migrate_auto_switch_settings(&mut data);
         autodetect_missing_tool_setups(&store, &mut data);
         store.save(&data)?;
         let managed = Self {
@@ -277,15 +278,15 @@ impl ManagedState {
             }
         }
 
-        let (auto_switch, threshold) = {
+        let setting = {
             let data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            (data.auto_switch, data.auto_switch_threshold)
+            auto_switch_setting(&data, &tool_id)
         };
-        if auto_switch {
-            self.maybe_auto_switch(&tool_id, threshold, app)?;
+        if setting.enabled {
+            self.maybe_auto_switch(&tool_id, setting.threshold, app)?;
         }
         self.snapshot()
     }
@@ -355,20 +356,20 @@ impl ManagedState {
             notify_exhausted(app, &account);
         }
 
-        let (auto_switch, threshold) = {
+        let setting = {
             let data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            (data.auto_switch, data.auto_switch_threshold)
+            auto_switch_setting(&data, tool_id)
         };
-        if auto_switch {
-            self.maybe_auto_switch(tool_id, threshold, app)?;
+        if setting.enabled {
+            self.maybe_auto_switch(tool_id, setting.threshold, app)?;
         }
         self.snapshot()
     }
 
-    /// Enable/disable auto-switch + set the threshold (% used that triggers it).
+    /// Legacy command: apply the same auto-switch setting to Claude and Codex.
     pub fn set_auto_switch(&self, enabled: bool, threshold: f64) -> Result<AppSnapshot> {
         {
             let mut data = self
@@ -377,6 +378,48 @@ impl ManagedState {
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             data.auto_switch = enabled;
             data.auto_switch_threshold = threshold.clamp(50.0, 100.0);
+            let threshold = data.auto_switch_threshold;
+            for tool_id in [ToolId::Claude, ToolId::Codex] {
+                data.auto_switch_settings.insert(
+                    tool_id.as_str().to_string(),
+                    AutoSwitchSetting { enabled, threshold },
+                );
+            }
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    /// Enable/disable auto-switch + set the threshold for one CLI tool.
+    pub fn set_auto_switch_setting(
+        &self,
+        tool_id: ToolId,
+        enabled: bool,
+        threshold: f64,
+    ) -> Result<AppSnapshot> {
+        if matches!(tool_id, ToolId::Antigravity) {
+            anyhow::bail!("Auto-switch is only supported for Claude Code and Codex");
+        }
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.auto_switch_settings.insert(
+                tool_id.as_str().to_string(),
+                AutoSwitchSetting {
+                    enabled,
+                    threshold: threshold.clamp(50.0, 100.0),
+                },
+            );
+            let claude = auto_switch_setting(&data, &ToolId::Claude);
+            let codex = auto_switch_setting(&data, &ToolId::Codex);
+            data.auto_switch = claude.enabled || codex.enabled;
+            data.auto_switch_threshold = if claude.enabled {
+                claude.threshold
+            } else {
+                codex.threshold
+            };
             self.store.save(&data)?;
         }
         self.snapshot()
@@ -1091,6 +1134,20 @@ fn configured_binary_path(data: &StoredState, tool_id: &ToolId) -> Option<std::p
         .and_then(|setup| setup.binary_path.clone())
 }
 
+fn default_auto_switch_setting_from_legacy(data: &StoredState) -> AutoSwitchSetting {
+    AutoSwitchSetting {
+        enabled: data.auto_switch,
+        threshold: data.auto_switch_threshold.clamp(50.0, 100.0),
+    }
+}
+
+fn auto_switch_setting(data: &StoredState, tool_id: &ToolId) -> AutoSwitchSetting {
+    data.auto_switch_settings
+        .get(tool_id.as_str())
+        .cloned()
+        .unwrap_or_else(|| default_auto_switch_setting_from_legacy(data))
+}
+
 /// Drop the old-style "system-default" account, ensuring each CLI tool has one machine Default
 /// account (pointing to ~/.claude, ~/.codex) — read-only, reading quota like a normal account.
 fn migrate_defaults(accounts: &mut Vec<Account>) {
@@ -1121,6 +1178,20 @@ fn migrate_defaults(accounts: &mut Vec<Account>) {
             api_provider: None,
         });
     }
+}
+
+fn migrate_auto_switch_settings(data: &mut StoredState) {
+    let legacy = default_auto_switch_setting_from_legacy(data);
+    for tool_id in [ToolId::Claude, ToolId::Codex] {
+        data.auto_switch_settings
+            .entry(tool_id.as_str().to_string())
+            .or_insert_with(|| legacy.clone());
+    }
+    data.auto_switch_settings.remove(ToolId::Antigravity.as_str());
+    data.auto_switch = data
+        .auto_switch_settings
+        .values()
+        .any(|setting| setting.enabled);
 }
 
 fn build_snapshot(store: &Store, data: &StoredState) -> AppSnapshot {
@@ -1161,6 +1232,7 @@ fn build_snapshot(store: &Store, data: &StoredState) -> AppSnapshot {
         disclaimer_accepted: data.disclaimer_accepted,
         auto_switch: data.auto_switch,
         auto_switch_threshold: data.auto_switch_threshold,
+        auto_switch_settings: data.auto_switch_settings.clone(),
         tool_setups: data.tool_setups.clone(),
     }
 }

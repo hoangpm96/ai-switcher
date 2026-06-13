@@ -5,6 +5,7 @@ mod pricing;
 mod quota;
 mod store;
 mod tools;
+mod tray;
 mod usage;
 
 use app_state::ManagedState;
@@ -24,13 +25,15 @@ fn load_snapshot(state: State<'_, ManagedState>) -> Result<AppSnapshot, String> 
 #[tauri::command]
 async fn refresh_tool(app: tauri::AppHandle, tool_id: ToolId) -> Result<AppSnapshot, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         app2.state::<ManagedState>()
             .refresh_tool(tool_id, Some(&app2))
             .map_err(display_error)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    tray::rebuild(&app);
+    result
 }
 
 #[tauri::command]
@@ -40,13 +43,15 @@ async fn refresh_account(
     account_id: String,
 ) -> Result<AppSnapshot, String> {
     let app2 = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         app2.state::<ManagedState>()
             .refresh_single_account(&tool_id, &account_id, Some(&app2))
             .map_err(display_error)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    tray::rebuild(&app);
+    result
 }
 
 #[tauri::command]
@@ -55,15 +60,20 @@ fn add_account(
     state: State<'_, ManagedState>,
     input: AddAccountInput,
 ) -> Result<AppSnapshot, String> {
-    state.add_account(&app, input).map_err(display_error)
+    let snapshot = state.add_account(&app, input).map_err(display_error)?;
+    tray::rebuild(&app);
+    Ok(snapshot)
 }
 
 #[tauri::command]
 fn add_api_account(
+    app: tauri::AppHandle,
     state: State<'_, ManagedState>,
     input: AddApiAccountInput,
 ) -> Result<AppSnapshot, String> {
-    state.add_api_account(input).map_err(display_error)
+    let snapshot = state.add_api_account(input).map_err(display_error)?;
+    tray::rebuild(&app);
+    Ok(snapshot)
 }
 
 /// List the gateway's models (`{base_url}/models`) so the Add dialog can offer a default model +
@@ -75,18 +85,24 @@ fn fetch_gateway_models(base_url: String, api_key: String) -> Result<Vec<String>
 
 #[tauri::command]
 fn rename_account(
+    app: tauri::AppHandle,
     state: State<'_, ManagedState>,
     input: RenameAccountInput,
 ) -> Result<AppSnapshot, String> {
-    state.rename_account(input).map_err(display_error)
+    let snapshot = state.rename_account(input).map_err(display_error)?;
+    tray::rebuild(&app);
+    Ok(snapshot)
 }
 
 #[tauri::command]
 fn switch_account(
+    app: tauri::AppHandle,
     state: State<'_, ManagedState>,
     input: SwitchAccountInput,
 ) -> Result<AppSnapshot, String> {
-    state.switch_account(input).map_err(display_error)
+    let snapshot = state.switch_account(input).map_err(display_error)?;
+    tray::rebuild(&app);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -99,13 +115,16 @@ fn set_launcher(
 
 #[tauri::command]
 fn delete_account(
+    app: tauri::AppHandle,
     state: State<'_, ManagedState>,
     tool_id: ToolId,
     account_id: String,
 ) -> Result<AppSnapshot, String> {
-    state
+    let snapshot = state
         .delete_account(tool_id, account_id)
-        .map_err(display_error)
+        .map_err(display_error)?;
+    tray::rebuild(&app);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -126,6 +145,18 @@ fn set_auto_switch(
 ) -> Result<AppSnapshot, String> {
     state
         .set_auto_switch(enabled, threshold)
+        .map_err(display_error)
+}
+
+#[tauri::command]
+fn set_auto_switch_setting(
+    state: State<'_, ManagedState>,
+    tool_id: ToolId,
+    enabled: bool,
+    threshold: f64,
+) -> Result<AppSnapshot, String> {
+    state
+        .set_auto_switch_setting(tool_id, enabled, threshold)
         .map_err(display_error)
 }
 
@@ -184,12 +215,16 @@ pub fn run() {
             accept_disclaimer,
             antigravity_new_login,
             set_auto_switch,
+            set_auto_switch_setting,
             detect_tool_setup,
             validate_tool_setup,
             set_tool_setup,
             get_usage
         ])
         .setup(|app| {
+            // Menu-bar (tray) icon for quick account switching without opening the window.
+            tray::create(app.handle())?;
+
             // Background poller: periodically refresh quota + auto-switch if enabled.
             // Refresh every 5 minutes (Claude's quota endpoint is rate-limited hard;
             // the 5h/weekly quota changes slowly, so no need to poll more often).
@@ -204,11 +239,32 @@ pub fn run() {
                 // (with whatever range the user has selected).
                 let _ = state.usage_report(0);
                 let _ = handle.emit("usage-changed", ());
+                // Refresh the tray menu's quota %/checkmarks with the new snapshot.
+                tray::rebuild(&handle);
             });
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .on_window_event(|window, event| {
+            // Close (✕) hides the main window to the tray instead of quitting — the poller and
+            // tray stay alive so quick-switch keeps working. Quit is via the tray menu.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Clicking the Dock icon while the window is hidden (closed to tray) reopens it.
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        });
 }
 
 fn display_error(error: anyhow::Error) -> String {

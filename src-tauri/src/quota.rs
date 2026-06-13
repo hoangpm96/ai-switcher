@@ -94,9 +94,23 @@ fn quota_from_claude_usage(value: &serde_json::Value) -> Result<QuotaInfo> {
         five_hour,
         weekly,
         models: None,
+        plan: claude_plan(value),
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
+}
+
+/// Best-effort plan label from Claude's usage payload. The endpoint isn't documented to
+/// always carry one, so try a few likely keys and ignore if absent.
+fn claude_plan(value: &serde_json::Value) -> Option<String> {
+    for key in ["subscription_type", "plan", "plan_type", "tier", "account_type"] {
+        if let Some(raw) = value.get(key).and_then(serde_json::Value::as_str) {
+            if let Some(plan) = pretty_plan(raw) {
+                return Some(plan);
+            }
+        }
+    }
+    None
 }
 
 fn claude_window(label: &str, value: Option<&serde_json::Value>) -> QuotaWindow {
@@ -354,6 +368,13 @@ fn antigravity_user_status(port: u16, csrf: &str) -> Result<String> {
 }
 
 fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo> {
+    let plan = value
+        .get("userStatus")
+        .and_then(|status| status.get("planStatus"))
+        .and_then(|status| status.get("planInfo"))
+        .and_then(|info| info.get("planName"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(pretty_plan);
     let configs = value
         .get("userStatus")
         .and_then(|status| status.get("cascadeModelConfigData"))
@@ -417,6 +438,7 @@ fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo>
             reset_at: None,
         },
         models: Some(models),
+        plan,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -537,6 +559,10 @@ fn quota_from_codex_endpoint(value: &serde_json::Value) -> Result<QuotaInfo> {
         five_hour,
         weekly,
         models: None,
+        plan: value
+            .get("plan_type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(pretty_plan),
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -669,6 +695,10 @@ fn quota_from_codex_rate_limits(limits: &serde_json::Value) -> Result<QuotaInfo>
         five_hour,
         weekly,
         models: None,
+        plan: limits
+            .get("plan_type")
+            .and_then(serde_json::Value::as_str)
+            .and_then(pretty_plan),
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -676,6 +706,27 @@ fn quota_from_codex_rate_limits(limits: &serde_json::Value) -> Result<QuotaInfo>
 
 fn unix_to_rfc3339(seconds: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(seconds, 0).map(|dt| dt.to_rfc3339())
+}
+
+/// Normalises a raw plan string from the usage API into a short display label.
+/// e.g. "plus" → "Plus", "chatgpt_pro" → "Pro", "claude_max_20x" → "Max".
+fn pretty_plan(raw: &str) -> Option<String> {
+    let cleaned = raw.trim().to_lowercase();
+    if cleaned.is_empty() || cleaned == "free" || cleaned == "unknown" {
+        return None;
+    }
+    // Pick the most recognisable tier keyword if present; otherwise title-case the last token.
+    for tier in ["max", "pro", "plus", "team", "enterprise", "edu", "business"] {
+        if cleaned.contains(tier) {
+            let mut chars = tier.chars();
+            let first = chars.next().unwrap().to_uppercase().to_string();
+            return Some(format!("{first}{}", chars.as_str()));
+        }
+    }
+    let token = cleaned.split(['_', '-', ' ']).next_back().unwrap_or(&cleaned);
+    let mut chars = token.chars();
+    let first = chars.next()?.to_uppercase().to_string();
+    Some(format!("{first}{}", chars.as_str()))
 }
 
 #[cfg(test)]
@@ -691,6 +742,7 @@ mod tests {
         assert_eq!(quota.weekly.percent_used, Some(21.0));
         assert!(quota.five_hour.reset_at.is_some());
         assert!(quota.weekly.reset_at.is_some());
+        assert_eq!(quota.plan.as_deref(), Some("Plus"));
         assert!(quota.error.is_none());
     }
 
@@ -713,6 +765,7 @@ mod tests {
             Some("2026-05-31T13:00:00Z")
         );
         assert!(quota.weekly.percent_used.is_none());
+        assert_eq!(quota.plan.as_deref(), Some("Pro"));
     }
 
     #[test]
@@ -745,6 +798,7 @@ mod tests {
         assert_eq!(quota.weekly.percent_used, Some(0.0));
         assert!(quota.five_hour.reset_at.is_some());
         assert!(quota.weekly.reset_at.is_some());
+        assert_eq!(quota.plan.as_deref(), Some("Plus"));
     }
 
     #[test]
