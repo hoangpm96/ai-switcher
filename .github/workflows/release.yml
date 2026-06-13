@@ -41,10 +41,15 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "AI Account Switcher ${{ github.ref_name }}"
           releaseBody: |
-            macOS build (universal).
+            Universal macOS build (`.dmg` under **Assets**).
 
             The app is not code-signed. On first launch, right-click the app → Open,
             or run `xattr -cr "/Applications/AI Account Switcher.app"`.
+
+            See the [CHANGELOG](https://github.com/hoangpm96/ai-switcher/blob/main/CHANGELOG.md)
+            for what changed in this version.
           releaseDraft: true
           prerelease: false
+          # Auto-append the list of merged commits/PRs since the last tag.
+          generateReleaseNotes: true
           args: --target universal-apple-darwin

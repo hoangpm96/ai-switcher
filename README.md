@@ -15,7 +15,10 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 ## Features
 
 - **One window for every tool.** Log in, switch, rename, and remove accounts per tool.
-- **Quota at a glance.** Reads 5-hour / weekly usage for Claude & Codex and per-model quota for Antigravity, with an optional **auto-switch** when the active account runs out.
+- **Menu-bar quick switch.** A tray icon in the macOS menu bar lists your Claude & Codex accounts (with quota % and plan) so you can switch without opening the window. Closing the window hides the app to the tray; it keeps polling quota in the background.
+- **Quota at a glance.** Reads 5-hour / weekly usage for Claude & Codex and per-model quota for Antigravity, and shows your **subscription plan** (Plus / Pro / Max) when the API reports it.
+- **Per-tool auto-switch.** Configure separately for Claude and Codex — the bare command falls back to another account when the active one nears its quota.
+- **Usage & cost tab.** Token usage and estimated cost per tool, plus an aggregated **All** view across tools, charted over a selectable date range.
 
 ### Claude Code & Codex (CLI)
 
@@ -57,12 +60,14 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a tag like `v0.1.0` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and attaches it to a draft GitHub Release:
+Pushing a version tag like `v0.2.0` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and attaches it to a draft GitHub Release. Bump the version in `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` first, then:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for the per-version history.
 
 ## License
 
