@@ -131,9 +131,10 @@ impl ManagedState {
     }
 
     pub fn start_api_gateway(&self, input: StartApiGatewayInput) -> Result<AppSnapshot> {
-        // Refresh the provider model registry on each start. Individual account failures are
-        // retained in the registry and do not prevent healthy pools from serving requests.
-        let _ = self.refresh_api_gateway_models();
+        // NOTE: do NOT refresh the model registry here. Discovery spawns a Codex subprocess and
+        // makes blocking HTTP calls per account — doing that inline froze Start (and could hang
+        // the whole app). The gateway serves fine without a fresh registry (name heuristics +
+        // the cached registry). The UI kicks off a background refresh after Start succeeds.
         let bind_host = input.bind_host.trim();
         if !matches!(bind_host, "127.0.0.1" | "0.0.0.0") {
             anyhow::bail!("API server bind address must be 127.0.0.1 or 0.0.0.0");

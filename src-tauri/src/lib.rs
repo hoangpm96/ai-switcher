@@ -198,11 +198,17 @@ fn get_api_usage(state: State<'_, ManagedState>) -> ApiUsageReport {
 }
 
 #[tauri::command]
-fn start_api_gateway(
-    state: State<'_, ManagedState>,
+async fn start_api_gateway(
+    app: tauri::AppHandle,
     input: StartApiGatewayInput,
 ) -> Result<AppSnapshot, String> {
-    state.start_api_gateway(input).map_err(display_error)
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedState>()
+            .start_api_gateway(input)
+            .map_err(display_error)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]

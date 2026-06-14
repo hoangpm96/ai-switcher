@@ -827,13 +827,16 @@ function ApiGatewayView({
     return () => window.clearInterval(timer);
   }, [onRefresh, running]);
 
-  const submitStart = () =>
-    onStart({
+  const submitStart = async () => {
+    const ok = await onStart({
       bindHost: allowLan ? "0.0.0.0" : "127.0.0.1",
       port: Number(port) || 8783,
       quotaThreshold: Number(threshold) || 95,
       rotationStrategy,
     });
+    // Refresh the model registry in the background — Start no longer waits on it.
+    if (ok) void onRefreshModels().catch(() => {});
+  };
 
   const openCreateCombo = () => {
     setComboEditing(null);

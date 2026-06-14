@@ -1115,7 +1115,10 @@ fn discover_claude_models(config_dir: &FsPath, binary: Option<&FsPath>) -> Resul
     let token = crate::quota::claude_oauth_token_fresh(config_dir, binary)
         .context("Claude OAuth token is missing or expired")?;
     let version = crate::quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());
-    let value = reqwest::blocking::Client::new()
+    let value = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("Couldn't build HTTP client")?
         .get("https://api.anthropic.com/v1/models?limit=1000")
         .bearer_auth(token)
         .header("anthropic-version", "2023-06-01")
@@ -1179,10 +1182,27 @@ fn discover_codex_models(config_dir: &FsPath, binary: Option<&FsPath>) -> Result
         std::thread::sleep(Duration::from_secs(2));
     }
     drop(child.stdin.take());
-    let output = child
-        .wait_with_output()
-        .context("Couldn't read Codex model registry")?;
-    let response = String::from_utf8_lossy(&output.stdout)
+    // `codex app-server` may keep running after we close stdin, so never block on it: wait up to a
+    // short deadline, then kill it. We read whatever it already wrote either way.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => return Err(error).context("Couldn't poll Codex model registry"),
+        }
+    }
+    let mut stdout = Vec::new();
+    if let Some(mut handle) = child.stdout.take() {
+        use std::io::Read;
+        let _ = handle.read_to_end(&mut stdout);
+    }
+    let response = String::from_utf8_lossy(&stdout)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .find(|message| message.get("id").and_then(Value::as_i64) == Some(2))
