@@ -1017,8 +1017,9 @@ fn build_claude_request(
     state: &GatewayState,
     data: &StoredState,
     account: &Account,
-    body: Value,
+    mut body: Value,
 ) -> std::result::Result<reqwest::RequestBuilder, Response> {
+    sanitize_anthropic_body(&mut body);
     let config_dir = account_config_dir(&state.store, data, account);
     let binary = data
         .tool_setups
@@ -1043,6 +1044,30 @@ fn build_claude_request(
             format!("claude-cli/{version} (external, sdk-cli)"),
         )
         .json(&body))
+}
+
+/// Strip request fields that newer Claude Code clients send but the Anthropic OAuth Messages
+/// endpoint rejects (e.g. `context_management` → "Extra inputs are not permitted"). We only forward
+/// the documented Messages API fields, so an evolving client can't 400 the upstream.
+fn sanitize_anthropic_body(body: &mut Value) {
+    const ALLOWED: &[&str] = &[
+        "model",
+        "messages",
+        "system",
+        "max_tokens",
+        "metadata",
+        "stop_sequences",
+        "stream",
+        "temperature",
+        "top_k",
+        "top_p",
+        "tools",
+        "tool_choice",
+        "thinking",
+    ];
+    if let Some(object) = body.as_object_mut() {
+        object.retain(|key, _| ALLOWED.contains(&key.as_str()));
+    }
 }
 
 fn build_codex_request(
@@ -2578,6 +2603,27 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
         let fill_first = select_member(&state, &data, &combo, "fill", &tried).unwrap();
         assert_eq!(fill_first.account.id, "a1");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sanitize_anthropic_body_drops_unknown_client_fields() {
+        let mut body = json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "stream": true,
+            "context_management": {"edits": []},
+            "anthropic_beta": ["x"],
+            "betas": ["y"]
+        });
+        sanitize_anthropic_body(&mut body);
+        assert!(body.get("context_management").is_none());
+        assert!(body.get("anthropic_beta").is_none());
+        assert!(body.get("betas").is_none());
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(body["max_tokens"], 100);
+        assert_eq!(body["stream"], true);
+        assert!(body.get("messages").is_some());
     }
 
     #[test]
