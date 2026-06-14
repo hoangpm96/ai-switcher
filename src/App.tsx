@@ -762,6 +762,7 @@ function ApiGatewayView({
   const [virtualTool, setVirtualTool] = useState<ToolId | null>(null);
   const [showModels, setShowModels] = useState(false);
   const [usage, setUsage] = useState<ApiUsageReport | null>(null);
+  const [starting, setStarting] = useState(false);
 
   const running = gateway.status.state === "running";
   const hasVirtualClaude = snapshot.tools
@@ -829,14 +830,19 @@ function ApiGatewayView({
   }, [onRefresh, running]);
 
   const submitStart = async () => {
-    const ok = await onStart({
-      bindHost: allowLan ? "0.0.0.0" : "127.0.0.1",
-      port: Number(port) || 8783,
-      quotaThreshold: Number(threshold) || 95,
-      rotationStrategy,
-    });
-    // Refresh the model registry in the background — Start no longer waits on it.
-    if (ok) void onRefreshModels().catch(() => {});
+    setStarting(true);
+    try {
+      const ok = await onStart({
+        bindHost: allowLan ? "0.0.0.0" : "127.0.0.1",
+        port: Number(port) || 8783,
+        quotaThreshold: Number(threshold) || 95,
+        rotationStrategy,
+      });
+      // Refresh the model registry in the background — Start no longer waits on it.
+      if (ok) void onRefreshModels().catch(() => {});
+    } finally {
+      setStarting(false);
+    }
   };
 
   const openCreateCombo = () => {
@@ -856,8 +862,18 @@ function ApiGatewayView({
         <div>
           <div className="titleRow">
             <h2>API</h2>
-            <span className={`status ${running ? "ok" : gateway.status.state === "errored" ? "bad" : "muted"}`}>
-              {running ? "Running" : gateway.status.state === "errored" ? "Errored" : "Stopped"}
+            <span
+              className={`status ${
+                starting ? "muted" : running ? "ok" : gateway.status.state === "errored" ? "bad" : "muted"
+              }`}
+            >
+              {starting
+                ? "Starting…"
+                : running
+                  ? "Running"
+                  : gateway.status.state === "errored"
+                    ? "Errored"
+                    : "Stopped"}
             </span>
           </div>
           <p className="panelLead">Local OpenAI/Anthropic-compatible gateway for Claude and Codex subscription accounts.</p>
@@ -873,9 +889,9 @@ function ApiGatewayView({
               Stop
             </button>
           ) : (
-            <button className="primary" onClick={submitStart} disabled={busy}>
-              <Server />
-              Start
+            <button className="primary" onClick={submitStart} disabled={busy || starting}>
+              {starting ? <Loader2 className="spin" /> : <Server />}
+              {starting ? "Starting…" : "Start"}
             </button>
           )}
         </div>
@@ -1180,6 +1196,7 @@ function ApiGatewayView({
           busy={busy}
           tool={virtualTool}
           combos={gateway.config.combos.filter((combo) => combo.enabled)}
+          modelsByProvider={modelsByProvider}
           currentModel={
             snapshot.tools
               .find((t) => t.id === virtualTool)
@@ -1200,6 +1217,7 @@ function VirtualAccountModal({
   busy,
   tool,
   combos,
+  modelsByProvider,
   currentModel,
   onClose,
   onConfirm,
@@ -1207,40 +1225,72 @@ function VirtualAccountModal({
   busy: boolean;
   tool: ToolId;
   combos: ApiGatewayCombo[];
+  modelsByProvider: { tool: ToolId; label: string; models: string[] }[];
   currentModel: string | null;
   onClose: () => void;
   onConfirm: (model: string) => Promise<void>;
 }) {
   const toolName = tool === "claude" ? "Claude Code" : "Codex";
-  const [model, setModel] = useState(
-    currentModel && combos.some((c) => c.name === currentModel)
-      ? currentModel
-      : combos[0]?.name ?? "",
-  );
+  const [model, setModel] = useState(currentModel ?? combos[0]?.name ?? "");
   return (
     <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
       <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
         <h2>{currentModel ? `Update ${toolName}` : `Add to ${toolName}`}</h2>
         <p className="hint">
           A <code>{tool === "claude" ? "claude-api" : "codex-api"}</code> account is added to{" "}
-          {toolName} pointing at the local gateway. Pick which combo (model) it requests.
+          {toolName} pointing at the local gateway. Choose the model it requests — a combo (with
+          fallback) or any single model the gateway can serve.
         </p>
         <label>
-          Combo (model)
-          <select value={model} onChange={(event) => setModel(event.target.value)}>
-            {combos.map((combo) => (
-              <option value={combo.name} key={combo.id}>
-                {combo.name}
-              </option>
-            ))}
-          </select>
+          Model
+          <input
+            value={model}
+            onChange={(event) => setModel(event.target.value)}
+            placeholder="combo name or model id"
+          />
         </label>
+        <div className="comboPicker">
+          {combos.length > 0 && (
+            <div className="apiModelGroup">
+              <small className="apiModelGroupLabel">Combos</small>
+              <div className="apiModelChips">
+                {combos.map((combo) => (
+                  <button
+                    key={combo.id}
+                    className={`apiModelChip pickable ${model === combo.name ? "picked" : ""}`}
+                    onClick={() => setModel(combo.name)}
+                  >
+                    {combo.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {modelsByProvider.map((group) => (
+            <div className="apiModelGroup" key={group.tool}>
+              <small className="apiModelGroupLabel">
+                {group.label} ({group.models.length})
+              </small>
+              <div className="apiModelChips">
+                {group.models.map((name) => (
+                  <button
+                    key={name}
+                    className={`apiModelChip pickable ${model === name ? "picked" : ""}`}
+                    onClick={() => setModel(name)}
+                  >
+                    {name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
         <div className="modalActions">
           <button onClick={onClose}>Cancel</button>
           <button
             className="primary"
-            onClick={() => model && onConfirm(model)}
-            disabled={busy || !model}
+            onClick={() => model.trim() && onConfirm(model.trim())}
+            disabled={busy || !model.trim()}
           >
             <Terminal />
             {currentModel ? "Update" : "Add"}

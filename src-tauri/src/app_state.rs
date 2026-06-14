@@ -245,22 +245,24 @@ impl ManagedState {
                     secret
                 }
             };
-            // Bind to the requested combo if given (and still enabled), else the first enabled one.
+            // Bind to the requested model if given — a combo name OR any model the gateway can
+            // serve directly. Else fall back to the first enabled combo.
             let model = match input.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
-                Some(requested) => data
-                    .api_gateway
-                    .combos
-                    .iter()
-                    .find(|combo| combo.enabled && combo.name == requested)
-                    .map(|combo| combo.name.clone())
-                    .with_context(|| format!("Combo '{requested}' not found or disabled"))?,
+                Some(requested) => {
+                    if !crate::api_gateway::model_is_servable(&data, requested) {
+                        anyhow::bail!(
+                            "'{requested}' isn't a combo or a model your enabled accounts serve"
+                        );
+                    }
+                    requested.to_string()
+                }
                 None => data
                     .api_gateway
                     .combos
                     .iter()
                     .find(|combo| combo.enabled)
                     .map(|combo| combo.name.clone())
-                    .context("Create at least one combo before adding a local API account")?,
+                    .context("Create at least one combo or pick a model before adding the account")?,
             };
             let base_url = crate::api_gateway::base_url(&data.api_gateway);
             let default_dir = configured_default_config_dir(&data, &input.tool_id)

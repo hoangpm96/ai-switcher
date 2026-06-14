@@ -388,6 +388,16 @@ fn resolve_combo(data: &StoredState, model: &str) -> Option<ApiGatewayCombo> {
     None
 }
 
+/// Whether the gateway can serve this model id: it names an enabled combo, or some enabled account
+/// supports it as a direct model. Used to validate the model a virtual CLI account binds to.
+pub fn model_is_servable(data: &StoredState, model: &str) -> bool {
+    data.api_gateway
+        .combos
+        .iter()
+        .any(|combo| combo.enabled && combo.name == model)
+        || provider_for_model(data, model).is_some()
+}
+
 /// Which provider serves a given model: the provider whose enabled account's model registry lists
 /// it. Falls back to a name heuristic (Claude models start with `claude`, GPT/Codex with `gpt`/`o`)
 /// so freshly-typed models still route before a registry refresh.
