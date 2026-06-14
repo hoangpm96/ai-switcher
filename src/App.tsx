@@ -697,8 +697,7 @@ function ApiGatewayView({
   const [threshold, setThreshold] = useState(String(gateway.config.quotaThreshold));
   const [allowLan, setAllowLan] = useState(gateway.config.bindHost === "0.0.0.0");
   const [rotationStrategy, setRotationStrategy] = useState(gateway.config.rotationStrategy);
-  const [keyName, setKeyName] = useState("Default key");
-  const [keyExpiry, setKeyExpiry] = useState("");
+  const [showKeyModal, setShowKeyModal] = useState(false);
   const [poolModel, setPoolModel] = useState("local-subscription");
   const [memberModels, setMemberModels] = useState<Record<string, string>>({});
   const [selectedMembers, setSelectedMembers] = useState<Set<string>>(new Set());
@@ -867,39 +866,9 @@ function ApiGatewayView({
               <strong>API keys</strong>
               <small>All valid keys can call every pool.</small>
             </div>
-          </div>
-          <div className="apiInline">
-            <label className="apiField">
-              Key name
-              <input
-                value={keyName}
-                onChange={(event) => setKeyName(event.target.value)}
-                placeholder="e.g. Cline laptop"
-              />
-            </label>
-            <label className="apiField">
-              <span>
-                Expires <small>(optional)</small>
-              </span>
-              <input
-                type="date"
-                value={keyExpiry}
-                onChange={(event) => setKeyExpiry(event.target.value)}
-              />
-            </label>
-            <button
-              onClick={() =>
-                onCreateKey({
-                  name: keyName,
-                  expiresAt: keyExpiry
-                    ? new Date(`${keyExpiry}T23:59:59`).toISOString()
-                    : null,
-                })
-              }
-              disabled={busy}
-            >
+            <button onClick={() => setShowKeyModal(true)} disabled={busy}>
               <Plus />
-              Create
+              Add key
             </button>
           </div>
           <div className="apiList">
@@ -1044,7 +1013,66 @@ function ApiGatewayView({
           </div>
         </section>
       </div>
+
+      {showKeyModal && (
+        <AddKeyModal
+          busy={busy}
+          onClose={() => setShowKeyModal(false)}
+          onCreate={async (input) => {
+            await onCreateKey(input);
+            setShowKeyModal(false);
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function AddKeyModal({
+  busy,
+  onClose,
+  onCreate,
+}: {
+  busy: boolean;
+  onClose: () => void;
+  onCreate: (input: CreateApiGatewayKeyInput) => Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [expiry, setExpiry] = useState("");
+  const submit = () =>
+    onCreate({
+      name: name.trim() || "Untitled key",
+      expiresAt: expiry ? new Date(`${expiry}T23:59:59`).toISOString() : null,
+    });
+  return (
+    <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>Add API key</h2>
+        <label>
+          Key name
+          <input
+            autoFocus
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="e.g. Cline laptop"
+          />
+        </label>
+        <label>
+          <span className="labelRow">
+            Expires <small>(optional)</small>
+          </span>
+          <input type="date" value={expiry} onChange={(event) => setExpiry(event.target.value)} />
+        </label>
+        <p className="hint">The full key is shown once and copied to your clipboard on create.</p>
+        <div className="modalActions">
+          <button onClick={onClose}>Cancel</button>
+          <button className="primary" onClick={submit} disabled={busy}>
+            <Plus />
+            Create key
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 

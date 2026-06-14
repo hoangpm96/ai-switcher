@@ -1101,6 +1101,12 @@ button.danger:hover:not(:disabled) {
   flex: none;
 }
 
+/* A trailing action (Add key, refresh) in a section header sits on the right edge. */
+.settingsSectionHead > button {
+  flex: none;
+  margin-left: auto;
+}
+
 .settingsSectionHead div {
   display: grid;
   gap: 3px;
