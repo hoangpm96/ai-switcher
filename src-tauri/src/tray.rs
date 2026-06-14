@@ -10,14 +10,16 @@
 
 use crate::app_state::ManagedState;
 use crate::models::{Account, AccountState, AppSnapshot, SwitchAccountInput, ToolId, ToolStatus};
-use tauri::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Emitter, Manager, Wry};
+use tauri_plugin_notification::NotificationExt;
 
 /// Tools shown in the tray, in order. Antigravity is intentionally excluded.
 const TRAY_TOOLS: [ToolId; 2] = [ToolId::Claude, ToolId::Codex];
 
 const SWITCH_PREFIX: &str = "switch:";
+const REFRESH_PREFIX: &str = "refresh:";
 const OPEN_ID: &str = "tray:open";
 const QUIT_ID: &str = "tray:quit";
 
@@ -56,6 +58,7 @@ fn build_menu(app: &AppHandle, snapshot: Option<&AppSnapshot>) -> tauri::Result<
 
     if let Some(snapshot) = snapshot {
         let mut any_tool = false;
+        let mut installed_tools = Vec::new();
         for tool_id in TRAY_TOOLS {
             let Some(tool) = snapshot.tools.iter().find(|t| t.id == tool_id) else {
                 continue;
@@ -63,6 +66,7 @@ fn build_menu(app: &AppHandle, snapshot: Option<&AppSnapshot>) -> tauri::Result<
             if !tool.installed {
                 continue;
             }
+            installed_tools.push(tool_id.clone());
             if any_tool {
                 menu.append(&PredefinedMenuItem::separator(app)?)?;
             }
@@ -71,12 +75,65 @@ fn build_menu(app: &AppHandle, snapshot: Option<&AppSnapshot>) -> tauri::Result<
         }
         if any_tool {
             menu.append(&PredefinedMenuItem::separator(app)?)?;
+            append_refresh_section(app, &menu, &installed_tools)?;
+            menu.append(&PredefinedMenuItem::separator(app)?)?;
         }
     }
 
-    menu.append(&MenuItem::with_id(app, OPEN_ID, "Open AI Switcher…", true, None::<&str>)?)?;
-    menu.append(&MenuItem::with_id(app, QUIT_ID, "Quit", true, Some("Cmd+Q"))?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        OPEN_ID,
+        "Open AI Switcher…",
+        true,
+        None::<&str>,
+    )?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        QUIT_ID,
+        "Quit",
+        true,
+        Some("Cmd+Q"),
+    )?)?;
     Ok(menu)
+}
+
+fn append_refresh_section(
+    app: &AppHandle,
+    menu: &Menu<Wry>,
+    installed_tools: &[ToolId],
+) -> tauri::Result<()> {
+    let refresh_menu = Submenu::with_id(app, "refresh:menu", "Refresh Quotas", true)?;
+
+    if installed_tools.contains(&ToolId::Claude) {
+        refresh_menu.append(&MenuItem::with_id(
+            app,
+            "refresh:claude",
+            "Claude Code",
+            true,
+            None::<&str>,
+        )?)?;
+    }
+    if installed_tools.contains(&ToolId::Codex) {
+        refresh_menu.append(&MenuItem::with_id(
+            app,
+            "refresh:codex",
+            "Codex",
+            true,
+            None::<&str>,
+        )?)?;
+    }
+    if installed_tools.len() > 1 {
+        refresh_menu.append(&PredefinedMenuItem::separator(app)?)?;
+        refresh_menu.append(&MenuItem::with_id(
+            app,
+            "refresh:all",
+            "All",
+            true,
+            None::<&str>,
+        )?)?;
+    }
+
+    menu.append(&refresh_menu)
 }
 
 fn append_tool_section(app: &AppHandle, menu: &Menu<Wry>, tool: &ToolStatus) -> tauri::Result<()> {
@@ -112,10 +169,21 @@ fn append_tool_section(app: &AppHandle, menu: &Menu<Wry>, tool: &ToolStatus) -> 
             // normal (not greyed-out) text colour; clicking it just re-selects the same
             // account, which is a harmless no-op.
             menu.append(&CheckMenuItem::with_id(
-                app, id, label, true, true, None::<&str>,
+                app,
+                id,
+                label,
+                true,
+                true,
+                None::<&str>,
             )?)?;
         } else {
-            menu.append(&MenuItem::with_id(app, id, label, !needs_login, None::<&str>)?)?;
+            menu.append(&MenuItem::with_id(
+                app,
+                id,
+                label,
+                !needs_login,
+                None::<&str>,
+            )?)?;
         }
     }
     Ok(())
@@ -148,6 +216,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
         OPEN_ID => show_main_window(app),
         QUIT_ID => app.exit(0),
         other if other.starts_with(SWITCH_PREFIX) => switch_from_id(app, id),
+        other if other.starts_with(REFRESH_PREFIX) => refresh_from_id(app, id),
         _ => {}
     }
 }
@@ -167,13 +236,52 @@ fn switch_from_id(app: &AppHandle, id: &MenuId) {
     let account_id = account_id.to_string();
     let app = app.clone();
     std::thread::spawn(move || {
-        let result = app.state::<ManagedState>().switch_account(SwitchAccountInput {
-            tool_id,
-            account_id,
-        });
+        let result = app
+            .state::<ManagedState>()
+            .switch_account(SwitchAccountInput {
+                tool_id,
+                account_id,
+            });
         if let Ok(snapshot) = result {
-            use tauri::Emitter;
             let _ = app.emit("snapshot-changed", &snapshot);
+        }
+        rebuild(&app);
+    });
+}
+
+/// Parses `refresh:<tool|all>` and refreshes quota on a worker thread so the native
+/// menu event handler stays responsive while quota endpoints are queried.
+fn refresh_from_id(app: &AppHandle, id: &MenuId) {
+    let target = &id.as_ref()[REFRESH_PREFIX.len()..];
+    let tools: Vec<ToolId> = match target {
+        "claude" => vec![ToolId::Claude],
+        "codex" => vec![ToolId::Codex],
+        "all" => vec![ToolId::Claude, ToolId::Codex],
+        _ => return,
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let state = app.state::<ManagedState>();
+        let mut latest_snapshot = None;
+        let mut failed = false;
+
+        for tool_id in tools {
+            match state.refresh_tool(tool_id, Some(&app)) {
+                Ok(snapshot) => latest_snapshot = Some(snapshot),
+                Err(_) => failed = true,
+            }
+        }
+
+        if let Some(snapshot) = latest_snapshot {
+            let _ = app.emit("snapshot-changed", &snapshot);
+        }
+        if failed {
+            let _ = app
+                .notification()
+                .builder()
+                .title("Refresh failed")
+                .body("Could not refresh one or more quota reports.")
+                .show();
         }
         rebuild(&app);
     });
