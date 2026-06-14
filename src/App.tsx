@@ -675,6 +675,33 @@ function SettingsView({
   );
 }
 
+/** A small on/off switch (replaces checkboxes across the API tab). */
+function Toggle({
+  checked,
+  onChange,
+  disabled,
+  title,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  return (
+    <button
+      type="button"
+      className={`toggle ${checked ? "on" : ""}`}
+      role="switch"
+      aria-checked={checked}
+      onClick={() => onChange(!checked)}
+      disabled={disabled}
+      title={title}
+    >
+      <span className="toggleKnob" />
+    </button>
+  );
+}
+
 function ApiGatewayView({
   snapshot,
   busy,
@@ -747,8 +774,9 @@ function ApiGatewayView({
     [snapshot.tools, gateway.config.accounts],
   );
 
-  // Every model the gateway can serve right now, grouped by provider (for the picker + the
-  // collapsible "Available models" list). Sourced from the per-account model registry.
+  // Every model the gateway can serve, grouped by provider (for the picker + the collapsible
+  // "Available models" list). Primary source is the live per-account model registry; if that
+  // hasn't been discovered yet we fall back to a small curated list so the picker is never blank.
   const modelsByProvider = useMemo(() => {
     const groups: { tool: ToolId; label: string; models: string[] }[] = [];
     for (const tool of ["claude", "codex"] as ToolId[]) {
@@ -756,13 +784,12 @@ function ApiGatewayView({
       for (const registry of gateway.config.modelRegistry.filter((r) => r.toolId === tool)) {
         registry.models.forEach((model) => models.add(model));
       }
-      if (models.size > 0) {
-        groups.push({
-          tool,
-          label: tool === "claude" ? "Claude" : "Codex",
-          models: Array.from(models).sort(),
-        });
-      }
+      if (models.size === 0) FALLBACK_MODELS[tool].forEach((model) => models.add(model));
+      groups.push({
+        tool,
+        label: tool === "claude" ? "Claude" : "Codex",
+        models: Array.from(models).sort(),
+      });
     }
     return groups;
   }, [gateway.config.modelRegistry]);
@@ -791,10 +818,12 @@ function ApiGatewayView({
   const openCreateCombo = () => {
     setComboEditing(null);
     setShowComboModal(true);
+    void onRefreshModels().catch(() => {});
   };
   const openEditCombo = (combo: ApiGatewayCombo) => {
     setComboEditing(combo);
     setShowComboModal(true);
+    void onRefreshModels().catch(() => {});
   };
 
   return (
@@ -839,7 +868,7 @@ function ApiGatewayView({
               <small>{gateway.status.baseUrl}</small>
             </div>
           </div>
-          <div className="apiFormRow">
+          <div className="apiFormRow cols3">
             <label>
               Bind
               <input value={allowLan ? "0.0.0.0" : "127.0.0.1"} readOnly />
@@ -858,28 +887,14 @@ function ApiGatewayView({
                 title="Drop an account from rotation once its quota usage passes this percentage."
               />
             </label>
-            <label>
-              Rotation
-              <select
-                value={rotationStrategy}
-                onChange={(event) => setRotationStrategy(event.target.value as typeof rotationStrategy)}
-              >
-                <option value="roundRobin">Round-robin</option>
-                <option value="fillFirst">Fill-first</option>
-              </select>
-            </label>
           </div>
-          <label className="memberRow">
-            <input
-              type="checkbox"
-              checked={allowLan}
-              onChange={(event) => setAllowLan(event.target.checked)}
-            />
+          <div className="apiToggleRow">
             <span>
               <strong>Allow LAN access</strong>
               <small>Bind to 0.0.0.0. API keys remain required.</small>
             </span>
-          </label>
+            <Toggle checked={allowLan} onChange={setAllowLan} title="Allow LAN access" />
+          </div>
           <div className="apiInline">
             <button
               onClick={() => onCreateVirtual("claude")}
@@ -939,17 +954,12 @@ function ApiGatewayView({
               <strong>Accounts</strong>
               <small>Toggle which subscription accounts the gateway may rotate through.</small>
             </div>
-            <label className="apiRotation">
-              Rotation
-              <select
-                value={rotationStrategy}
-                onChange={(event) =>
-                  setRotationStrategy(event.target.value as typeof rotationStrategy)
-                }
-              >
-                <option value="roundRobin">Round-robin</option>
-                <option value="fillFirst">Fill-first</option>
-              </select>
+            <label className="apiRotation" title="On = rotate accounts round-robin. Off = fill one until exhausted.">
+              <span>Round-robin</span>
+              <Toggle
+                checked={rotationStrategy === "roundRobin"}
+                onChange={(next) => setRotationStrategy(next ? "roundRobin" : "fillFirst")}
+              />
             </label>
             <button
               className="iconButton"
@@ -973,13 +983,12 @@ function ApiGatewayView({
                       <strong>{account.name}</strong>
                       <small>
                         {tool.name}
-                        {enabled ? (
+                        {!enabled && " · Off"}
+                        {enabled && state !== "available" && (
                           <>
                             {" · "}
                             <span className={`poolMemberState ${state}`}>{poolStateLabel(state)}</span>
                           </>
-                        ) : (
-                          " · Off"
                         )}
                       </small>
                     </div>
@@ -1029,9 +1038,10 @@ function ApiGatewayView({
                       {" · "}
                       {combo.members.length} model(s)
                     </small>
-                    <div className="poolMemberStates">
-                      {combo.members.map((model) => (
-                        <span className="poolMemberState available" key={model}>
+                    <div className="apiModelChips comboMembers">
+                      {combo.members.map((model, index) => (
+                        <span className="apiModelChip" key={model}>
+                          <span className="comboMemberOrder">{index + 1}</span>
                           {model}
                         </span>
                       ))}
@@ -1205,17 +1215,13 @@ function ComboModal({
           <small>Only letters, numbers, -, _ and . allowed. Clients request this name.</small>
         </label>
 
-        <label className="checkRow">
-          <input
-            type="checkbox"
-            checked={roundRobin}
-            onChange={(event) => setRoundRobin(event.target.checked)}
-          />
+        <div className="apiToggleRow">
           <span>
             Round-robin
             <small>Rotate members each request. Off = fallback (try members top to bottom).</small>
           </span>
-        </label>
+          <Toggle checked={roundRobin} onChange={setRoundRobin} title="Round-robin" />
+        </div>
 
         <div className="comboModels">
           <span className="labelRow">Models</span>
@@ -1359,6 +1365,14 @@ function AddKeyModal({
     </div>
   );
 }
+
+// Curated fallback so the combo model picker is never blank before the live registry loads.
+// The real registry (per signed-in account) overrides these the moment it is discovered.
+const FALLBACK_MODELS: Record<ToolId, string[]> = {
+  claude: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+  codex: ["gpt-5-codex", "gpt-5.1-codex", "gpt-5.1", "gpt-5.1-codex-mini"],
+  antigravity: [],
+};
 
 function poolStateLabel(state: ApiPoolAccountState) {
   if (state === "coolingDown") return "Cooling down";
@@ -1855,17 +1869,13 @@ function AddDialog({
                   />
                 </label>
 
-                <label className="checkRow">
-                  <input
-                    type="checkbox"
-                    checked={bypass}
-                    onChange={(event) => setBypass(event.target.checked)}
-                  />
+                <div className="apiToggleRow">
                   <span>
                     Bypass approvals &amp; sandbox in the custom command
                     <small>Adds {bypassFlag}. Off by default.</small>
                   </span>
-                </label>
+                  <Toggle checked={bypass} onChange={setBypass} title="Bypass approvals & sandbox" />
+                </div>
               </>
             )}
           </>

@@ -674,20 +674,59 @@ button.danger:hover:not(:disabled) {
   transform: translateX(16px);
 }
 
-/* Inline rotation selector in a section header. */
+/* Inline Round-robin toggle in a section header. */
 .apiRotation {
   align-items: center;
-  color: var(--text-3);
+  color: var(--text-2);
+  cursor: pointer;
   display: flex;
+  flex: none;
   font-size: 12px;
   font-weight: 500;
-  gap: 6px;
+  gap: 8px;
   margin-left: auto;
+  white-space: nowrap;
 }
 
-.apiRotation select {
-  min-height: 30px;
-  min-width: 120px;
+/* A labelled toggle row: text on the left, switch on the right. */
+.apiToggleRow {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+
+.apiToggleRow > span {
+  display: grid;
+  font-size: 13px;
+  font-weight: 500;
+  gap: 2px;
+}
+
+.apiToggleRow > span small {
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 400;
+}
+
+/* Three-field server form (Bind / Port / Quota) after Rotation moved to a toggle. */
+.apiFormRow.cols3 {
+  grid-template-columns: 1fr 0.7fr 0.8fr;
+}
+
+/* Combo member chips on the list card, with an order badge. */
+.comboMembers {
+  margin-top: 8px;
+}
+
+.comboMemberOrder {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  margin-right: 6px;
 }
 
 /* When a rotation control already pushed itself right, the trailing icon button hugs it. */
