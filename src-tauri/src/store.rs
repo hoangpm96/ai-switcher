@@ -1,4 +1,6 @@
-use crate::models::{Account, AccountState, AutoSwitchSetting, ToolId, ToolSetup};
+use crate::models::{
+    Account, AccountState, ApiGatewayConfig, AutoSwitchSetting, ToolId, ToolSetup,
+};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -23,6 +25,9 @@ pub struct StoredState {
     /// Resolved CLI binary/config dirs per tool. Missing = detect on startup / ask user.
     #[serde(default)]
     pub tool_setups: BTreeMap<String, ToolSetup>,
+    /// Local OpenAI/Anthropic-compatible proxy settings for the API tab.
+    #[serde(default)]
+    pub api_gateway: ApiGatewayConfig,
 }
 
 fn default_threshold() -> f64 {
@@ -38,6 +43,7 @@ impl Default for StoredState {
             auto_switch_threshold: default_threshold(),
             auto_switch_settings: BTreeMap::new(),
             tool_setups: BTreeMap::new(),
+            api_gateway: ApiGatewayConfig::default(),
         }
     }
 }
@@ -69,6 +75,12 @@ impl Store {
     /// Cached copy of LiteLLM's pricing dataset (refreshed at most daily).
     pub fn price_cache_path(&self) -> PathBuf {
         self.root.join("litellm_prices.json")
+    }
+
+    /// Usage produced by the local API gateway only. Kept separate from `usage.json`
+    /// because CLI JSONL scans may also see some proxy-originated requests.
+    pub fn api_usage_path(&self) -> PathBuf {
+        self.root.join("api_usage.json")
     }
 
     /// The tool's accounts root (`accounts/<tool>/`), holding one dir per profile account.
@@ -104,6 +116,13 @@ impl Store {
         fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
         fs::rename(tmp, path)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn for_test(root: PathBuf) -> Result<Self> {
+        fs::create_dir_all(root.join("accounts"))?;
+        fs::create_dir_all(root.join("backups"))?;
+        Ok(Self { root })
     }
 }
 

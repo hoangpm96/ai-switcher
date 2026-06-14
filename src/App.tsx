@@ -8,8 +8,10 @@ import {
   Loader2,
   LogIn,
   Pencil,
+  Plus,
   RefreshCw,
   RotateCcw,
+  Server,
   Settings,
   ShieldAlert,
   Terminal,
@@ -28,11 +30,17 @@ import type {
   Account,
   AddAccountInput,
   AddApiAccountInput,
+  ApiGatewayPool,
+  ApiGatewayPoolMember,
+  ApiUsageReport,
   AppSnapshot,
   BinaryCandidate,
   ConfigCandidate,
+  CreateApiGatewayKeyInput,
   DetectionReport,
+  SaveApiGatewayPoolInput,
   SetToolSetupInput,
+  StartApiGatewayInput,
   ToolSetup,
   ToolId,
   ToolStatus,
@@ -63,12 +71,27 @@ const emptySnapshot: AppSnapshot = {
   autoSwitchThreshold: 100,
   autoSwitchSettings: {},
   toolSetups: {},
+  apiGateway: {
+    config: {
+      bindHost: "127.0.0.1",
+      port: 8783,
+      quotaThreshold: 95,
+      maxRetries: 3,
+      rotationStrategy: "roundRobin",
+      keys: [],
+      pools: [],
+      modelRegistry: [],
+      virtualClaudeEnabled: false,
+      virtualCodexEnabled: false,
+    },
+    status: { state: "stopped", baseUrl: "http://127.0.0.1:8783", error: null },
+  },
 };
 
 export function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [selectedTool, setSelectedTool] = useState<ToolId>("claude");
-  const [view, setView] = useState<"accounts" | "usage" | "settings">("accounts");
+  const [view, setView] = useState<"accounts" | "api" | "usage" | "settings">("accounts");
   const [toast, setToast] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [refreshingAccounts, setRefreshingAccounts] = useState<Set<string>>(new Set());
@@ -292,6 +315,16 @@ export function App() {
             ))}
             <div className="sideDivider" />
             <button
+              className={`toolTab ${view === "api" ? "selected" : ""}`}
+              onClick={() => setView("api")}
+            >
+              <span className="usageTabLabel">
+                <Server />
+                API
+              </span>
+              <small>{snapshot.apiGateway.status.state === "running" ? "Server running" : "Local gateway"}</small>
+            </button>
+            <button
               className={`toolTab ${view === "usage" ? "selected" : ""}`}
               onClick={() => setView("usage")}
             >
@@ -330,6 +363,45 @@ export function App() {
         </aside>
 
         {view === "usage" && <UsageView />}
+
+        {view === "api" && (
+          <ApiGatewayView
+            snapshot={snapshot}
+            busy={busy !== null}
+            onStart={(input) => run("api-start", () => api.startApiGateway(input), `API server đang chạy tại http://${input.bindHost}:${input.port}`)}
+            onStop={() => run("api-stop", api.stopApiGateway)}
+            onCreateKey={async (input) => {
+              setBusy("api-key");
+              setError(null);
+              try {
+                const result = await api.createApiGatewayKey(input);
+                setSnapshot(result.snapshot);
+                await navigator.clipboard?.writeText(result.secret);
+                setToast("Đã tạo API key. Copy ngay — key chỉ hiện đầy đủ một lần.");
+              } catch (err) {
+                setError(errorMessage(err));
+              } finally {
+                setBusy(null);
+              }
+            }}
+            onDeleteKey={(keyId) => run("api-key-delete", () => api.deleteApiGatewayKey(keyId))}
+            onSavePool={(input) => run("api-pool", () => api.saveApiGatewayPool(input))}
+            onDeletePool={(poolId) => run("api-pool-delete", () => api.deleteApiGatewayPool(poolId))}
+            onRefreshModels={() =>
+              run("api-models", api.refreshApiGatewayModels, "Model registry updated")
+            }
+            onCreateVirtual={(toolId) =>
+              run(`api-virtual-${toolId}`, () => api.createVirtualApiAccount(toolId))
+            }
+            onRefresh={async () => {
+              setSnapshot(await api.loadSnapshot());
+            }}
+            onCopy={(text) => {
+              void navigator.clipboard?.writeText(text);
+              setToast(`Copied: ${text}`);
+            }}
+          />
+        )}
 
         {view === "settings" && (
           <SettingsView
@@ -593,6 +665,381 @@ function SettingsView({
   );
 }
 
+function ApiGatewayView({
+  snapshot,
+  busy,
+  onStart,
+  onStop,
+  onCreateKey,
+  onDeleteKey,
+  onSavePool,
+  onDeletePool,
+  onRefreshModels,
+  onCreateVirtual,
+  onRefresh,
+  onCopy,
+}: {
+  snapshot: AppSnapshot;
+  busy: boolean;
+  onStart: (input: StartApiGatewayInput) => Promise<boolean>;
+  onStop: () => Promise<boolean>;
+  onCreateKey: (input: CreateApiGatewayKeyInput) => Promise<void>;
+  onDeleteKey: (keyId: string) => Promise<boolean>;
+  onSavePool: (input: SaveApiGatewayPoolInput) => Promise<boolean>;
+  onDeletePool: (poolId: string) => Promise<boolean>;
+  onRefreshModels: () => Promise<boolean>;
+  onCreateVirtual: (toolId: ToolId) => Promise<boolean>;
+  onRefresh: () => Promise<void>;
+  onCopy: (text: string) => void;
+}) {
+  const gateway = snapshot.apiGateway;
+  const [port, setPort] = useState(String(gateway.config.port));
+  const [threshold, setThreshold] = useState(String(gateway.config.quotaThreshold));
+  const [allowLan, setAllowLan] = useState(gateway.config.bindHost === "0.0.0.0");
+  const [rotationStrategy, setRotationStrategy] = useState(gateway.config.rotationStrategy);
+  const [keyName, setKeyName] = useState("Default key");
+  const [keyExpiry, setKeyExpiry] = useState("");
+  const [poolModel, setPoolModel] = useState("local-subscription");
+  const [memberModels, setMemberModels] = useState<Record<string, string>>({});
+  const [selectedMembers, setSelectedMembers] = useState<Set<string>>(new Set());
+  const [usage, setUsage] = useState<ApiUsageReport | null>(null);
+
+  const accounts = useMemo(
+    () =>
+      snapshot.tools
+        .filter((tool) => tool.id === "claude" || tool.id === "codex")
+        .flatMap((tool) =>
+          tool.accounts
+            .filter((account) => !account.apiProvider && account.state !== "needs-login")
+            .map((account) => ({ tool, account })),
+        ),
+    [snapshot.tools],
+  );
+  const running = gateway.status.state === "running";
+  const hasVirtualClaude = snapshot.tools
+    .find((tool) => tool.id === "claude")
+    ?.accounts.some((account) => account.fingerprint === "api-local");
+  const hasVirtualCodex = snapshot.tools
+    .find((tool) => tool.id === "codex")
+    ?.accounts.some((account) => account.fingerprint === "api-local");
+
+  useEffect(() => {
+    api.getApiUsage().then(setUsage).catch(() => setUsage(null));
+  }, [gateway.status.state, gateway.config.pools.length]);
+
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => {
+      void onRefresh().catch(() => {});
+      void api.getApiUsage().then(setUsage).catch(() => {});
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [onRefresh, running]);
+
+  const submitStart = () =>
+    onStart({
+      bindHost: allowLan ? "0.0.0.0" : "127.0.0.1",
+      port: Number(port) || 8783,
+      quotaThreshold: Number(threshold) || 95,
+      rotationStrategy,
+    });
+
+  const savePool = () => {
+    const members: ApiGatewayPoolMember[] = accounts
+      .filter(({ account }) => selectedMembers.has(account.id))
+      .map(({ tool, account }) => ({
+        toolId: tool.id,
+        accountId: account.id,
+        model: memberModels[account.id]?.trim() || defaultModelForTool(tool.id),
+        enabled: true,
+        state: "available",
+        cooldownUntil: null,
+        error: null,
+      }));
+    return onSavePool({ model: poolModel.trim(), members });
+  };
+
+  return (
+    <section className="panel">
+      <div className="panelHead">
+        <div>
+          <div className="titleRow">
+            <h2>API</h2>
+            <span className={`status ${running ? "ok" : gateway.status.state === "errored" ? "bad" : "muted"}`}>
+              {running ? "Running" : gateway.status.state === "errored" ? "Errored" : "Stopped"}
+            </span>
+          </div>
+          <p className="panelLead">Local OpenAI/Anthropic-compatible gateway for Claude and Codex subscription accounts.</p>
+        </div>
+        <div className="actions">
+          <button onClick={() => onCopy(gateway.status.baseUrl)}>
+            <Copy />
+            Base URL
+          </button>
+          {running ? (
+            <button className="danger" onClick={onStop} disabled={busy}>
+              <X />
+              Stop
+            </button>
+          ) : (
+            <button className="primary" onClick={submitStart} disabled={busy}>
+              <Server />
+              Start
+            </button>
+          )}
+        </div>
+      </div>
+
+      {gateway.status.error && <p className="quotaError">{gateway.status.error}</p>}
+
+      <div className="apiGrid">
+        <section className="apiSection">
+          <div className="settingsSectionHead">
+            <Server />
+            <div>
+              <strong>Server</strong>
+              <small>{gateway.status.baseUrl}</small>
+            </div>
+          </div>
+          <div className="apiFormRow">
+            <label>
+              Bind
+              <input value={allowLan ? "0.0.0.0" : "127.0.0.1"} readOnly />
+            </label>
+            <label>
+              Port
+              <input value={port} onChange={(event) => setPort(event.target.value)} />
+            </label>
+            <label>
+              Quota cutoff
+              <input value={threshold} onChange={(event) => setThreshold(event.target.value)} />
+            </label>
+            <label>
+              Rotation
+              <select
+                value={rotationStrategy}
+                onChange={(event) => setRotationStrategy(event.target.value as typeof rotationStrategy)}
+              >
+                <option value="roundRobin">Round-robin</option>
+                <option value="fillFirst">Fill-first</option>
+              </select>
+            </label>
+          </div>
+          <label className="memberRow">
+            <input
+              type="checkbox"
+              checked={allowLan}
+              onChange={(event) => setAllowLan(event.target.checked)}
+            />
+            <span>
+              <strong>Allow LAN access</strong>
+              <small>Bind to 0.0.0.0. API keys remain required.</small>
+            </span>
+          </label>
+          <div className="apiInline">
+            <button
+              onClick={() => onCreateVirtual("claude")}
+              disabled={busy || !running || gateway.config.pools.length === 0}
+            >
+              <Terminal />
+              {hasVirtualClaude ? "Update Claude Code" : "Add to Claude Code"}
+            </button>
+            <button
+              onClick={() => onCreateVirtual("codex")}
+              disabled={busy || !running || gateway.config.pools.length === 0}
+            >
+              <Terminal />
+              {hasVirtualCodex ? "Update Codex" : "Add to Codex"}
+            </button>
+          </div>
+        </section>
+
+        <section className="apiSection">
+          <div className="settingsSectionHead">
+            <KeyRound />
+            <div>
+              <strong>API keys</strong>
+              <small>All valid keys can call every pool.</small>
+            </div>
+          </div>
+          <div className="apiInline">
+            <input value={keyName} onChange={(event) => setKeyName(event.target.value)} />
+            <input
+              type="date"
+              value={keyExpiry}
+              onChange={(event) => setKeyExpiry(event.target.value)}
+              title="Optional expiration date"
+            />
+            <button
+              onClick={() =>
+                onCreateKey({
+                  name: keyName,
+                  expiresAt: keyExpiry
+                    ? new Date(`${keyExpiry}T23:59:59`).toISOString()
+                    : null,
+                })
+              }
+              disabled={busy}
+            >
+              <Plus />
+              Create
+            </button>
+          </div>
+          <div className="apiList">
+            {gateway.config.keys.length === 0 ? (
+              <p className="hint">Create a key before calling the gateway.</p>
+            ) : (
+              gateway.config.keys.map((key) => (
+                <div className="apiListItem" key={key.id}>
+                  <div>
+                    <strong>{key.name || "Unnamed key"}</strong>
+                    <small>
+                      {key.prefix}
+                      {key.expiresAt ? ` · expires ${new Date(key.expiresAt).toLocaleDateString()}` : ""}
+                    </small>
+                  </div>
+                  <button className="iconButton danger" onClick={() => onDeleteKey(key.id)} disabled={busy} title="Delete key">
+                    <Trash2 />
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+
+        <section className="apiSection wide">
+          <div className="settingsSectionHead">
+            <RotateCcw />
+            <div>
+              <strong>Pools</strong>
+              <small>One pool name is the model clients request.</small>
+            </div>
+            <button
+              className="iconButton"
+              onClick={onRefreshModels}
+              disabled={busy}
+              title="Refresh subscription models"
+            >
+              <RefreshCw />
+            </button>
+          </div>
+          <div className="apiInline">
+            <input value={poolModel} onChange={(event) => setPoolModel(event.target.value)} />
+            <button onClick={savePool} disabled={busy || selectedMembers.size === 0}>
+              <Plus />
+              Save pool
+            </button>
+          </div>
+          <div className="memberList">
+            {accounts.map(({ tool, account }) => {
+              const registry = gateway.config.modelRegistry.find(
+                (entry) => entry.toolId === tool.id && entry.accountId === account.id,
+              );
+              const listId = `api-models-${account.id}`;
+              return (
+              <label className="memberRow" key={account.id}>
+                <input
+                  type="checkbox"
+                  checked={selectedMembers.has(account.id)}
+                  onChange={(event) => {
+                    const next = new Set(selectedMembers);
+                    if (event.target.checked) next.add(account.id);
+                    else next.delete(account.id);
+                    setSelectedMembers(next);
+                  }}
+                />
+                <span>
+                  <strong>{account.name}</strong>
+                  <small>{tool.name}</small>
+                </span>
+                <input
+                  list={listId}
+                  value={memberModels[account.id] ?? defaultModelForTool(tool.id)}
+                  onChange={(event) => setMemberModels({ ...memberModels, [account.id]: event.target.value })}
+                />
+                <datalist id={listId}>
+                  {registry?.models.map((model) => <option value={model} key={model} />)}
+                </datalist>
+                {registry?.error && <small className="quotaError">{registry.error}</small>}
+              </label>
+              );
+            })}
+          </div>
+
+          <div className="apiList">
+            {gateway.config.pools.map((pool: ApiGatewayPool) => (
+              <div className="apiListItem" key={pool.id}>
+                <div>
+                  <strong>{pool.model}</strong>
+                  <small>{pool.members.length} account(s)</small>
+                  <div className="poolMemberStates">
+                    {pool.members.map((member) => {
+                      const account = snapshot.tools
+                        .find((tool) => tool.id === member.toolId)
+                        ?.accounts.find((item) => item.id === member.accountId);
+                      return (
+                        <span className={`poolMemberState ${member.state}`} key={`${member.toolId}-${member.accountId}`}>
+                          {account?.name ?? member.accountId} · {poolStateLabel(member.state)}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+                <button className="iconButton danger" onClick={() => onDeletePool(pool.id)} disabled={busy} title="Delete pool">
+                  <Trash2 />
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="apiSection wide">
+          <div className="settingsSectionHead">
+            <BarChart3 />
+            <div>
+              <strong>API usage</strong>
+              <small>{usage ? `${usage.totalRequests} request(s)` : "No proxy usage yet"}</small>
+            </div>
+          </div>
+          <div className="apiUsageStats">
+            <span>Input {formatCount(usage?.total.input ?? 0)}</span>
+            <span>Output {formatCount(usage?.total.output ?? 0)}</span>
+            <span>Cache {formatCount((usage?.total.cacheRead ?? 0) + (usage?.total.cacheCreation ?? 0))}</span>
+          </div>
+          <div className="apiList">
+            {usage?.rows.map((row) => (
+              <div className="apiListItem" key={`${row.poolModel}-${row.keyId}-${row.accountId}`}>
+                <div>
+                  <strong>{row.poolModel}</strong>
+                  <small>
+                    {row.toolId} · {row.requests} request(s) · {formatCount(row.tokens.input + row.tokens.output)} tokens
+                  </small>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+    </section>
+  );
+}
+
+function defaultModelForTool(toolId: ToolId) {
+  return toolId === "claude" ? "claude-sonnet-4-5-20250929" : "gpt-5-codex";
+}
+
+function poolStateLabel(state: ApiGatewayPoolMember["state"]) {
+  if (state === "coolingDown") return "Cooling down";
+  if (state === "exhausted") return "Exhausted";
+  if (state === "errored") return "Needs attention";
+  if (state === "excluded") return "Excluded";
+  return "Available";
+}
+
+function formatCount(value: number) {
+  return new Intl.NumberFormat("en", { notation: value >= 100_000 ? "compact" : "standard" }).format(value);
+}
+
 function CliSetupBar({
   tool,
   setup,
@@ -646,6 +1093,7 @@ function AccountCard({
 }) {
   const isAntigravity = tool.id === "antigravity";
   const isApi = !!account.apiProvider;
+  const isVirtualApi = account.fingerprint === "api-local";
   const isActive = account.id === tool.activeAccountId || account.state === "active";
   const exhausted = account.state === "exhausted";
   const needsLogin = account.state === "needs-login";
@@ -688,7 +1136,7 @@ function AccountCard({
           </div>
         </div>
         <div className="badgeRow">
-          {isApi && <span className="badge api">API</span>}
+          {isApi && <span className="badge api">{isVirtualApi ? "Local API" : "API"}</span>}
           <span className={`badge ${badgeClass(account.state)}`}>
             {exhausted ? "Out of quota" : isActive ? "In use" : stateLabel(account.state)}
           </span>
@@ -728,7 +1176,7 @@ function AccountCard({
             {refreshingQuota ? <Loader2 className="spin" /> : <RefreshCw />}
           </button>
         )}
-        {tool.id !== "antigravity" && !account.isDefault && (
+        {tool.id !== "antigravity" && !account.isDefault && !isVirtualApi && (
           <button
             className="iconButton"
             onClick={onSetLauncher}
@@ -738,7 +1186,7 @@ function AccountCard({
             <Terminal />
           </button>
         )}
-        {!account.isDefault && (
+        {!account.isDefault && !isVirtualApi && (
           <button
             className="iconButton"
             onClick={onRename}
@@ -748,7 +1196,7 @@ function AccountCard({
             <Pencil />
           </button>
         )}
-        {!account.isDefault && (
+        {!account.isDefault && !isVirtualApi && (
           <button className="iconButton danger" onClick={onDelete} disabled={busy !== null} title="Delete">
             <Trash2 />
           </button>

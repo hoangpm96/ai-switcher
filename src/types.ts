@@ -64,6 +64,88 @@ export interface AppSnapshot {
   autoSwitchThreshold: number;
   autoSwitchSettings: Record<string, AutoSwitchSetting>;
   toolSetups: Record<string, ToolSetup>;
+  apiGateway: ApiGatewaySnapshot;
+}
+
+export type ApiGatewayServerState = "stopped" | "running" | "errored";
+export type ApiPoolAccountState = "available" | "exhausted" | "coolingDown" | "errored" | "excluded";
+export type ApiRotationStrategy = "roundRobin" | "fillFirst";
+
+export interface ApiGatewayKey {
+  id: string;
+  name: string;
+  prefix: string;
+  enabled: boolean;
+  expiresAt?: string | null;
+  createdAt: string;
+}
+
+export interface ApiGatewayPoolMember {
+  toolId: ToolId;
+  accountId: string;
+  model: string;
+  enabled: boolean;
+  state: ApiPoolAccountState;
+  cooldownUntil?: string | null;
+  error?: string | null;
+}
+
+export interface ApiGatewayPool {
+  id: string;
+  model: string;
+  members: ApiGatewayPoolMember[];
+  rrIndex: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ApiGatewayModelRegistry {
+  toolId: ToolId;
+  accountId: string;
+  models: string[];
+  updatedAt: string;
+  error?: string | null;
+}
+
+export interface ApiGatewayConfig {
+  bindHost: string;
+  port: number;
+  quotaThreshold: number;
+  maxRetries: number;
+  rotationStrategy: ApiRotationStrategy;
+  keys: ApiGatewayKey[];
+  pools: ApiGatewayPool[];
+  modelRegistry: ApiGatewayModelRegistry[];
+  virtualClaudeEnabled: boolean;
+  virtualCodexEnabled: boolean;
+}
+
+export interface ApiGatewayStatus {
+  state: ApiGatewayServerState;
+  baseUrl: string;
+  error?: string | null;
+}
+
+export interface ApiGatewaySnapshot {
+  config: ApiGatewayConfig;
+  status: ApiGatewayStatus;
+}
+
+export interface ApiUsageReport {
+  generatedAt: string;
+  totalRequests: number;
+  total: TokenBreakdown;
+  rows: ApiUsageRow[];
+}
+
+export interface ApiUsageRow {
+  poolModel: string;
+  keyId: string;
+  accountId: string;
+  toolId: ToolId;
+  requests: number;
+  tokens: TokenBreakdown;
+  lastUsedAt: string;
 }
 
 export interface AutoSwitchSetting {
@@ -162,6 +244,33 @@ export interface SetLauncherInput {
   toolId: ToolId;
   accountId: string;
   name: string;
+}
+
+export interface StartApiGatewayInput {
+  bindHost: string;
+  port: number;
+  quotaThreshold: number;
+  rotationStrategy: ApiRotationStrategy;
+}
+
+export interface CreateApiGatewayKeyInput {
+  name: string;
+  expiresAt?: string | null;
+}
+
+export interface CreateApiGatewayKeyResult {
+  snapshot: AppSnapshot;
+  secret: string;
+}
+
+export interface SaveApiGatewayPoolInput {
+  id?: string | null;
+  model: string;
+  members: ApiGatewayPoolMember[];
+}
+
+export interface CreateVirtualApiAccountInput {
+  toolId: ToolId;
 }
 
 // --- Token usage tracking (Usage tab) ---

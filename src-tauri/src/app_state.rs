@@ -1,7 +1,11 @@
 use crate::models::{
-    Account, AccountState, AddAccountInput, AddApiAccountInput, ApiProvider, AppSnapshot,
-    AutoSwitchSetting, DetectionReport, QuotaInfo, RenameAccountInput, SetLauncherInput,
-    SetToolSetupInput, SwitchAccountInput, ToolId, ToolStatus, UsageReport,
+    Account, AccountState, AddAccountInput, AddApiAccountInput, ApiGatewayConfig, ApiGatewayKey,
+    ApiGatewayPool, ApiGatewayPoolMember, ApiGatewayServerState, ApiGatewaySnapshot, ApiProvider,
+    ApiUsageReport, AppSnapshot, AutoSwitchSetting, CreateApiGatewayKeyInput,
+    CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayKeyInput,
+    DeleteApiGatewayPoolInput, DetectionReport, QuotaInfo, RenameAccountInput,
+    SaveApiGatewayPoolInput, SetLauncherInput, SetToolSetupInput, StartApiGatewayInput,
+    SwitchAccountInput, ToolId, ToolStatus, UsageReport,
 };
 use crate::quota::read_quota;
 use crate::store::{normalize_account_states, Store, StoredState};
@@ -23,6 +27,7 @@ use uuid::Uuid;
 pub struct ManagedState {
     pub store: Store,
     pub data: Mutex<StoredState>,
+    pub api_server: Mutex<crate::api_gateway::ApiServerHandle>,
 }
 
 impl ManagedState {
@@ -33,12 +38,17 @@ impl ManagedState {
         migrate_auto_switch_settings(&mut data);
         autodetect_missing_tool_setups(&store, &mut data);
         store.save(&data)?;
+        let server = crate::api_gateway::ApiServerHandle::stopped(&data.api_gateway);
         let managed = Self {
             store,
             data: Mutex::new(data),
+            api_server: Mutex::new(server),
         };
         // Clean up orphan active files: pointing to a deleted profile → clear + reinstall the hook.
         managed.heal_active_profiles();
+        // The API server never auto-starts. Recover from a crash/forced quit that may have left
+        // the bare CLI command pointing at a virtual account whose endpoint is now offline.
+        let _ = managed.deactivate_virtual_api_accounts();
         Ok(managed)
     }
 
@@ -109,7 +119,426 @@ impl ManagedState {
             .data
             .lock()
             .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-        Ok(build_snapshot(&self.store, &data))
+        let snapshot_data = self.store.load().unwrap_or_else(|_| data.clone());
+        let status = self
+            .api_server
+            .lock()
+            .map(|server| server.status.clone())
+            .unwrap_or_else(|_| {
+                crate::api_gateway::ApiServerHandle::stopped(&snapshot_data.api_gateway).status
+            });
+        Ok(build_snapshot(&self.store, &snapshot_data, status))
+    }
+
+    pub fn start_api_gateway(&self, input: StartApiGatewayInput) -> Result<AppSnapshot> {
+        // Refresh the provider model registry on each start. Individual account failures are
+        // retained in the registry and do not prevent healthy pools from serving requests.
+        let _ = self.refresh_api_gateway_models();
+        let bind_host = input.bind_host.trim();
+        if !matches!(bind_host, "127.0.0.1" | "0.0.0.0") {
+            anyhow::bail!("API server bind address must be 127.0.0.1 or 0.0.0.0");
+        }
+        if input.port == 0 {
+            anyhow::bail!("API server port must be between 1 and 65535");
+        }
+        let config = {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.api_gateway.bind_host = bind_host.to_string();
+            data.api_gateway.port = input.port;
+            data.api_gateway.quota_threshold = input.quota_threshold.clamp(50.0, 100.0);
+            data.api_gateway.rotation_strategy = input.rotation_strategy;
+            self.store.save(&data)?;
+            data.api_gateway.clone()
+        };
+        let mut server = self
+            .api_server
+            .lock()
+            .map_err(|_| anyhow::anyhow!("API server lock poisoned"))?;
+        server.stop(&config);
+        let handle = crate::api_gateway::start_server(self.store.clone(), config.clone());
+        *server = match handle {
+            Ok(handle) => handle,
+            Err(err) => crate::api_gateway::ApiServerHandle {
+                shutdown: None,
+                thread: None,
+                status: crate::models::ApiGatewayStatus {
+                    state: ApiGatewayServerState::Errored,
+                    base_url: crate::api_gateway::base_url(&config),
+                    error: Some(err.to_string()),
+                },
+            },
+        };
+        let errored = server.status.state == ApiGatewayServerState::Errored;
+        drop(server);
+        if errored {
+            self.deactivate_virtual_api_accounts()?;
+        }
+        self.snapshot()
+    }
+
+    pub fn stop_api_gateway(&self) -> Result<AppSnapshot> {
+        let config = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.api_gateway.clone()
+        };
+        self.api_server
+            .lock()
+            .map_err(|_| anyhow::anyhow!("API server lock poisoned"))?
+            .stop(&config);
+        self.deactivate_virtual_api_accounts()?;
+        self.snapshot()
+    }
+
+    pub fn create_virtual_api_account(
+        &self,
+        input: CreateVirtualApiAccountInput,
+    ) -> Result<AppSnapshot> {
+        if !matches!(input.tool_id, ToolId::Claude | ToolId::Codex) {
+            anyhow::bail!("Local API accounts are only supported for Claude Code and Codex");
+        }
+        let running = self
+            .api_server
+            .lock()
+            .map_err(|_| anyhow::anyhow!("API server lock poisoned"))?
+            .status
+            .state
+            == ApiGatewayServerState::Running;
+        if !running {
+            anyhow::bail!("Start the local API gateway before adding a local API account");
+        }
+        let name = virtual_api_name(&input.tool_id).to_string();
+        let (id, base_url, api_key, model, default_dir, is_new) = {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let existing_id = data
+                .accounts
+                .iter()
+                .find(|account| account.tool_id == input.tool_id && account.name == name)
+                .map(|account| account.id.clone());
+            let api_key = match data
+                .api_gateway
+                .keys
+                .iter()
+                .find_map(|key| key.secret.clone())
+            {
+                Some(secret) => secret,
+                None => {
+                    let secret = generate_api_key();
+                    data.api_gateway.keys.push(ApiGatewayKey {
+                        id: Uuid::new_v4().to_string(),
+                        name: "Local CLI".to_string(),
+                        prefix: mask_key(&secret),
+                        secret: Some(secret.clone()),
+                        enabled: true,
+                        expires_at: None,
+                        created_at: now(),
+                    });
+                    secret
+                }
+            };
+            let model = data
+                .api_gateway
+                .pools
+                .first()
+                .map(|pool| pool.model.clone())
+                .context("Create at least one API pool before adding a local API account")?;
+            let base_url = crate::api_gateway::base_url(&data.api_gateway);
+            let default_dir = configured_default_config_dir(&data, &input.tool_id)
+                .context("CLI setup is ambiguous — choose the tool's default config first")?;
+            self.store.save(&data)?;
+            let is_new = existing_id.is_none();
+            (
+                existing_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                base_url,
+                api_key,
+                model,
+                default_dir,
+                is_new,
+            )
+        };
+
+        let profile = create_profile_with_default(&input.tool_id, &self.store, &id, &default_dir)?;
+        match input.tool_id {
+            ToolId::Codex => {
+                write_codex_proxy_config(
+                    &profile,
+                    &name,
+                    &format!("{}/v1", base_url.trim_end_matches('/')),
+                    &model,
+                )?;
+                write_api_key_file(&profile, &api_key)?;
+            }
+            ToolId::Claude => {
+                write_claude_proxy_settings(&profile, &base_url, &api_key, &model)?;
+                crate::tools::seed_onboarding(&input.tool_id, &profile);
+            }
+            ToolId::Antigravity => unreachable!("guarded above"),
+        }
+        let launcher = None;
+        let timestamp = now();
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            match input.tool_id {
+                ToolId::Claude => data.api_gateway.virtual_claude_enabled = true,
+                ToolId::Codex => data.api_gateway.virtual_codex_enabled = true,
+                ToolId::Antigravity => {}
+            }
+            if is_new {
+                data.accounts.push(Account {
+                    id,
+                    tool_id: input.tool_id.clone(),
+                    name,
+                    state: AccountState::Idle,
+                    fingerprint: "api-local".to_string(),
+                    created_at: timestamp.clone(),
+                    updated_at: timestamp,
+                    last_used_at: None,
+                    quota: None,
+                    launcher_command: launcher,
+                    is_default: false,
+                    avatar_url: None,
+                    api_provider: Some(ApiProvider {
+                        base_url,
+                        model,
+                        bypass: false,
+                    }),
+                });
+            } else if let Some(account) = data
+                .accounts
+                .iter_mut()
+                .find(|account| account.tool_id == input.tool_id && account.name == name)
+            {
+                account.state = if account.state == AccountState::Active {
+                    AccountState::Active
+                } else {
+                    AccountState::Idle
+                };
+                account.fingerprint = "api-local".to_string();
+                account.quota = None;
+                account.launcher_command = launcher;
+                account.updated_at = timestamp;
+                account.api_provider = Some(ApiProvider {
+                    base_url,
+                    model,
+                    bypass: false,
+                });
+            }
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    fn deactivate_virtual_api_accounts(&self) -> Result<()> {
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        for tool_id in [ToolId::Claude, ToolId::Codex] {
+            let active_target = std::fs::read_to_string(self.store.active_profile_path(&tool_id))
+                .ok()
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty());
+            let active_virtual_id = active_target.as_deref().and_then(|target| {
+                data.accounts
+                    .iter()
+                    .find(|account| {
+                        account.tool_id == tool_id
+                            && is_virtual_api_account(account)
+                            && self
+                                .store
+                                .account_dir(&tool_id, &account.id)
+                                .to_string_lossy()
+                                == target
+                    })
+                    .map(|account| account.id.clone())
+            });
+            if active_virtual_id.is_some() {
+                let _ = clear_active_profile(&tool_id, &self.store);
+                let default_id = data
+                    .accounts
+                    .iter()
+                    .find(|account| account.tool_id == tool_id && account.is_default)
+                    .map(|account| account.id.clone());
+                normalize_account_states(&mut data.accounts, &tool_id, default_id.as_deref());
+            }
+            for account in data
+                .accounts
+                .iter_mut()
+                .filter(|account| account.tool_id == tool_id && is_virtual_api_account(account))
+            {
+                if account.state == AccountState::Active {
+                    account.state = AccountState::Idle;
+                    account.updated_at = now();
+                }
+            }
+        }
+        data.api_gateway.virtual_claude_enabled = false;
+        data.api_gateway.virtual_codex_enabled = false;
+        self.store.save(&data)?;
+        let _ = install_shell_hook(&self.store);
+        Ok(())
+    }
+
+    pub fn create_api_gateway_key(
+        &self,
+        input: CreateApiGatewayKeyInput,
+    ) -> Result<CreateApiGatewayKeyResult> {
+        let secret = generate_api_key();
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.api_gateway.keys.push(ApiGatewayKey {
+                id: Uuid::new_v4().to_string(),
+                name: input.name.trim().chars().take(40).collect(),
+                prefix: mask_key(&secret),
+                secret: Some(secret.clone()),
+                enabled: true,
+                expires_at: input.expires_at,
+                created_at: now(),
+            });
+            self.store.save(&data)?;
+        }
+        Ok(CreateApiGatewayKeyResult {
+            snapshot: self.snapshot()?,
+            secret,
+        })
+    }
+
+    pub fn delete_api_gateway_key(&self, input: DeleteApiGatewayKeyInput) -> Result<AppSnapshot> {
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.api_gateway.keys.retain(|key| key.id != input.key_id);
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    pub fn save_api_gateway_pool(&self, input: SaveApiGatewayPoolInput) -> Result<AppSnapshot> {
+        let model = input.model.trim();
+        if model.is_empty() {
+            anyhow::bail!("Pool model name is required");
+        }
+        if input.members.is_empty() {
+            anyhow::bail!("Pool must include at least one account");
+        }
+        let mut member_ids = std::collections::HashSet::new();
+        if input
+            .members
+            .iter()
+            .any(|member| !member_ids.insert((member.tool_id.as_str(), member.account_id.as_str())))
+        {
+            anyhow::bail!("An account can only appear once in the same pool");
+        }
+        let timestamp = now();
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            if data
+                .api_gateway
+                .pools
+                .iter()
+                .any(|pool| pool.model == model && Some(pool.id.as_str()) != input.id.as_deref())
+            {
+                anyhow::bail!("Pool model name must be unique");
+            }
+            for member in &input.members {
+                validate_pool_member(&data, member)?;
+            }
+            let pool = ApiGatewayPool {
+                id: input
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                model: model.to_string(),
+                members: input.members,
+                rr_index: 0,
+                created_at: timestamp.clone(),
+                updated_at: timestamp,
+            };
+            match data
+                .api_gateway
+                .pools
+                .iter()
+                .position(|existing| existing.id == pool.id)
+            {
+                Some(index) => data.api_gateway.pools[index] = pool,
+                None => data.api_gateway.pools.push(pool),
+            }
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    pub fn delete_api_gateway_pool(&self, input: DeleteApiGatewayPoolInput) -> Result<AppSnapshot> {
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.api_gateway
+                .pools
+                .retain(|pool| pool.id != input.pool_id);
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    pub fn refresh_api_gateway_models(&self) -> Result<AppSnapshot> {
+        let (data, accounts) = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let accounts = data
+                .accounts
+                .iter()
+                .filter(|account| {
+                    matches!(account.tool_id, ToolId::Claude | ToolId::Codex)
+                        && account.api_provider.is_none()
+                        && account.state != AccountState::NeedsLogin
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (data.clone(), accounts)
+        };
+        let registry = accounts
+            .iter()
+            .map(|account| {
+                crate::api_gateway::discover_account_models(
+                    &self.store,
+                    &data,
+                    account,
+                    configured_binary_path(&data, &account.tool_id).as_deref(),
+                )
+            })
+            .collect();
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            data.api_gateway.model_registry = registry;
+            self.store.save(&data)?;
+        }
+        self.snapshot()
     }
 
     pub fn detect_tool_setup(&self, tool_id: ToolId) -> DetectionReport {
@@ -159,6 +588,10 @@ impl ManagedState {
             &self.config_dirs(&ToolId::Codex),
             range_days,
         )
+    }
+
+    pub fn api_usage_report(&self) -> ApiUsageReport {
+        crate::api_gateway::usage_report(&self.store)
     }
 
     /// Every config dir to scan for a tool: the machine default (`~/.claude`, `~/.codex`) plus
@@ -661,8 +1094,14 @@ impl ManagedState {
         .context("CLI setup is ambiguous — choose the tool's binary first")?;
         launch_profile_login(&input.tool_id, &self.store, &id, &default_dir, &binary_path)
             .context("Login not completed, account not added")?;
-        write_launcher(&input.tool_id, &self.store, &id, &full_launcher, &binary_path)
-            .context("Couldn't create the account's custom command")?;
+        write_launcher(
+            &input.tool_id,
+            &self.store,
+            &id,
+            &full_launcher,
+            &binary_path,
+        )
+        .context("Couldn't create the account's custom command")?;
 
         let timestamp = now();
         {
@@ -771,7 +1210,7 @@ impl ManagedState {
                 input.bypass,
                 &binary_path,
             )
-                .context("Couldn't create the account's custom command")?;
+            .context("Couldn't create the account's custom command")?;
         }
 
         let timestamp = now();
@@ -826,6 +1265,9 @@ impl ManagedState {
             if account.is_default {
                 anyhow::bail!("Can't rename the machine default account");
             }
+            if is_virtual_api_account(account) {
+                anyhow::bail!("Local API accounts are managed from the API tab");
+            }
             account.name = name;
             account.updated_at = now();
             self.store.save(&data)?;
@@ -851,6 +1293,9 @@ impl ManagedState {
                 .iter()
                 .find(|a| a.tool_id == input.tool_id && a.id == input.account_id)
                 .context("Account not found")?;
+            if is_virtual_api_account(account) {
+                anyhow::bail!("Local API accounts are managed from the API tab");
+            }
             (
                 account.launcher_command.clone(),
                 account
@@ -898,7 +1343,7 @@ impl ManagedState {
                     &full,
                     &binary_path,
                 )
-                    .context("Couldn't create the custom command")?;
+                .context("Couldn't create the custom command")?;
             }
         }
         if let Some(old) = old_launcher.filter(|old| old != &full) {
@@ -1187,21 +1632,30 @@ fn migrate_auto_switch_settings(data: &mut StoredState) {
             .entry(tool_id.as_str().to_string())
             .or_insert_with(|| legacy.clone());
     }
-    data.auto_switch_settings.remove(ToolId::Antigravity.as_str());
+    data.auto_switch_settings
+        .remove(ToolId::Antigravity.as_str());
     data.auto_switch = data
         .auto_switch_settings
         .values()
         .any(|setting| setting.enabled);
 }
 
-fn build_snapshot(store: &Store, data: &StoredState) -> AppSnapshot {
+fn build_snapshot(
+    store: &Store,
+    data: &StoredState,
+    status: crate::models::ApiGatewayStatus,
+) -> AppSnapshot {
+    let show_virtual_api = status.state == ApiGatewayServerState::Running;
     let tools = [ToolId::Claude, ToolId::Codex, ToolId::Antigravity]
         .into_iter()
         .map(|tool_id| {
             let mut accounts = data
                 .accounts
                 .iter()
-                .filter(|account| account.tool_id == tool_id)
+                .filter(|account| {
+                    account.tool_id == tool_id
+                        && (show_virtual_api || !is_virtual_api_account(account))
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             // Default first, the rest by name.
@@ -1234,7 +1688,59 @@ fn build_snapshot(store: &Store, data: &StoredState) -> AppSnapshot {
         auto_switch_threshold: data.auto_switch_threshold,
         auto_switch_settings: data.auto_switch_settings.clone(),
         tool_setups: data.tool_setups.clone(),
+        api_gateway: ApiGatewaySnapshot {
+            config: redacted_api_gateway_config(data),
+            status,
+        },
     }
+}
+
+fn redacted_api_gateway_config(data: &StoredState) -> ApiGatewayConfig {
+    let mut redacted = data.api_gateway.clone();
+    for key in &mut redacted.keys {
+        key.secret = None;
+    }
+    for member in redacted
+        .pools
+        .iter_mut()
+        .flat_map(|pool| pool.members.iter_mut())
+    {
+        if !member.enabled {
+            member.state = crate::models::ApiPoolAccountState::Excluded;
+            continue;
+        }
+        let Some(account) = data
+            .accounts
+            .iter()
+            .find(|account| account.tool_id == member.tool_id && account.id == member.account_id)
+        else {
+            member.state = crate::models::ApiPoolAccountState::Errored;
+            member.error = Some("Account not found".to_string());
+            continue;
+        };
+        if matches!(account.state, AccountState::NeedsLogin) {
+            member.state = crate::models::ApiPoolAccountState::Errored;
+            member.error = Some("Account needs login".to_string());
+            continue;
+        }
+        if max_percent_used(account) >= data.api_gateway.quota_threshold {
+            member.state = crate::models::ApiPoolAccountState::Exhausted;
+            continue;
+        }
+        let cooling = member
+            .cooldown_until
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .is_some_and(|until| until > chrono::Utc::now());
+        if cooling {
+            member.state = crate::models::ApiPoolAccountState::CoolingDown;
+        } else if member.state != crate::models::ApiPoolAccountState::Errored {
+            member.state = crate::models::ApiPoolAccountState::Available;
+            member.cooldown_until = None;
+            member.error = None;
+        }
+    }
+    redacted
 }
 
 fn autodetect_missing_tool_setups(store: &Store, data: &mut StoredState) {
@@ -1343,6 +1849,14 @@ fn validate_name(
     if trimmed.is_empty() {
         return Ok(());
     }
+    if [
+        virtual_api_name(&ToolId::Claude),
+        virtual_api_name(&ToolId::Codex),
+    ]
+    .contains(&trimmed)
+    {
+        anyhow::bail!("This account name is reserved for the local API gateway");
+    }
     let data = state
         .data
         .lock()
@@ -1356,6 +1870,64 @@ fn validate_name(
         anyhow::bail!("Account name must be unique within the same tool");
     }
     Ok(())
+}
+
+fn virtual_api_name(tool_id: &ToolId) -> &'static str {
+    match tool_id {
+        ToolId::Claude => "claude-api",
+        ToolId::Codex => "codex-api",
+        ToolId::Antigravity => "antigravity-api",
+    }
+}
+
+fn is_virtual_api_account(account: &Account) -> bool {
+    account.fingerprint == "api-local"
+}
+
+fn validate_pool_member(data: &StoredState, member: &ApiGatewayPoolMember) -> Result<()> {
+    if !matches!(member.tool_id, ToolId::Claude | ToolId::Codex) {
+        anyhow::bail!("API pools only support Claude Code and Codex accounts");
+    }
+    if member.model.trim().is_empty() {
+        anyhow::bail!("Each pool account needs a model");
+    }
+    let Some(account) = data
+        .accounts
+        .iter()
+        .find(|account| account.tool_id == member.tool_id && account.id == member.account_id)
+    else {
+        anyhow::bail!("Pool account not found");
+    };
+    if account.api_provider.is_some() || is_virtual_api_account(account) {
+        anyhow::bail!("API/proxy accounts can't be used inside API pools");
+    }
+    if matches!(account.state, AccountState::NeedsLogin) {
+        anyhow::bail!("Pool account hasn't finished logging in yet");
+    }
+    Ok(())
+}
+
+fn generate_api_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0_u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let encoded = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sk-{encoded}")
+}
+
+fn mask_key(secret: &str) -> String {
+    let suffix = secret
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("sk-...{suffix}")
 }
 
 fn normalized_or_default_name(

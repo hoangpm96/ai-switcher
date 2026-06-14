@@ -1,11 +1,12 @@
 use crate::models::{QuotaInfo, QuotaWindow, ToolId};
 use crate::tools::home_dir;
 use anyhow::{Context, Result};
+use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// `config_dir` is the `CLAUDE_CONFIG_DIR` of the account being read (profile dir,
@@ -128,7 +129,7 @@ fn claude_window(label: &str, value: Option<&serde_json::Value>) -> QuotaWindow 
     }
 }
 
-fn claude_oauth_token(config_dir: &Path) -> Option<String> {
+pub(crate) fn claude_oauth_token(config_dir: &Path) -> Option<String> {
     let raw = claude_credentials_blob(config_dir)?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
@@ -136,6 +137,24 @@ fn claude_oauth_token(config_dir: &Path) -> Option<String> {
         .and_then(|oauth| oauth.get("accessToken"))
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string)
+}
+
+pub(crate) fn claude_oauth_token_fresh(config_dir: &Path, binary: Option<&Path>) -> Option<String> {
+    let raw = claude_credentials_blob(config_dir)?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let expires_at = value
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("expiresAt"))
+        .and_then(serde_json::Value::as_i64);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if expires_at.is_some_and(|expiry| expiry <= now_ms + 300_000) {
+        let mut command = Command::new(binary.unwrap_or_else(|| Path::new("claude")));
+        let _ = command
+            .args(["auth", "status", "--json"])
+            .env("CLAUDE_CONFIG_DIR", config_dir)
+            .output();
+    }
+    claude_oauth_token(config_dir)
 }
 
 /// Claude's keychain suffix for a config dir = `sha256(path)[:8]` (hex).
@@ -496,12 +515,85 @@ fn read_codex_usage_endpoint(config_dir: &Path) -> Result<QuotaInfo> {
     quota_from_codex_endpoint(&value)
 }
 
-fn codex_access_token(config_dir: &Path) -> Option<String> {
+pub(crate) fn codex_access_token(config_dir: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(config_dir.join("auth.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value
         .get("tokens")
         .and_then(|tokens| tokens.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+pub(crate) fn codex_access_token_fresh(config_dir: &Path) -> Option<String> {
+    static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = REFRESH_LOCK.get_or_init(|| Mutex::new(())).lock().ok()?;
+    let path = config_dir.join("auth.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let tokens = value.get("tokens")?;
+    let access_token = tokens.get("access_token")?.as_str()?.to_string();
+    if jwt_expiry(&access_token).is_none_or(|expiry| expiry > chrono::Utc::now().timestamp() + 300) {
+        return Some(access_token);
+    }
+
+    let refresh_token = tokens.get("refresh_token")?.as_str()?.to_string();
+    let response = reqwest::blocking::Client::new()
+        .post("https://auth.openai.com/oauth/token")
+        .form(&[
+            ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+        ])
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .ok()?;
+    let new_access = response.get("access_token")?.as_str()?.to_string();
+    let tokens = value.get_mut("tokens")?.as_object_mut()?;
+    tokens.insert(
+        "access_token".to_string(),
+        serde_json::Value::String(new_access.clone()),
+    );
+    for field in ["refresh_token", "id_token"] {
+        if let Some(new_value) = response.get(field).and_then(serde_json::Value::as_str) {
+            tokens.insert(
+                field.to_string(),
+                serde_json::Value::String(new_value.to_string()),
+            );
+        }
+    }
+    value["last_refresh"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+    let encoded = serde_json::to_vec_pretty(&value).ok()?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, encoded).ok()?;
+    let permissions = std::fs::metadata(&path).ok().map(|meta| meta.permissions());
+    std::fs::rename(&temporary, &path).ok()?;
+    if let Some(permissions) = permissions {
+        let _ = std::fs::set_permissions(&path, permissions);
+    }
+    Some(new_access)
+}
+
+fn jwt_expiry(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice::<serde_json::Value>(&decoded)
+        .ok()?
+        .get("exp")?
+        .as_i64()
+}
+
+pub(crate) fn codex_account_id(config_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(config_dir.join("auth.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("tokens")
+        .and_then(|tokens| tokens.get("account_id"))
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string)
 }
@@ -840,5 +932,31 @@ mod tests {
         let limits = last_rate_limits_in(text).expect("present");
         let quota = quota_from_codex_rate_limits(&limits).unwrap();
         assert_eq!(quota.five_hour.percent_used, Some(42.0));
+    }
+
+    #[test]
+    fn reads_codex_account_id_separately_from_access_token() {
+        let dir = std::env::temp_dir().join(format!("aisw-codex-auth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"tokens":{"access_token":"secret-token","account_id":"acct_123"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(codex_access_token(&dir).as_deref(), Some("secret-token"));
+        assert_eq!(codex_account_id(&dir).as_deref(), Some("acct_123"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reads_jwt_expiry_without_exposing_token_data() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"exp":1893456000,"sub":"account"}"#);
+        assert_eq!(
+            jwt_expiry(&format!("header.{payload}.signature")),
+            Some(1_893_456_000)
+        );
+        assert_eq!(jwt_expiry("not-a-jwt"), None);
     }
 }

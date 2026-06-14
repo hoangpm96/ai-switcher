@@ -36,6 +36,209 @@ pub enum AccountState {
     NeedsLogin,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ApiGatewayServerState {
+    Stopped,
+    Running,
+    Errored,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ApiPoolAccountState {
+    Available,
+    Exhausted,
+    CoolingDown,
+    Errored,
+    Excluded,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ApiRotationStrategy {
+    RoundRobin,
+    FillFirst,
+}
+
+fn default_api_rotation_strategy() -> ApiRotationStrategy {
+    ApiRotationStrategy::RoundRobin
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGatewayKey {
+    pub id: String,
+    pub name: String,
+    /// Only the full secret is persisted locally. It is returned once on create,
+    /// and snapshots expose only a masked suffix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    pub prefix: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGatewayPoolMember {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    pub model: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "api_pool_member_default_state")]
+    pub state: ApiPoolAccountState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn api_pool_member_default_state() -> ApiPoolAccountState {
+    ApiPoolAccountState::Available
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGatewayPool {
+    pub id: String,
+    pub model: String,
+    pub members: Vec<ApiGatewayPoolMember>,
+    #[serde(default)]
+    pub rr_index: usize,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGatewayModelRegistry {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGatewayConfig {
+    #[serde(default = "default_api_bind_host")]
+    pub bind_host: String,
+    #[serde(default = "default_api_port")]
+    pub port: u16,
+    #[serde(default = "default_api_quota_threshold")]
+    pub quota_threshold: f64,
+    #[serde(default = "default_api_max_retries")]
+    pub max_retries: u8,
+    #[serde(default = "default_api_rotation_strategy")]
+    pub rotation_strategy: ApiRotationStrategy,
+    #[serde(default)]
+    pub keys: Vec<ApiGatewayKey>,
+    #[serde(default)]
+    pub pools: Vec<ApiGatewayPool>,
+    #[serde(default)]
+    pub model_registry: Vec<ApiGatewayModelRegistry>,
+    #[serde(default)]
+    pub virtual_claude_enabled: bool,
+    #[serde(default)]
+    pub virtual_codex_enabled: bool,
+}
+
+impl Default for ApiGatewayConfig {
+    fn default() -> Self {
+        Self {
+            bind_host: default_api_bind_host(),
+            port: default_api_port(),
+            quota_threshold: default_api_quota_threshold(),
+            max_retries: default_api_max_retries(),
+            rotation_strategy: default_api_rotation_strategy(),
+            keys: Vec::new(),
+            pools: Vec::new(),
+            model_registry: Vec::new(),
+            virtual_claude_enabled: false,
+            virtual_codex_enabled: false,
+        }
+    }
+}
+
+fn default_api_bind_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_api_port() -> u16 {
+    8783
+}
+
+fn default_api_quota_threshold() -> f64 {
+    95.0
+}
+
+fn default_api_max_retries() -> u8 {
+    3
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGatewayStatus {
+    pub state: ApiGatewayServerState,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGatewaySnapshot {
+    pub config: ApiGatewayConfig,
+    pub status: ApiGatewayStatus,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUsageReport {
+    pub generated_at: String,
+    pub total_requests: u64,
+    pub total: TokenBreakdown,
+    pub rows: Vec<ApiUsageRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiUsageRow {
+    pub pool_model: String,
+    pub key_id: String,
+    pub account_id: String,
+    pub tool_id: ToolId,
+    pub requests: u64,
+    pub tokens: TokenBreakdown,
+    pub last_used_at: String,
+}
+
+impl Default for ApiGatewayStatus {
+    fn default() -> Self {
+        Self {
+            state: ApiGatewayServerState::Stopped,
+            base_url: "http://127.0.0.1:8783".to_string(),
+            error: None,
+        }
+    }
+}
+
+impl Default for ApiGatewaySnapshot {
+    fn default() -> Self {
+        Self {
+            config: ApiGatewayConfig::default(),
+            status: ApiGatewayStatus::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaWindow {
@@ -157,6 +360,8 @@ pub struct AppSnapshot {
     pub auto_switch_settings: std::collections::BTreeMap<String, AutoSwitchSetting>,
     #[serde(default)]
     pub tool_setups: std::collections::BTreeMap<String, ToolSetup>,
+    #[serde(default)]
+    pub api_gateway: ApiGatewaySnapshot,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -314,6 +519,58 @@ pub struct AddApiAccountInput {
     pub launcher: Option<String>,
     #[serde(default)]
     pub bypass: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartApiGatewayInput {
+    pub bind_host: String,
+    pub port: u16,
+    pub quota_threshold: f64,
+    #[serde(default = "default_api_rotation_strategy")]
+    pub rotation_strategy: ApiRotationStrategy,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApiGatewayKeyInput {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApiGatewayKeyResult {
+    pub snapshot: AppSnapshot,
+    pub secret: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveApiGatewayPoolInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub model: String,
+    pub members: Vec<ApiGatewayPoolMember>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteApiGatewayKeyInput {
+    pub key_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteApiGatewayPoolInput {
+    pub pool_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateVirtualApiAccountInput {
+    pub tool_id: ToolId,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

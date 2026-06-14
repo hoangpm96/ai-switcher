@@ -2,11 +2,17 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
   AddAccountInput,
   AddApiAccountInput,
+  ApiUsageReport,
   AppSnapshot,
   DetectionReport,
   RenameAccountInput,
+  CreateApiGatewayKeyInput,
+  CreateApiGatewayKeyResult,
+  CreateVirtualApiAccountInput,
+  SaveApiGatewayPoolInput,
   SetLauncherInput,
   SetToolSetupInput,
+  StartApiGatewayInput,
   SwitchAccountInput,
   ToolId,
   UsageReport,
@@ -46,6 +52,21 @@ const demoSnapshot: AppSnapshot = {
       validatedAt: "2026-06-08T10:00:00Z",
       validationWarnings: [],
     },
+  },
+  apiGateway: {
+    config: {
+      bindHost: "127.0.0.1",
+      port: 8783,
+      quotaThreshold: 95,
+      maxRetries: 3,
+      rotationStrategy: "roundRobin",
+      keys: [],
+      pools: [],
+      modelRegistry: [],
+      virtualClaudeEnabled: false,
+      virtualCodexEnabled: false,
+    },
+    status: { state: "stopped", baseUrl: "http://127.0.0.1:8783", error: null },
   },
   tools: [
     {
@@ -165,6 +186,13 @@ const demoUsage: UsageReport = {
   ],
 };
 
+const demoApiUsage: ApiUsageReport = {
+  generatedAt: "2026-06-14T09:00:00Z",
+  totalRequests: 0,
+  total: tb(0, 0, 0, 0),
+  rows: [],
+};
+
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri) {
     return tauriInvoke<T>(command, args);
@@ -176,6 +204,9 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   }
   if (command === "get_usage") {
     return structuredClone(demoUsage) as T;
+  }
+  if (command === "get_api_usage") {
+    return structuredClone(demoApiUsage) as T;
   }
   if (command === "fetch_gateway_models") {
     return [
@@ -248,6 +279,90 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
     demoSnapshot.autoSwitchSettings.codex = { enabled, threshold };
     return structuredClone(demoSnapshot) as T;
   }
+  if (command === "start_api_gateway") {
+    const input = args?.input as StartApiGatewayInput;
+    demoSnapshot.apiGateway.config.bindHost = input.bindHost;
+    demoSnapshot.apiGateway.config.port = input.port;
+    demoSnapshot.apiGateway.config.quotaThreshold = input.quotaThreshold;
+    demoSnapshot.apiGateway.config.rotationStrategy = input.rotationStrategy;
+    demoSnapshot.apiGateway.status = {
+      state: "running",
+      baseUrl: `http://${input.bindHost}:${input.port}`,
+      error: null,
+    };
+    return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "stop_api_gateway") {
+    demoSnapshot.apiGateway.status.state = "stopped";
+    return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "create_api_gateway_key") {
+    const input = args?.input as CreateApiGatewayKeyInput;
+    const secret = `sk-demo-${Math.random().toString(16).slice(2)}${Date.now()}`;
+    demoSnapshot.apiGateway.config.keys.push({
+      id: crypto.randomUUID(),
+      name: input.name || "Default key",
+      prefix: `sk-...${secret.slice(-6)}`,
+      enabled: true,
+      expiresAt: input.expiresAt,
+      createdAt: new Date().toISOString(),
+    });
+    return { snapshot: structuredClone(demoSnapshot), secret } as T;
+  }
+  if (command === "delete_api_gateway_key") {
+    const keyId = (args?.input as { keyId: string }).keyId;
+    demoSnapshot.apiGateway.config.keys = demoSnapshot.apiGateway.config.keys.filter((key) => key.id !== keyId);
+    return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "save_api_gateway_pool") {
+    const input = args?.input as SaveApiGatewayPoolInput;
+    const id = input.id || crypto.randomUUID();
+    const existing = demoSnapshot.apiGateway.config.pools.findIndex((pool) => pool.id === id);
+    const pool = {
+      id,
+      model: input.model,
+      members: input.members,
+      rrIndex: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    if (existing >= 0) demoSnapshot.apiGateway.config.pools[existing] = pool;
+    else demoSnapshot.apiGateway.config.pools.push(pool);
+    return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "delete_api_gateway_pool") {
+    const poolId = (args?.input as { poolId: string }).poolId;
+    demoSnapshot.apiGateway.config.pools = demoSnapshot.apiGateway.config.pools.filter((pool) => pool.id !== poolId);
+    return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "refresh_api_gateway_models") {
+    return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "create_virtual_api_account") {
+    const input = args?.input as CreateVirtualApiAccountInput;
+    const tool = demoSnapshot.tools.find((item) => item.id === input.toolId);
+    if (tool && !tool.accounts.some((account) => account.fingerprint === "api-local")) {
+      tool.accounts.push({
+        id: crypto.randomUUID(),
+        toolId: input.toolId,
+        name: input.toolId === "claude" ? "claude-api" : "codex-api",
+        state: "idle",
+        fingerprint: "api-local",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        lastUsedAt: null,
+        quota: null,
+        launcherCommand: null,
+        isDefault: false,
+        apiProvider: {
+          baseUrl: demoSnapshot.apiGateway.status.baseUrl,
+          model: demoSnapshot.apiGateway.config.pools[0]?.model ?? "local-subscription",
+          bypass: false,
+        },
+      });
+    }
+    return structuredClone(demoSnapshot) as T;
+  }
   if (command === "add_api_account") {
     return structuredClone(demoSnapshot) as T;
   }
@@ -283,4 +398,19 @@ export const api = {
     invoke<DetectionReport>("validate_tool_setup", { input }),
   setToolSetup: (input: SetToolSetupInput) => invoke<AppSnapshot>("set_tool_setup", { input }),
   getUsage: (rangeDays: number) => invoke<UsageReport>("get_usage", { rangeDays }),
+  getApiUsage: () => invoke<ApiUsageReport>("get_api_usage"),
+  startApiGateway: (input: StartApiGatewayInput) =>
+    invoke<AppSnapshot>("start_api_gateway", { input }),
+  stopApiGateway: () => invoke<AppSnapshot>("stop_api_gateway"),
+  createApiGatewayKey: (input: CreateApiGatewayKeyInput) =>
+    invoke<CreateApiGatewayKeyResult>("create_api_gateway_key", { input }),
+  deleteApiGatewayKey: (keyId: string) =>
+    invoke<AppSnapshot>("delete_api_gateway_key", { input: { keyId } }),
+  saveApiGatewayPool: (input: SaveApiGatewayPoolInput) =>
+    invoke<AppSnapshot>("save_api_gateway_pool", { input }),
+  deleteApiGatewayPool: (poolId: string) =>
+    invoke<AppSnapshot>("delete_api_gateway_pool", { input: { poolId } }),
+  refreshApiGatewayModels: () => invoke<AppSnapshot>("refresh_api_gateway_models"),
+  createVirtualApiAccount: (toolId: ToolId) =>
+    invoke<AppSnapshot>("create_virtual_api_account", { input: { toolId } }),
 };

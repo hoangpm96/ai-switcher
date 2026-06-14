@@ -1,3 +1,4 @@
+mod api_gateway;
 mod app_state;
 mod detection;
 mod models;
@@ -10,8 +11,11 @@ mod usage;
 
 use app_state::ManagedState;
 use models::{
-    AddAccountInput, AddApiAccountInput, AppSnapshot, DetectionReport, RenameAccountInput,
-    SetLauncherInput, SetToolSetupInput, SwitchAccountInput, ToolId, UsageReport,
+    AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
+    CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayKeyInput,
+    DeleteApiGatewayPoolInput, DetectionReport, RenameAccountInput, SaveApiGatewayPoolInput,
+    SetLauncherInput, SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId,
+    UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -188,6 +192,82 @@ fn get_usage(state: State<'_, ManagedState>, range_days: u32) -> UsageReport {
     state.usage_report(range_days)
 }
 
+#[tauri::command]
+fn get_api_usage(state: State<'_, ManagedState>) -> ApiUsageReport {
+    state.api_usage_report()
+}
+
+#[tauri::command]
+fn start_api_gateway(
+    state: State<'_, ManagedState>,
+    input: StartApiGatewayInput,
+) -> Result<AppSnapshot, String> {
+    state.start_api_gateway(input).map_err(display_error)
+}
+
+#[tauri::command]
+fn stop_api_gateway(state: State<'_, ManagedState>) -> Result<AppSnapshot, String> {
+    state.stop_api_gateway().map_err(display_error)
+}
+
+#[tauri::command]
+fn create_api_gateway_key(
+    state: State<'_, ManagedState>,
+    input: CreateApiGatewayKeyInput,
+) -> Result<CreateApiGatewayKeyResult, String> {
+    state.create_api_gateway_key(input).map_err(display_error)
+}
+
+#[tauri::command]
+fn delete_api_gateway_key(
+    state: State<'_, ManagedState>,
+    input: DeleteApiGatewayKeyInput,
+) -> Result<AppSnapshot, String> {
+    state.delete_api_gateway_key(input).map_err(display_error)
+}
+
+#[tauri::command]
+fn save_api_gateway_pool(
+    state: State<'_, ManagedState>,
+    input: SaveApiGatewayPoolInput,
+) -> Result<AppSnapshot, String> {
+    state.save_api_gateway_pool(input).map_err(display_error)
+}
+
+#[tauri::command]
+fn delete_api_gateway_pool(
+    state: State<'_, ManagedState>,
+    input: DeleteApiGatewayPoolInput,
+) -> Result<AppSnapshot, String> {
+    state.delete_api_gateway_pool(input).map_err(display_error)
+}
+
+#[tauri::command]
+async fn refresh_api_gateway_models(
+    app: tauri::AppHandle,
+) -> Result<AppSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedState>()
+            .refresh_api_gateway_models()
+            .map_err(display_error)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn create_virtual_api_account(
+    app: tauri::AppHandle,
+    state: State<'_, ManagedState>,
+    input: CreateVirtualApiAccountInput,
+) -> Result<AppSnapshot, String> {
+    let snapshot = state
+        .create_virtual_api_account(input)
+        .map_err(display_error)?;
+    tray::rebuild(&app);
+    Ok(snapshot)
+}
+
 pub fn run() {
     let state = ManagedState::new().expect("failed to initialize app state");
     tauri::Builder::default()
@@ -219,7 +299,16 @@ pub fn run() {
             detect_tool_setup,
             validate_tool_setup,
             set_tool_setup,
-            get_usage
+            get_usage,
+            get_api_usage,
+            start_api_gateway,
+            stop_api_gateway,
+            create_api_gateway_key,
+            delete_api_gateway_key,
+            save_api_gateway_pool,
+            delete_api_gateway_pool,
+            refresh_api_gateway_models,
+            create_virtual_api_account
         ])
         .setup(|app| {
             // Menu-bar (tray) icon for quick account switching without opening the window.
@@ -257,6 +346,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                let state = app.state::<ManagedState>();
+                let _ = state.stop_api_gateway();
+            }
             // Clicking the Dock icon while the window is hidden (closed to tray) reopens it.
             if let tauri::RunEvent::Reopen { .. } = event {
                 if let Some(window) = app.get_webview_window("main") {
