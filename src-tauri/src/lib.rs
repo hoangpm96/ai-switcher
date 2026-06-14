@@ -233,6 +233,14 @@ fn delete_api_gateway_key(
 }
 
 #[tauri::command]
+fn reveal_api_gateway_key(
+    state: State<'_, ManagedState>,
+    keyId: String,
+) -> Result<String, String> {
+    state.reveal_api_gateway_key(keyId).map_err(display_error)
+}
+
+#[tauri::command]
 fn save_api_gateway_combo(
     state: State<'_, ManagedState>,
     input: SaveApiGatewayComboInput,
@@ -319,6 +327,7 @@ pub fn run() {
             stop_api_gateway,
             create_api_gateway_key,
             delete_api_gateway_key,
+            reveal_api_gateway_key,
             save_api_gateway_combo,
             delete_api_gateway_combo,
             set_api_gateway_account,

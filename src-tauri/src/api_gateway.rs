@@ -1182,8 +1182,21 @@ fn sanitize_codex_body(body: &mut Value) {
                 Value::String("You are a helpful coding assistant.".to_string()),
             );
         }
-        // Chat-style / sampling fields the Responses endpoint doesn't accept.
-        for key in ["messages", "max_tokens", "max_completion_tokens", "top_p", "temperature"] {
+        // Chat-style / sampling / Anthropic fields the Codex Responses endpoint doesn't accept.
+        for key in [
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "max_output_tokens",
+            "top_p",
+            "top_k",
+            "temperature",
+            "system",
+            "stop_sequences",
+            "metadata",
+            "thinking",
+            "tool_choice",
+        ] {
             object.remove(key);
         }
     }
@@ -2752,12 +2765,14 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
             "max_tokens": 100,
             "temperature": 0.5
         });
+        body["max_output_tokens"] = json!(512);
         sanitize_codex_body(&mut body);
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert!(body["instructions"].as_str().is_some_and(|s| !s.is_empty()));
         assert!(body.get("messages").is_none());
         assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_output_tokens").is_none());
         assert!(body.get("temperature").is_none());
 
         // A caller-supplied stream choice is preserved.

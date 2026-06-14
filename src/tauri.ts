@@ -316,6 +316,9 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
     demoSnapshot.apiGateway.config.keys = demoSnapshot.apiGateway.config.keys.filter((key) => key.id !== keyId);
     return structuredClone(demoSnapshot) as T;
   }
+  if (command === "reveal_api_gateway_key") {
+    return ("sk-demo-revealed-key") as T;
+  }
   if (command === "save_api_gateway_combo") {
     const input = args?.input as SaveApiGatewayComboInput;
     const id = input.id || crypto.randomUUID();
@@ -429,6 +432,7 @@ export const api = {
     invoke<CreateApiGatewayKeyResult>("create_api_gateway_key", { input }),
   deleteApiGatewayKey: (keyId: string) =>
     invoke<AppSnapshot>("delete_api_gateway_key", { input: { keyId } }),
+  revealApiGatewayKey: (keyId: string) => invoke<string>("reveal_api_gateway_key", { keyId }),
   saveApiGatewayCombo: (input: SaveApiGatewayComboInput) =>
     invoke<AppSnapshot>("save_api_gateway_combo", { input }),
   deleteApiGatewayCombo: (comboId: string) =>

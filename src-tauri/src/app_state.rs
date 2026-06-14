@@ -469,6 +469,21 @@ impl ManagedState {
         self.snapshot()
     }
 
+    /// Return the full secret for a stored key so the UI can copy it on demand. Snapshots redact
+    /// secrets, so this is the only way to recover a previously-created key (local single-user app).
+    pub fn reveal_api_gateway_key(&self, key_id: String) -> Result<String> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        data.api_gateway
+            .keys
+            .iter()
+            .find(|key| key.id == key_id)
+            .and_then(|key| key.secret.clone())
+            .context("Key not found")
+    }
+
     pub fn save_api_gateway_combo(&self, input: SaveApiGatewayComboInput) -> Result<AppSnapshot> {
         let name = input.name.trim();
         if name.is_empty() {

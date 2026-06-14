@@ -414,6 +414,15 @@ export function App() {
               }
             }}
             onDeleteKey={(keyId) => run("api-key-delete", () => api.deleteApiGatewayKey(keyId))}
+            onCopyKey={async (keyId) => {
+              try {
+                const secret = await api.revealApiGatewayKey(keyId);
+                const ok = await copyToClipboard(secret);
+                notify(ok ? "API key copied to clipboard." : "Couldn't access the clipboard.", ok ? "success" : "error");
+              } catch (err) {
+                notify(errorMessage(err), "error");
+              }
+            }}
             onSaveCombo={(input) => run("api-combo", () => api.saveApiGatewayCombo(input))}
             onDeleteCombo={(comboId) => run("api-combo-delete", () => api.deleteApiGatewayCombo(comboId))}
             onSetAccount={(input) => run("api-account", () => api.setApiGatewayAccount(input))}
@@ -729,6 +738,7 @@ function ApiGatewayView({
   onStop,
   onCreateKey,
   onDeleteKey,
+  onCopyKey,
   onSaveCombo,
   onDeleteCombo,
   onSetAccount,
@@ -743,6 +753,7 @@ function ApiGatewayView({
   onStop: () => Promise<boolean>;
   onCreateKey: (input: CreateApiGatewayKeyInput) => Promise<string | null>;
   onDeleteKey: (keyId: string) => Promise<boolean>;
+  onCopyKey: (keyId: string) => Promise<void>;
   onSaveCombo: (input: SaveApiGatewayComboInput) => Promise<boolean>;
   onDeleteCombo: (comboId: string) => Promise<boolean>;
   onSetAccount: (input: SetApiGatewayAccountInput) => Promise<boolean>;
@@ -979,9 +990,14 @@ function ApiGatewayView({
                       {key.expiresAt ? ` · expires ${new Date(key.expiresAt).toLocaleDateString()}` : ""}
                     </small>
                   </div>
-                  <button className="iconButton danger" onClick={() => onDeleteKey(key.id)} disabled={busy} title="Delete key">
-                    <Trash2 />
-                  </button>
+                  <div className="apiItemActions">
+                    <button className="iconButton" onClick={() => onCopyKey(key.id)} disabled={busy} title="Copy full key">
+                      <Copy />
+                    </button>
+                    <button className="iconButton danger" onClick={() => onDeleteKey(key.id)} disabled={busy} title="Delete key">
+                      <Trash2 />
+                    </button>
+                  </div>
                 </div>
               ))
             )}
