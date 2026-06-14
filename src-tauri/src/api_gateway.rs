@@ -1128,6 +1128,9 @@ fn build_claude_request(
     mut body: Value,
 ) -> std::result::Result<reqwest::RequestBuilder, Response> {
     sanitize_anthropic_body(&mut body);
+    // Subscription OAuth tokens require the Claude Code system identity; inject it so any client
+    // (Cline, scripts, Codex-translated requests) can use a Claude subscription account.
+    ensure_claude_code_system(&mut body);
     let config_dir = account_config_dir(&state.store, data, account);
     let binary = data
         .tool_setups
@@ -1190,6 +1193,40 @@ fn sanitize_anthropic_body(body: &mut Value) {
             }
         }
     }
+}
+
+/// Claude Code's identity preamble. Anthropic gates OAuth *subscription* tokens: a request whose
+/// `system` does not begin with this exact line is rejected (as a misleading `rate_limit_error`).
+/// First-party Claude Code always sends it, so to let any client use a subscription account we
+/// inject it as the first system block, preserving the caller's own system prompt after it.
+const CLAUDE_CODE_SYSTEM_PREAMBLE: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// Ensure `system` is an array whose first block is the Claude Code preamble. Any existing system
+/// content (string or array) is kept as the following blocks. Idempotent.
+fn ensure_claude_code_system(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let mut blocks: Vec<Value> = match object.remove("system") {
+        Some(Value::String(text)) if !text.trim().is_empty() => {
+            vec![json!({"type": "text", "text": text})]
+        }
+        Some(Value::Array(existing)) => existing,
+        _ => Vec::new(),
+    };
+    // If the first block is already the preamble, leave it; otherwise prepend it.
+    let already = blocks
+        .first()
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.starts_with(CLAUDE_CODE_SYSTEM_PREAMBLE));
+    if !already {
+        blocks.insert(
+            0,
+            json!({"type": "text", "text": CLAUDE_CODE_SYSTEM_PREAMBLE}),
+        );
+    }
+    object.insert("system".to_string(), Value::Array(blocks));
 }
 
 fn build_codex_request(
@@ -3006,6 +3043,27 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
             .filter_map(|t| t["name"].as_str())
             .collect();
         assert_eq!(names, vec!["lookup", "shell", "fetch"]);
+    }
+
+    #[test]
+    fn ensure_claude_code_system_injects_preamble() {
+        // No system → preamble becomes the only block.
+        let mut a = json!({"model": "claude-opus-4-8", "messages": []});
+        ensure_claude_code_system(&mut a);
+        assert_eq!(a["system"][0]["text"], CLAUDE_CODE_SYSTEM_PREAMBLE);
+        assert_eq!(a["system"].as_array().unwrap().len(), 1);
+
+        // String system → preamble first, original kept as second block.
+        let mut b = json!({"system": "Answer in 3 words.", "messages": []});
+        ensure_claude_code_system(&mut b);
+        assert_eq!(b["system"][0]["text"], CLAUDE_CODE_SYSTEM_PREAMBLE);
+        assert_eq!(b["system"][1]["text"], "Answer in 3 words.");
+
+        // Already led by the preamble → unchanged (idempotent, no duplicate).
+        let mut c = json!({"system": [{"type": "text", "text": CLAUDE_CODE_SYSTEM_PREAMBLE}, {"type": "text", "text": "x"}]});
+        ensure_claude_code_system(&mut c);
+        assert_eq!(c["system"].as_array().unwrap().len(), 2);
+        assert_eq!(c["system"][0]["text"], CLAUDE_CODE_SYSTEM_PREAMBLE);
     }
 
     #[test]
