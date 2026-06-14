@@ -289,6 +289,8 @@ export interface SetApiGatewayAccountInput {
 
 export interface CreateVirtualApiAccountInput {
   toolId: ToolId;
+  /** Combo (model id) to bind. Omit to use the first enabled combo. */
+  model?: string | null;
 }
 
 // --- Token usage tracking (Usage tab) ---

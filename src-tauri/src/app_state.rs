@@ -245,13 +245,23 @@ impl ManagedState {
                     secret
                 }
             };
-            let model = data
-                .api_gateway
-                .combos
-                .iter()
-                .find(|combo| combo.enabled)
-                .map(|combo| combo.name.clone())
-                .context("Create at least one combo before adding a local API account")?;
+            // Bind to the requested combo if given (and still enabled), else the first enabled one.
+            let model = match input.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+                Some(requested) => data
+                    .api_gateway
+                    .combos
+                    .iter()
+                    .find(|combo| combo.enabled && combo.name == requested)
+                    .map(|combo| combo.name.clone())
+                    .with_context(|| format!("Combo '{requested}' not found or disabled"))?,
+                None => data
+                    .api_gateway
+                    .combos
+                    .iter()
+                    .find(|combo| combo.enabled)
+                    .map(|combo| combo.name.clone())
+                    .context("Create at least one combo before adding a local API account")?,
+            };
             let base_url = crate::api_gateway::base_url(&data.api_gateway);
             let default_dir = configured_default_config_dir(&data, &input.tool_id)
                 .context("CLI setup is ambiguous — choose the tool's default config first")?;

@@ -420,8 +420,8 @@ export function App() {
             onRefreshModels={() =>
               run("api-models", api.refreshApiGatewayModels, "Model registry updated")
             }
-            onCreateVirtual={(toolId) =>
-              run(`api-virtual-${toolId}`, () => api.createVirtualApiAccount(toolId))
+            onCreateVirtual={(toolId, model) =>
+              run(`api-virtual-${toolId}`, () => api.createVirtualApiAccount(toolId, model))
             }
             onRefresh={async () => {
               setSnapshot(await api.loadSnapshot());
@@ -747,7 +747,7 @@ function ApiGatewayView({
   onDeleteCombo: (comboId: string) => Promise<boolean>;
   onSetAccount: (input: SetApiGatewayAccountInput) => Promise<boolean>;
   onRefreshModels: () => Promise<boolean>;
-  onCreateVirtual: (toolId: ToolId) => Promise<boolean>;
+  onCreateVirtual: (toolId: ToolId, model?: string) => Promise<boolean>;
   onRefresh: () => Promise<void>;
   onCopy: (text: string) => void;
 }) {
@@ -759,6 +759,7 @@ function ApiGatewayView({
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [comboEditing, setComboEditing] = useState<ApiGatewayCombo | null>(null);
   const [showComboModal, setShowComboModal] = useState(false);
+  const [virtualTool, setVirtualTool] = useState<ToolId | null>(null);
   const [showModels, setShowModels] = useState(false);
   const [usage, setUsage] = useState<ApiUsageReport | null>(null);
 
@@ -920,14 +921,14 @@ function ApiGatewayView({
           </div>
           <div className="apiInline">
             <button
-              onClick={() => onCreateVirtual("claude")}
+              onClick={() => setVirtualTool("claude")}
               disabled={busy || !running || gateway.config.combos.length === 0}
             >
               <Terminal />
               {hasVirtualClaude ? "Update Claude Code" : "Add to Claude Code"}
             </button>
             <button
-              onClick={() => onCreateVirtual("codex")}
+              onClick={() => setVirtualTool("codex")}
               disabled={busy || !running || gateway.config.combos.length === 0}
             >
               <Terminal />
@@ -1173,7 +1174,80 @@ function ApiGatewayView({
           }}
         />
       )}
+
+      {virtualTool && (
+        <VirtualAccountModal
+          busy={busy}
+          tool={virtualTool}
+          combos={gateway.config.combos.filter((combo) => combo.enabled)}
+          currentModel={
+            snapshot.tools
+              .find((t) => t.id === virtualTool)
+              ?.accounts.find((a) => a.fingerprint === "api-local")?.apiProvider?.model ?? null
+          }
+          onClose={() => setVirtualTool(null)}
+          onConfirm={async (model) => {
+            const ok = await onCreateVirtual(virtualTool, model);
+            if (ok) setVirtualTool(null);
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function VirtualAccountModal({
+  busy,
+  tool,
+  combos,
+  currentModel,
+  onClose,
+  onConfirm,
+}: {
+  busy: boolean;
+  tool: ToolId;
+  combos: ApiGatewayCombo[];
+  currentModel: string | null;
+  onClose: () => void;
+  onConfirm: (model: string) => Promise<void>;
+}) {
+  const toolName = tool === "claude" ? "Claude Code" : "Codex";
+  const [model, setModel] = useState(
+    currentModel && combos.some((c) => c.name === currentModel)
+      ? currentModel
+      : combos[0]?.name ?? "",
+  );
+  return (
+    <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>{currentModel ? `Update ${toolName}` : `Add to ${toolName}`}</h2>
+        <p className="hint">
+          A <code>{tool === "claude" ? "claude-api" : "codex-api"}</code> account is added to{" "}
+          {toolName} pointing at the local gateway. Pick which combo (model) it requests.
+        </p>
+        <label>
+          Combo (model)
+          <select value={model} onChange={(event) => setModel(event.target.value)}>
+            {combos.map((combo) => (
+              <option value={combo.name} key={combo.id}>
+                {combo.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="modalActions">
+          <button onClick={onClose}>Cancel</button>
+          <button
+            className="primary"
+            onClick={() => model && onConfirm(model)}
+            disabled={busy || !model}
+          >
+            <Terminal />
+            {currentModel ? "Update" : "Add"}
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 

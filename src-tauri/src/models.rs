@@ -630,6 +630,9 @@ pub struct SetApiGatewayAccountInput {
 #[serde(rename_all = "camelCase")]
 pub struct CreateVirtualApiAccountInput {
     pub tool_id: ToolId,
+    /// Combo (model id) to bind the virtual account to. None = first enabled combo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

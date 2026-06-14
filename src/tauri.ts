@@ -376,7 +376,10 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
         isDefault: false,
         apiProvider: {
           baseUrl: demoSnapshot.apiGateway.status.baseUrl,
-          model: demoSnapshot.apiGateway.config.combos[0]?.name ?? "local-subscription",
+          model:
+            input.model ||
+            demoSnapshot.apiGateway.config.combos[0]?.name ||
+            "local-subscription",
           bypass: false,
         },
       });
@@ -433,6 +436,6 @@ export const api = {
   setApiGatewayAccount: (input: SetApiGatewayAccountInput) =>
     invoke<AppSnapshot>("set_api_gateway_account", { input }),
   refreshApiGatewayModels: () => invoke<AppSnapshot>("refresh_api_gateway_models"),
-  createVirtualApiAccount: (toolId: ToolId) =>
-    invoke<AppSnapshot>("create_virtual_api_account", { input: { toolId } }),
+  createVirtualApiAccount: (toolId: ToolId, model?: string) =>
+    invoke<AppSnapshot>("create_virtual_api_account", { input: { toolId, model: model ?? null } }),
 };
