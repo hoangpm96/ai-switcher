@@ -1441,15 +1441,27 @@ async fn translate_response(
         .to_string();
     // Never run a non-2xx upstream body through success translation — that fabricated an empty
     // assistant message (content:[]) with the upstream's error status, confusing the client.
-    // Pass the real error body + status straight back so the client sees what actually failed.
+    // Pass the real error body + status straight back so the client sees what actually failed,
+    // forwarding the provider's retry hints so the client backs off correctly.
     if !status.is_success() {
-        let body = response.bytes().await.unwrap_or_default();
-        let content_type = if content_type.is_empty() {
+        let mut headers = HeaderMap::new();
+        let ct = if content_type.is_empty() {
             "application/json".to_string()
         } else {
             content_type
         };
-        return (status, [(header::CONTENT_TYPE, content_type)], body).into_response();
+        if let Ok(value) = HeaderValue::from_str(&ct) {
+            headers.insert(header::CONTENT_TYPE, value);
+        }
+        for name in ["retry-after", "x-should-retry"] {
+            if let Some(value) = response.headers().get(name).cloned() {
+                if let Ok(header_name) = header::HeaderName::from_bytes(name.as_bytes()) {
+                    headers.insert(header_name, value);
+                }
+            }
+        }
+        let body = response.bytes().await.unwrap_or_default();
+        return (status, headers, body).into_response();
     }
 
     // We force Codex upstream to stream, and some providers send SSE without a clear content-type,
