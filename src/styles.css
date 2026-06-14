@@ -179,8 +179,7 @@ button.danger:hover:not(:disabled) {
 /* ---------- Banners ---------- */
 
 .notice,
-.error,
-.toast,
+.notice,
 .drift {
   align-items: center;
   border-radius: var(--radius-sm);
@@ -200,58 +199,69 @@ button.danger:hover:not(:disabled) {
   margin-left: auto;
 }
 
-.error {
-  /* Floating error toast: takes no layout space, floats bottom-center (above the green toast) */
+/* Unified notifications: one stack pinned top-right; success + error share this look. */
+.toastStack {
   position: fixed;
-  left: 50%;
-  bottom: 24px;
-  z-index: 110;
-  margin: 0;
-  max-width: calc(100vw - 48px);
-  width: max-content;
-  transform: translateX(-50%);
-  animation: floatIn 0.18s ease forwards;
-  background: var(--red-soft);
-  border: 1px solid rgba(251, 113, 133, 0.4);
-  box-shadow: var(--edge), var(--shadow-pop);
-}
-
-.error svg:first-child {
-  color: var(--red);
-}
-
-.error button {
-  margin-left: 4px;
-}
-
-@keyframes floatIn {
-  from {
-    opacity: 0;
-    transform: translate(-50%, 10px);
-  }
-  to {
-    opacity: 1;
-    transform: translate(-50%, 0);
-  }
+  top: 16px;
+  right: 16px;
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: min(380px, calc(100vw - 32px));
+  pointer-events: none;
 }
 
 .toast {
-  /* Floating toast: takes no layout space, floats at the bottom-center of the screen */
-  position: fixed;
-  left: 50%;
-  bottom: 24px;
-  z-index: 100;
-  margin: 0;
-  max-width: calc(100vw - 48px);
-  width: max-content;
-  animation: toastPop 4s forwards;
+  align-items: center;
+  animation: toastSlideIn 0.18s ease forwards;
   background: var(--surface);
   border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
   box-shadow: var(--shadow-pop);
+  display: flex;
+  font-size: 13px;
+  gap: 10px;
+  padding: 10px 12px;
+  pointer-events: auto;
 }
 
-.toast svg {
+.toast span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.toast button {
+  margin-left: 2px;
+}
+
+.toast.success {
+  border-color: rgba(52, 211, 153, 0.35);
+}
+
+.toast.success > svg:first-child {
   color: var(--green);
+}
+
+.toast.error {
+  background: var(--red-soft);
+  border-color: rgba(251, 113, 133, 0.4);
+}
+
+.toast.error > svg:first-child {
+  color: var(--red);
+}
+
+@keyframes toastSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 .drift {
@@ -260,12 +270,30 @@ button.danger:hover:not(:disabled) {
 }
 
 .notice svg,
-.error svg,
 .toast svg,
 .drift svg {
   flex-shrink: 0;
   height: 16px;
   width: 16px;
+}
+
+/* One-time secret reveal in the Add API key modal. */
+.secretReveal {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+}
+
+.secretReveal code {
+  color: var(--text);
+  flex: 1;
+  font-size: 12.5px;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* ---------- Workspace layout ---------- */
@@ -1547,22 +1575,6 @@ button.danger:hover:not(:disabled) {
 @keyframes spin {
   to {
     transform: rotate(360deg);
-  }
-}
-
-@keyframes toastPop {
-  0% {
-    opacity: 0;
-    transform: translate(-50%, 10px);
-  }
-  8%,
-  85% {
-    opacity: 1;
-    transform: translate(-50%, 0);
-  }
-  100% {
-    opacity: 0;
-    transform: translate(-50%, 6px);
   }
 }
 

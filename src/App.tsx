@@ -101,12 +101,27 @@ export function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [selectedTool, setSelectedTool] = useState<ToolId>("claude");
   const [view, setView] = useState<"accounts" | "api" | "usage" | "settings">("accounts");
-  const [toast, setToast] = useState<string | null>(null);
+  // One unified notification channel for the whole app: success + error both render as a
+  // top-right toast (see the Toasts renderer). `notify` is the single entry point.
+  const [toasts, setToasts] = useState<{ id: number; kind: "success" | "error"; text: string }[]>(
+    [],
+  );
+  const notify = useCallback((text: string, kind: "success" | "error" = "success") => {
+    if (!text) return;
+    const id = nextToastId();
+    setToasts((current) => [...current.slice(-3), { id, kind, text }]);
+    window.setTimeout(() => setToasts((current) => current.filter((item) => item.id !== id)), 4500);
+  }, []);
+  const dismissToast = useCallback(
+    (id: number) => setToasts((current) => current.filter((item) => item.id !== id)),
+    [],
+  );
+  const setToast = useCallback((text: string | null) => text && notify(text, "success"), [notify]);
+  const setError = useCallback((text: string | null) => text && notify(text, "error"), [notify]);
   const [busy, setBusy] = useState<string | null>(null);
   const [refreshingAccounts, setRefreshingAccounts] = useState<Set<string>>(new Set());
   const [dialog, setDialog] = useState<"add" | "rename" | "launcher" | "setup" | null>(null);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [switchNotice, setSwitchNotice] = useState<string | null>(null);
   const [autoSwitchBanner, setAutoSwitchBanner] = useState<string | null>(null);
   const [version, setVersion] = useState("");
@@ -279,22 +294,21 @@ export function App() {
         </section>
       )}
 
-      {error && (
-        <section className="error" role="alert">
-          <AlertTriangle />
-          <span>{error}</span>
-          <button className="iconButton" onClick={() => setError(null)} title="Dismiss">
-            <X />
-          </button>
-        </section>
-      )}
-
-      {toast && (
-        <section className="toast" onAnimationEnd={() => setToast(null)}>
-          <Check />
-          <span>{toast}</span>
-        </section>
-      )}
+      <div className="toastStack">
+        {toasts.map((item) => (
+          <section
+            className={`toast ${item.kind}`}
+            role={item.kind === "error" ? "alert" : "status"}
+            key={item.id}
+          >
+            {item.kind === "error" ? <AlertTriangle /> : <Check />}
+            <span>{item.text}</span>
+            <button className="iconButton" onClick={() => dismissToast(item.id)} title="Dismiss">
+              <X />
+            </button>
+          </section>
+        ))}
+      </div>
 
       {autoSwitchBanner && (
         <section className="autoBanner">
@@ -381,14 +395,20 @@ export function App() {
             onStop={() => run("api-stop", api.stopApiGateway)}
             onCreateKey={async (input) => {
               setBusy("api-key");
-              setError(null);
               try {
                 const result = await api.createApiGatewayKey(input);
                 setSnapshot(result.snapshot);
-                await navigator.clipboard?.writeText(result.secret);
-                setToast("Đã tạo API key. Copy ngay — key chỉ hiện đầy đủ một lần.");
+                const copied = await copyToClipboard(result.secret);
+                notify(
+                  copied
+                    ? "API key created and copied to clipboard."
+                    : "API key created — copy it now, it is shown only once.",
+                  "success",
+                );
+                return result.secret;
               } catch (err) {
-                setError(errorMessage(err));
+                notify(errorMessage(err), "error");
+                return null;
               } finally {
                 setBusy(null);
               }
@@ -406,9 +426,9 @@ export function App() {
             onRefresh={async () => {
               setSnapshot(await api.loadSnapshot());
             }}
-            onCopy={(text) => {
-              void navigator.clipboard?.writeText(text);
-              setToast(`Copied: ${text}`);
+            onCopy={async (text) => {
+              const ok = await copyToClipboard(text);
+              notify(ok ? `Copied: ${text}` : "Couldn't access the clipboard.", ok ? "success" : "error");
             }}
           />
         )}
@@ -521,9 +541,9 @@ export function App() {
                       setSelectedAccount(account);
                       setDialog("launcher");
                     }}
-                    onCopy={(text) => {
-                      void navigator.clipboard?.writeText(text);
-                      setToast(`Copied: ${text}`);
+                    onCopy={async (text) => {
+                      const ok = await copyToClipboard(text);
+                      notify(ok ? `Copied: ${text}` : "Couldn't access the clipboard.", ok ? "success" : "error");
                     }}
                     onDelete={() =>
                       run("delete", () => api.deleteAccount(currentTool.id, account.id))
@@ -721,7 +741,7 @@ function ApiGatewayView({
   busy: boolean;
   onStart: (input: StartApiGatewayInput) => Promise<boolean>;
   onStop: () => Promise<boolean>;
-  onCreateKey: (input: CreateApiGatewayKeyInput) => Promise<void>;
+  onCreateKey: (input: CreateApiGatewayKeyInput) => Promise<string | null>;
   onDeleteKey: (keyId: string) => Promise<boolean>;
   onSaveCombo: (input: SaveApiGatewayComboInput) => Promise<boolean>;
   onDeleteCombo: (comboId: string) => Promise<boolean>;
@@ -1131,10 +1151,8 @@ function ApiGatewayView({
         <AddKeyModal
           busy={busy}
           onClose={() => setShowKeyModal(false)}
-          onCreate={async (input) => {
-            await onCreateKey(input);
-            setShowKeyModal(false);
-          }}
+          onCreate={onCreateKey}
+          onCopy={onCopy}
         />
       )}
 
@@ -1322,48 +1340,110 @@ function AddKeyModal({
   busy,
   onClose,
   onCreate,
+  onCopy,
 }: {
   busy: boolean;
   onClose: () => void;
-  onCreate: (input: CreateApiGatewayKeyInput) => Promise<void>;
+  onCreate: (input: CreateApiGatewayKeyInput) => Promise<string | null>;
+  onCopy: (text: string) => void;
 }) {
   const [name, setName] = useState("");
   const [expiry, setExpiry] = useState("");
-  const submit = () =>
-    onCreate({
+  const [secret, setSecret] = useState<string | null>(null);
+  const submit = async () => {
+    const created = await onCreate({
       name: name.trim() || "Untitled key",
       expiresAt: expiry ? new Date(`${expiry}T23:59:59`).toISOString() : null,
     });
+    if (created) setSecret(created);
+  };
   return (
     <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
       <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
         <h2>Add API key</h2>
-        <label>
-          Key name
-          <input
-            autoFocus
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            placeholder="e.g. Cline laptop"
-          />
-        </label>
-        <label>
-          <span className="labelRow">
-            Expires <small>(optional)</small>
-          </span>
-          <input type="date" value={expiry} onChange={(event) => setExpiry(event.target.value)} />
-        </label>
-        <p className="hint">The full key is shown once and copied to your clipboard on create.</p>
-        <div className="modalActions">
-          <button onClick={onClose}>Cancel</button>
-          <button className="primary" onClick={submit} disabled={busy}>
-            <Plus />
-            Create key
-          </button>
-        </div>
+        {secret ? (
+          // Reveal view: the secret is shown exactly once. Copy works even if auto-copy was denied.
+          <>
+            <label>
+              Your new API key
+              <div className="secretReveal">
+                <code>{secret}</code>
+                <button className="iconButton" onClick={() => onCopy(secret)} title="Copy key">
+                  <Copy />
+                </button>
+              </div>
+              <small>Copy it now — it will not be shown again.</small>
+            </label>
+            <div className="modalActions">
+              <button className="primary" onClick={onClose}>
+                Done
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <label>
+              Key name
+              <input
+                autoFocus
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="e.g. Cline laptop"
+              />
+            </label>
+            <label>
+              <span className="labelRow">
+                Expires <small>(optional)</small>
+              </span>
+              <input type="date" value={expiry} onChange={(event) => setExpiry(event.target.value)} />
+            </label>
+            <p className="hint">The full key is shown once when created.</p>
+            <div className="modalActions">
+              <button onClick={onClose}>Cancel</button>
+              <button className="primary" onClick={submit} disabled={busy}>
+                <Plus />
+                Create key
+              </button>
+            </div>
+          </>
+        )}
       </section>
     </div>
   );
+}
+
+let toastSeq = 0;
+function nextToastId() {
+  toastSeq += 1;
+  return toastSeq;
+}
+
+/// Copy text to the clipboard, tolerating webviews that deny the async Clipboard API. Tries the
+/// modern API, falls back to a hidden-textarea execCommand, and never throws — returns whether it
+/// worked so callers can decide what to tell the user.
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the legacy path
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 // Curated fallback so the combo model picker is never blank before the live registry loads.
