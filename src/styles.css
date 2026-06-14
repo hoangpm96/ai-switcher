@@ -453,28 +453,94 @@ button.danger:hover:not(:disabled) {
 }
 
 .apiFormRow {
+  align-items: end;
   display: grid;
   gap: 10px;
-  grid-template-columns: 1.2fr 0.65fr 0.85fr 1fr;
+  grid-template-columns: 1.1fr 0.8fr 0.9fr 1fr;
+}
+
+/* Stack a caption above each field so "Bind", "Port"… read as labels, not raw inputs. */
+.apiFormRow > label,
+.apiField {
+  display: grid;
+  font-size: 12px;
+  font-weight: 500;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Keep each caption on one line so a long label can't shove its input out of row alignment. */
+.apiFormRow > label > span:first-child,
+.apiField > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.apiFormRow > label small,
+.apiField small {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 400;
 }
 
 .apiInline {
+  align-items: flex-end;
   display: flex;
   gap: 8px;
 }
 
-.apiInline input {
+.apiInline > .apiField {
+  flex: 1;
+}
+
+.apiInline > input {
   flex: 1;
   min-width: 0;
 }
 
-.apiSection select {
+/* Give every text-like field in the API tab the same surface/border/height as the
+   modal inputs — without this they fall back to bare browser defaults. */
+.apiSection input,
+.apiSection select,
+.apiField input {
   background: var(--surface-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
+  box-shadow: var(--edge);
   color: var(--text);
   min-height: 38px;
-  padding: 0 10px;
+  min-width: 0;
+  padding: 0 12px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+  width: 100%;
+}
+
+.apiSection input[type="checkbox"] {
+  min-height: 0;
+  width: auto;
+}
+
+.apiSection input:hover:not(:focus):not([readonly]),
+.apiSection select:hover {
+  border-color: var(--line-strong);
+}
+
+.apiSection input:focus,
+.apiSection select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+.apiSection input[readonly] {
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-3);
+  cursor: default;
+}
+
+.apiSection input::placeholder {
+  color: var(--text-3);
 }
 
 .apiList,

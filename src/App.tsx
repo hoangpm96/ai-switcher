@@ -811,8 +811,14 @@ function ApiGatewayView({
               <input value={port} onChange={(event) => setPort(event.target.value)} />
             </label>
             <label>
-              Quota cutoff
-              <input value={threshold} onChange={(event) => setThreshold(event.target.value)} />
+              <span>
+                Quota cutoff <small>(%)</small>
+              </span>
+              <input
+                value={threshold}
+                onChange={(event) => setThreshold(event.target.value)}
+                title="Drop an account from rotation once its quota usage passes this percentage."
+              />
             </label>
             <label>
               Rotation
@@ -863,13 +869,24 @@ function ApiGatewayView({
             </div>
           </div>
           <div className="apiInline">
-            <input value={keyName} onChange={(event) => setKeyName(event.target.value)} />
-            <input
-              type="date"
-              value={keyExpiry}
-              onChange={(event) => setKeyExpiry(event.target.value)}
-              title="Optional expiration date"
-            />
+            <label className="apiField">
+              Key name
+              <input
+                value={keyName}
+                onChange={(event) => setKeyName(event.target.value)}
+                placeholder="e.g. Cline laptop"
+              />
+            </label>
+            <label className="apiField">
+              <span>
+                Expires <small>(optional)</small>
+              </span>
+              <input
+                type="date"
+                value={keyExpiry}
+                onChange={(event) => setKeyExpiry(event.target.value)}
+              />
+            </label>
             <button
               onClick={() =>
                 onCreateKey({
@@ -912,7 +929,7 @@ function ApiGatewayView({
             <RotateCcw />
             <div>
               <strong>Pools</strong>
-              <small>One pool name is the model clients request.</small>
+              <small>The pool name is the model id your clients request.</small>
             </div>
             <button
               className="iconButton"
@@ -924,7 +941,14 @@ function ApiGatewayView({
             </button>
           </div>
           <div className="apiInline">
-            <input value={poolModel} onChange={(event) => setPoolModel(event.target.value)} />
+            <label className="apiField">
+              Pool model name
+              <input
+                value={poolModel}
+                onChange={(event) => setPoolModel(event.target.value)}
+                placeholder="e.g. local-subscription"
+              />
+            </label>
             <button onClick={savePool} disabled={busy || selectedMembers.size === 0}>
               <Plus />
               Save pool
