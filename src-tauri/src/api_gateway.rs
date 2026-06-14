@@ -2232,33 +2232,86 @@ fn translate_sse_line(
         if stream_event_usage(&value).is_some() {
             seen_events.push(value.clone());
         }
-        let translated = translate_stream_event(value, provider, client, model);
-        if !translated.is_null() {
-            out.push_str("data: ");
-            out.push_str(&translated.to_string());
-            out.push_str("\n\n");
+        for translated in translate_stream_event(value, provider, client, model) {
+            if !translated.is_null() {
+                out.push_str("data: ");
+                out.push_str(&translated.to_string());
+                out.push_str("\n\n");
+            }
         }
     }
     out
 }
 
+/// Translate one upstream SSE event into zero-or-more client-protocol events. Most map 1:1, but the
+/// Anthropic→Responses direction expands message boundaries into the structural events the Codex
+/// CLI requires (`response.created`/`output_item.added` on start, `output_item.done`/
+/// `response.completed{response:{…}}` on stop) — without them Codex reports "stream closed before
+/// response.completed".
 fn translate_stream_event(
     value: Value,
     provider: ClientProtocol,
     client: ClientProtocol,
     model: &str,
-) -> Value {
+) -> Vec<Value> {
+    let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+
+    // Anthropic → Responses: emit the structural envelope Codex expects.
+    if provider == ClientProtocol::Anthropic && client == ClientProtocol::OpenAiResponses {
+        let resp_id = format!("resp_{}", chrono::Utc::now().timestamp_millis());
+        match event_type {
+            "message_start" => {
+                let response = json!({"id": resp_id, "object": "response", "status": "in_progress", "model": model, "output": []});
+                return vec![
+                    json!({"type": "response.created", "response": response}),
+                    json!({"type": "response.output_item.added", "output_index": 0,
+                        "item": {"id": "msg_0", "type": "message", "status": "in_progress", "role": "assistant", "content": []}}),
+                    json!({"type": "response.content_part.added", "item_id": "msg_0", "output_index": 0,
+                        "content_index": 0, "part": {"type": "output_text", "text": ""}}),
+                ];
+            }
+            "content_block_delta" => {
+                let text = stream_delta_text(&value);
+                if let Some(tool) = translate_tool_stream_event(&value, provider, client, model) {
+                    return vec![tool];
+                }
+                if text.is_empty() {
+                    return vec![];
+                }
+                return vec![json!({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": text})];
+            }
+            "message_delta" | "content_block_start" | "content_block_stop" | "ping" => {
+                if let Some(tool) = translate_tool_stream_event(&value, provider, client, model) {
+                    return vec![tool];
+                }
+                return vec![];
+            }
+            "message_stop" => {
+                let usage = value.pointer("/usage").cloned().unwrap_or(Value::Null);
+                let response = json!({"id": resp_id, "object": "response", "status": "completed",
+                    "model": model, "output": [], "usage": usage});
+                return vec![
+                    json!({"type": "response.output_text.done", "output_index": 0, "content_index": 0}),
+                    json!({"type": "response.output_item.done", "output_index": 0,
+                        "item": {"id": "msg_0", "type": "message", "status": "completed", "role": "assistant"}}),
+                    json!({"type": "response.completed", "response": response}),
+                ];
+            }
+            _ => return vec![],
+        }
+    }
+
     if let Some(event) = translate_tool_stream_event(&value, provider, client, model) {
-        return event;
+        return vec![event];
     }
     if let Some(event) = translate_terminal_stream_event(&value, provider, client, model) {
-        return event;
+        return vec![event];
     }
     let text = stream_delta_text(&value);
     if text.is_empty() {
-        return Value::Null;
+        return vec![];
     }
-    match (provider, client) {
+    let single = match (provider, client) {
         (ClientProtocol::Anthropic, ClientProtocol::OpenAiChat)
         | (ClientProtocol::OpenAiResponses, ClientProtocol::OpenAiChat) => json!({
             "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
@@ -2267,17 +2320,14 @@ fn translate_stream_event(
             "model": model,
             "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
         }),
-        (ClientProtocol::Anthropic, ClientProtocol::OpenAiResponses) => json!({
-            "type": "response.output_text.delta",
-            "delta": text
-        }),
         (ClientProtocol::OpenAiResponses, ClientProtocol::Anthropic) => json!({
             "type": "content_block_delta",
             "index": 0,
             "delta": {"type": "text_delta", "text": text}
         }),
         _ => value,
-    }
+    };
+    vec![single]
 }
 
 fn translate_tool_stream_event(
@@ -2833,7 +2883,7 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
             "pool-model",
         );
         assert_eq!(
-            chat_start["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            chat_start[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
             "search"
         );
 
@@ -2848,9 +2898,56 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
             "pool-model",
         );
         assert_eq!(
-            anthropic_delta["delta"]["partial_json"],
+            anthropic_delta[0]["delta"]["partial_json"],
             "{\"query\":\"rust\"}"
         );
+    }
+
+    #[test]
+    fn anthropic_to_responses_stream_emits_codex_envelope() {
+        let model = "claude-opus-4-8";
+        let start = translate_stream_event(
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+            ClientProtocol::Anthropic,
+            ClientProtocol::OpenAiResponses,
+            model,
+        );
+        let start_types: Vec<&str> = start.iter().filter_map(|e| e["type"].as_str()).collect();
+        assert_eq!(
+            start_types,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added"
+            ]
+        );
+
+        let delta = translate_stream_event(
+            json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi"}}),
+            ClientProtocol::Anthropic,
+            ClientProtocol::OpenAiResponses,
+            model,
+        );
+        assert_eq!(delta[0]["type"], "response.output_text.delta");
+        assert_eq!(delta[0]["delta"], "Hi");
+
+        let stop = translate_stream_event(
+            json!({"type": "message_stop"}),
+            ClientProtocol::Anthropic,
+            ClientProtocol::OpenAiResponses,
+            model,
+        );
+        let stop_types: Vec<&str> = stop.iter().filter_map(|e| e["type"].as_str()).collect();
+        assert_eq!(
+            stop_types,
+            vec![
+                "response.output_text.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        // The completed event must carry a response object (Codex requires it).
+        assert_eq!(stop.last().unwrap()["response"]["status"], "completed");
     }
 
     #[test]
