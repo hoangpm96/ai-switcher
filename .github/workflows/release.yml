@@ -48,7 +48,7 @@ jobs:
 
             See the [CHANGELOG](https://github.com/hoangpm96/ai-switcher/blob/main/CHANGELOG.md)
             for what changed in this version.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           # Auto-append the list of merged commits/PRs since the last tag.
           generateReleaseNotes: true

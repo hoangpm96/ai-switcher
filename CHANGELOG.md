@@ -5,6 +5,47 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-15
+
+### Added
+
+- **Local API gateway.** Run a local OpenAI/Anthropic-compatible server for Claude
+  Code and Codex subscription accounts, with `/v1/models`, `/v1/messages`,
+  `/v1/chat/completions`, `/v1/responses`, and Codex direct proxy endpoints.
+- **9router-style combos.** Define named model combos with ordered fallback members
+  and per-combo rotation strategy, then expose each combo as a gateway model.
+- **Gateway API keys.** Create, reveal, copy, enable/disable, and delete local
+  gateway keys from the app. Keys are masked in snapshots and persisted locally.
+- **Subscription account rotation.** Toggle which Claude/Codex subscription
+  accounts may serve gateway traffic, rotate with round-robin or fill-first, honor
+  quota thresholds, and cool accounts down when upstreams ask clients to retry
+  later.
+- **Virtual CLI accounts.** Create local Claude/Codex launcher accounts that point
+  at the local gateway and pin either a combo or a single discovered model.
+- **Gateway usage report.** Track real token usage for streaming gateway requests
+  by combo, key, account, and tool.
+
+### Changed
+
+- API/proxy account creation now uses a modal, fetches gateway models before
+  choosing a model, supports Claude Code as well as Codex, and can optionally add
+  Codex bypass flags to generated launchers.
+- Notifications now use a unified top-right toast, and API tab controls use the
+  app's current toggle/status/button styling.
+- The release workflow now publishes GitHub Releases immediately when a version
+  tag is pushed, instead of leaving them as drafts.
+
+### Fixed
+
+- Gateway forwarding now passes through upstream errors, retry headers, and retry
+  cooldowns instead of hiding them behind fallback responses.
+- Anthropic-to-Codex and OpenAI Responses translations now strip incompatible
+  client-only fields, set required Codex `/responses` fields, preserve usable SSE
+  envelopes, flatten chat tools, and drop nameless tools rejected by Anthropic.
+- Gateway startup is non-blocking and no longer hangs on model discovery.
+- Clipboard copy actions use the real Tauri clipboard plugin when running in the
+  desktop app.
+
 ## [0.2.0] - 2026-06-14
 
 ### Added
@@ -54,5 +95,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - API / proxy gateway accounts for Claude Code and Codex.
 - Universal macOS `.dmg` release via GitHub Actions.
 
+[0.3.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.3.0
 [0.2.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.2.0
 [0.1.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.1.0

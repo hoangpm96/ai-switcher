@@ -19,12 +19,21 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 - **Quota at a glance.** Reads 5-hour / weekly usage for Claude & Codex and per-model quota for Antigravity, and shows your **subscription plan** (Plus / Pro / Max) when the API reports it.
 - **Per-tool auto-switch.** Configure separately for Claude and Codex — the bare command falls back to another account when the active one nears its quota.
 - **Usage & cost tab.** Token usage and estimated cost per tool, plus an aggregated **All** view across tools, charted over a selectable date range.
+- **Local API gateway.** Expose Claude/Codex subscription accounts through a local OpenAI/Anthropic-compatible server with API keys, model combos, fallback rotation, cooldown handling, and gateway usage tracking.
 
 ### Claude Code & Codex (CLI)
 
 - Each account logs into its own isolated config dir and gets a **dedicated command** (`claude-<name>`, `codex-<name>`) so you can run several accounts in parallel across terminals.
 - The bare `claude` / `codex` command **follows the account you select** (via a shell hook + an "active profile" file). Run `aisw` in an already-open terminal to sync it to the latest selection.
 - Chat sessions are **shared across accounts** in the same project, so you can resume work regardless of which account created it.
+- API/proxy accounts can point Claude Code or Codex at an external gateway, with one pinned model per generated launcher.
+
+### Local API Gateway
+
+- Start a local server on `127.0.0.1:8783` by default and call it with OpenAI or Anthropic-compatible clients.
+- Create local gateway API keys, enable the subscription accounts that may serve requests, and define named **combos** that resolve to ordered model fallbacks.
+- Create virtual Claude/Codex CLI accounts that point at the local gateway and pin a combo or single discovered model.
+- Gateway usage is tracked separately by combo, key, account, and tool.
 
 ### Antigravity IDE (GUI)
 
@@ -60,11 +69,11 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a version tag like `v0.2.0` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and attaches it to a draft GitHub Release. Bump the version in `package.json`, `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` first, then:
+Pushing a version tag like `v0.3.0` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin main v0.3.0
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version history.
