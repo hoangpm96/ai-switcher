@@ -342,7 +342,14 @@ async fn handle_ai_request(
                 continue;
             }
         }
-        if !credential_failed && !retryable_failed {
+        // Any other non-success (e.g. a 400 from a bad model on this member) → fall through to the
+        // next combo member/account instead of returning a broken response, the way 9router does.
+        // Only the last attempt surfaces the upstream error verbatim (handled in translate_response).
+        let other_failure = !response.status().is_success() && !credential_failed && !retryable_failed;
+        if other_failure && tried.len() < max_attempts {
+            continue;
+        }
+        if response.status().is_success() {
             mark_member_available(&state, &selected.key);
         }
         return translate_response(
@@ -1282,6 +1289,18 @@ async fn translate_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // Never run a non-2xx upstream body through success translation — that fabricated an empty
+    // assistant message (content:[]) with the upstream's error status, confusing the client.
+    // Pass the real error body + status straight back so the client sees what actually failed.
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_default();
+        let content_type = if content_type.is_empty() {
+            "application/json".to_string()
+        } else {
+            content_type
+        };
+        return (status, [(header::CONTENT_TYPE, content_type)], body).into_response();
+    }
     if content_type.contains("text/event-stream") {
         let recorder = UsageRecorder::new(store, model, key_id, member, provider);
         // Same protocol → pass bytes through untouched; otherwise translate each event. Either

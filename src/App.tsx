@@ -802,11 +802,12 @@ function ApiGatewayView({
   const modelsByProvider = useMemo(() => {
     const groups: { tool: ToolId; label: string; models: string[] }[] = [];
     for (const tool of ["claude", "codex"] as ToolId[]) {
-      const models = new Set<string>();
+      // Union the live registry with the curated known list, so the picker always offers the
+      // full set of usable models (like 9router) even when account discovery is sparse.
+      const models = new Set<string>(FALLBACK_MODELS[tool]);
       for (const registry of gateway.config.modelRegistry.filter((r) => r.toolId === tool)) {
         registry.models.forEach((model) => models.add(model));
       }
-      if (models.size === 0) FALLBACK_MODELS[tool].forEach((model) => models.add(model));
       groups.push({
         tool,
         label: tool === "claude" ? "Claude" : "Codex",
@@ -1573,11 +1574,28 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
-// Curated fallback so the combo model picker is never blank before the live registry loads.
-// The real registry (per signed-in account) overrides these the moment it is discovered.
+// Curated known-model list per provider, unioned with live account discovery so the picker always
+// offers the full usable set (the way 9router does) even when an account's discovery is sparse.
 const FALLBACK_MODELS: Record<ToolId, string[]> = {
-  claude: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
-  codex: ["gpt-5-codex", "gpt-5.1-codex", "gpt-5.1", "gpt-5.1-codex-mini"],
+  claude: [
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-1-20250805",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5-20250929",
+    "claude-haiku-4-5",
+  ],
+  codex: [
+    "gpt-5-codex",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1",
+    "gpt-5.1-codex-max",
+    "gpt-5",
+    "gpt-5-mini",
+    "o3",
+    "o4-mini",
+  ],
   antigravity: [],
 };
 
