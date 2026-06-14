@@ -759,13 +759,35 @@ fn should_retry_upstream(status: reqwest::StatusCode) -> bool {
 }
 
 fn openai_chat_to_responses(mut body: Value) -> Value {
-    let input = body
+    // Hoist any system messages into the required top-level `instructions`; the rest become `input`.
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+    for message in body
         .get("messages")
+        .and_then(Value::as_array)
         .cloned()
-        .unwrap_or(Value::Array(Vec::new()));
+        .unwrap_or_default()
+    {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            let text = message_text(&message);
+            if !text.is_empty() {
+                instructions.push(text);
+            }
+        } else {
+            input.push(message);
+        }
+    }
     if let Some(object) = body.as_object_mut() {
         object.remove("messages");
-        object.insert("input".to_string(), input);
+        object.insert("input".to_string(), Value::Array(input));
+        object.insert(
+            "instructions".to_string(),
+            Value::String(if instructions.is_empty() {
+                "You are a helpful coding assistant.".to_string()
+            } else {
+                instructions.join("\n\n")
+            }),
+        );
     }
     body
 }
@@ -898,9 +920,9 @@ fn openai_responses_to_anthropic(body: Value) -> Value {
 
 fn anthropic_to_responses(body: Value) -> Value {
     let mut input = Vec::new();
-    if let Some(system) = body.get("system").and_then(Value::as_str) {
-        input.push(json!({"role": "system", "content": system}));
-    }
+    // Codex's responses endpoint requires a top-level `instructions` string (the system prompt) —
+    // a `{role:"system"}` item inside `input` is rejected with "Instructions are required".
+    let instructions = anthropic_system_text(body.get("system"));
     for message in body
         .get("messages")
         .and_then(Value::as_array)
@@ -943,6 +965,11 @@ fn anthropic_to_responses(body: Value) -> Value {
     }
     let mut out = json!({
         "model": body.get("model").cloned().unwrap_or(Value::String(String::new())),
+        "instructions": if instructions.is_empty() {
+            "You are a helpful coding assistant.".to_string()
+        } else {
+            instructions
+        },
         "input": input,
     });
     if let Some(max_tokens) = body.get("max_tokens") {
@@ -955,6 +982,20 @@ fn anthropic_to_responses(body: Value) -> Value {
         out["tools"] = tools;
     }
     out
+}
+
+/// Anthropic `system` can be a plain string or an array of `{type:"text", text:...}` blocks.
+/// Flatten either form to a single instructions string.
+fn anthropic_system_text(system: Option<&Value>) -> String {
+    match system {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
 }
 
 fn openai_tools_to_anthropic(tools: Option<&Value>) -> Option<Value> {
@@ -2632,6 +2673,43 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
         let fill_first = select_member(&state, &data, &combo, "fill", &tried).unwrap();
         assert_eq!(fill_first.account.id, "a1");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn anthropic_to_responses_sets_top_level_instructions() {
+        // Codex's responses endpoint requires `instructions`; the Anthropic system prompt must be
+        // hoisted there, not left as a system item inside `input`.
+        let out = anthropic_to_responses(json!({
+            "model": "gpt-5-codex",
+            "system": [{"type": "text", "text": "Be terse."}],
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(out["instructions"], "Be terse.");
+        // No system role should leak into input.
+        let has_system = out["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.get("role").and_then(Value::as_str) == Some("system"));
+        assert!(!has_system);
+
+        // Missing system → a non-empty default instruction (the endpoint rejects an empty one).
+        let out2 = anthropic_to_responses(json!({
+            "model": "gpt-5-codex",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(out2["instructions"].as_str().is_some_and(|s| !s.is_empty()));
+
+        // OpenAI-chat → responses also hoists the system message into instructions.
+        let out3 = openai_chat_to_responses(json!({
+            "model": "gpt-5-codex",
+            "messages": [
+                {"role": "system", "content": "Rules here."},
+                {"role": "user", "content": "hi"}
+            ]
+        }));
+        assert_eq!(out3["instructions"], "Rules here.");
+        assert_eq!(out3["input"].as_array().unwrap().len(), 1);
     }
 
     #[test]
