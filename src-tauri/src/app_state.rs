@@ -296,7 +296,33 @@ impl ManagedState {
             }
             ToolId::Antigravity => unreachable!("guarded above"),
         }
-        let launcher = None;
+        // Give the virtual account its own standalone command (`claude-api` / `codex-api`) so it can
+        // be run in parallel from any terminal without "Use"-ing it as the active account. Failure
+        // to write the launcher is non-fatal — the account still works via "Use".
+        let launcher = {
+            let binary = {
+                let data = self
+                    .data
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+                configured_binary_path(&data, &input.tool_id)
+            };
+            let full = full_launcher_name(&input.tool_id, &name).ok();
+            match (full, binary) {
+                (Some(full), Some(binary)) => write_api_launcher(
+                    &input.tool_id,
+                    &self.store,
+                    &id,
+                    &full,
+                    &model,
+                    false,
+                    &binary,
+                )
+                .ok()
+                .map(|_| full),
+                _ => None,
+            }
+        };
         let timestamp = now();
         {
             let mut data = self
