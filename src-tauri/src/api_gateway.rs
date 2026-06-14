@@ -322,7 +322,7 @@ async fn handle_ai_request(
         let response = match builder.send().await {
             Ok(response) => response,
             Err(err) => {
-                mark_cooldown(&state, &selected.key);
+                mark_cooldown(&state, &selected.key, None);
                 if tried.len() >= max_attempts {
                     return api_error(
                         StatusCode::BAD_GATEWAY,
@@ -346,7 +346,13 @@ async fn handle_ai_request(
         }
         let retryable_failed = should_retry_upstream(response.status());
         if retryable_failed {
-            mark_cooldown(&state, &selected.key);
+            // Honor the provider's Retry-After (seconds) when present, else default cooldown.
+            let retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok());
+            mark_cooldown(&state, &selected.key, retry_after);
         }
         // Any other non-success (e.g. a 400 from a bad model on this member) → fall through to the
         // next combo member/account instead of returning a broken response, the way 9router does.
@@ -682,13 +688,15 @@ fn bind_session(state: &GatewayState, session_id: &str, account_key: &str) {
     }
 }
 
-fn mark_cooldown(state: &GatewayState, account_key: &str) {
-    let until = chrono::Utc::now() + chrono::Duration::seconds(60);
+/// Cool an account for `retry_after_secs` (the provider's Retry-After) when given, else 60s.
+/// Capped so a huge Retry-After can't sideline an account for an unreasonable time.
+fn mark_cooldown(state: &GatewayState, account_key: &str, retry_after_secs: Option<u64>) {
+    let secs = retry_after_secs.unwrap_or(60).clamp(1, 3600);
+    let until = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
     if let Ok(mut runtime) = state.runtime.lock() {
-        runtime.cooldowns.insert(
-            account_key.to_string(),
-            Instant::now() + Duration::from_secs(60),
-        );
+        runtime
+            .cooldowns
+            .insert(account_key.to_string(), Instant::now() + Duration::from_secs(secs));
     }
     persist_member_state(
         state,
@@ -2867,7 +2875,7 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
         let sticky = select_member(&state, &data, &combo, "sticky", &tried).unwrap();
         assert_eq!(sticky.account.id, "a2");
 
-        mark_cooldown(&state, &a2_key);
+        mark_cooldown(&state, &a2_key, None);
         let persisted = state.store.load().unwrap();
         let a2_entry = persisted
             .api_gateway
