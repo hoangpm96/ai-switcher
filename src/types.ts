@@ -80,23 +80,29 @@ export interface ApiGatewayKey {
   createdAt: string;
 }
 
-export interface ApiGatewayPoolMember {
+/** A combo: a named, ordered list of member model names (9router-style). The provider/account is
+ *  resolved at request time from the gateway's enabled accounts — a member is just a model id. */
+export interface ApiGatewayCombo {
+  id: string;
+  /** The model id clients request. Unique. */
+  name: string;
+  /** Ordered member model names (order = fallback priority). */
+  members: string[];
+  /** Per-combo rotation strategy; null = use the gateway's global strategy. */
+  strategy?: ApiRotationStrategy | null;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A subscription account's participation in the gateway, with its live rotation state. */
+export interface ApiGatewayAccount {
   toolId: ToolId;
   accountId: string;
-  model: string;
   enabled: boolean;
   state: ApiPoolAccountState;
   cooldownUntil?: string | null;
   error?: string | null;
-}
-
-export interface ApiGatewayPool {
-  id: string;
-  model: string;
-  members: ApiGatewayPoolMember[];
-  rrIndex: number;
-  createdAt: string;
-  updatedAt: string;
 }
 
 export interface ApiGatewayModelRegistry {
@@ -114,7 +120,8 @@ export interface ApiGatewayConfig {
   maxRetries: number;
   rotationStrategy: ApiRotationStrategy;
   keys: ApiGatewayKey[];
-  pools: ApiGatewayPool[];
+  combos: ApiGatewayCombo[];
+  accounts: ApiGatewayAccount[];
   modelRegistry: ApiGatewayModelRegistry[];
   virtualClaudeEnabled: boolean;
   virtualCodexEnabled: boolean;
@@ -139,7 +146,7 @@ export interface ApiUsageReport {
 }
 
 export interface ApiUsageRow {
-  poolModel: string;
+  comboName: string;
   keyId: string;
   accountId: string;
   toolId: ToolId;
@@ -263,10 +270,21 @@ export interface CreateApiGatewayKeyResult {
   secret: string;
 }
 
-export interface SaveApiGatewayPoolInput {
+export interface SaveApiGatewayComboInput {
   id?: string | null;
-  model: string;
-  members: ApiGatewayPoolMember[];
+  name: string;
+  members: string[];
+  strategy?: ApiRotationStrategy | null;
+}
+
+export interface DeleteApiGatewayComboInput {
+  comboId: string;
+}
+
+export interface SetApiGatewayAccountInput {
+  toolId: ToolId;
+  accountId: string;
+  enabled: boolean;
 }
 
 export interface CreateVirtualApiAccountInput {

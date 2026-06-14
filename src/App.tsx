@@ -1,10 +1,15 @@
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   BarChart3,
+  Boxes,
   Check,
+  ChevronDown,
   CircleHelp,
   Copy,
   KeyRound,
+  Layers,
   Loader2,
   LogIn,
   Pencil,
@@ -16,6 +21,7 @@ import {
   ShieldAlert,
   Terminal,
   Trash2,
+  Users,
   X,
   Zap,
 } from "lucide-react";
@@ -30,15 +36,17 @@ import type {
   Account,
   AddAccountInput,
   AddApiAccountInput,
-  ApiGatewayPool,
-  ApiGatewayPoolMember,
+  ApiGatewayCombo,
+  ApiPoolAccountState,
+  ApiRotationStrategy,
   ApiUsageReport,
   AppSnapshot,
   BinaryCandidate,
   ConfigCandidate,
   CreateApiGatewayKeyInput,
   DetectionReport,
-  SaveApiGatewayPoolInput,
+  SaveApiGatewayComboInput,
+  SetApiGatewayAccountInput,
   SetToolSetupInput,
   StartApiGatewayInput,
   ToolSetup,
@@ -79,7 +87,8 @@ const emptySnapshot: AppSnapshot = {
       maxRetries: 3,
       rotationStrategy: "roundRobin",
       keys: [],
-      pools: [],
+      combos: [],
+      accounts: [],
       modelRegistry: [],
       virtualClaudeEnabled: false,
       virtualCodexEnabled: false,
@@ -385,8 +394,9 @@ export function App() {
               }
             }}
             onDeleteKey={(keyId) => run("api-key-delete", () => api.deleteApiGatewayKey(keyId))}
-            onSavePool={(input) => run("api-pool", () => api.saveApiGatewayPool(input))}
-            onDeletePool={(poolId) => run("api-pool-delete", () => api.deleteApiGatewayPool(poolId))}
+            onSaveCombo={(input) => run("api-combo", () => api.saveApiGatewayCombo(input))}
+            onDeleteCombo={(comboId) => run("api-combo-delete", () => api.deleteApiGatewayCombo(comboId))}
+            onSetAccount={(input) => run("api-account", () => api.setApiGatewayAccount(input))}
             onRefreshModels={() =>
               run("api-models", api.refreshApiGatewayModels, "Model registry updated")
             }
@@ -672,8 +682,9 @@ function ApiGatewayView({
   onStop,
   onCreateKey,
   onDeleteKey,
-  onSavePool,
-  onDeletePool,
+  onSaveCombo,
+  onDeleteCombo,
+  onSetAccount,
   onRefreshModels,
   onCreateVirtual,
   onRefresh,
@@ -685,8 +696,9 @@ function ApiGatewayView({
   onStop: () => Promise<boolean>;
   onCreateKey: (input: CreateApiGatewayKeyInput) => Promise<void>;
   onDeleteKey: (keyId: string) => Promise<boolean>;
-  onSavePool: (input: SaveApiGatewayPoolInput) => Promise<boolean>;
-  onDeletePool: (poolId: string) => Promise<boolean>;
+  onSaveCombo: (input: SaveApiGatewayComboInput) => Promise<boolean>;
+  onDeleteCombo: (comboId: string) => Promise<boolean>;
+  onSetAccount: (input: SetApiGatewayAccountInput) => Promise<boolean>;
   onRefreshModels: () => Promise<boolean>;
   onCreateVirtual: (toolId: ToolId) => Promise<boolean>;
   onRefresh: () => Promise<void>;
@@ -698,22 +710,11 @@ function ApiGatewayView({
   const [allowLan, setAllowLan] = useState(gateway.config.bindHost === "0.0.0.0");
   const [rotationStrategy, setRotationStrategy] = useState(gateway.config.rotationStrategy);
   const [showKeyModal, setShowKeyModal] = useState(false);
-  const [poolModel, setPoolModel] = useState("local-subscription");
-  const [memberModels, setMemberModels] = useState<Record<string, string>>({});
-  const [selectedMembers, setSelectedMembers] = useState<Set<string>>(new Set());
+  const [comboEditing, setComboEditing] = useState<ApiGatewayCombo | null>(null);
+  const [showComboModal, setShowComboModal] = useState(false);
+  const [showModels, setShowModels] = useState(false);
   const [usage, setUsage] = useState<ApiUsageReport | null>(null);
 
-  const accounts = useMemo(
-    () =>
-      snapshot.tools
-        .filter((tool) => tool.id === "claude" || tool.id === "codex")
-        .flatMap((tool) =>
-          tool.accounts
-            .filter((account) => !account.apiProvider && account.state !== "needs-login")
-            .map((account) => ({ tool, account })),
-        ),
-    [snapshot.tools],
-  );
   const running = gateway.status.state === "running";
   const hasVirtualClaude = snapshot.tools
     .find((tool) => tool.id === "claude")
@@ -722,9 +723,53 @@ function ApiGatewayView({
     .find((tool) => tool.id === "codex")
     ?.accounts.some((account) => account.fingerprint === "api-local");
 
+  // Eligible subscription accounts (Claude/Codex, real login, not virtual), with their gateway
+  // participation entry merged in for on/off + status display.
+  const accounts = useMemo(
+    () =>
+      snapshot.tools
+        .filter((tool) => tool.id === "claude" || tool.id === "codex")
+        .flatMap((tool) =>
+          tool.accounts
+            .filter(
+              (account) =>
+                !account.apiProvider &&
+                account.fingerprint !== "api-local" &&
+                account.state !== "needs-login",
+            )
+            .map((account) => {
+              const entry = gateway.config.accounts.find(
+                (item) => item.toolId === tool.id && item.accountId === account.id,
+              );
+              return { tool, account, entry };
+            }),
+        ),
+    [snapshot.tools, gateway.config.accounts],
+  );
+
+  // Every model the gateway can serve right now, grouped by provider (for the picker + the
+  // collapsible "Available models" list). Sourced from the per-account model registry.
+  const modelsByProvider = useMemo(() => {
+    const groups: { tool: ToolId; label: string; models: string[] }[] = [];
+    for (const tool of ["claude", "codex"] as ToolId[]) {
+      const models = new Set<string>();
+      for (const registry of gateway.config.modelRegistry.filter((r) => r.toolId === tool)) {
+        registry.models.forEach((model) => models.add(model));
+      }
+      if (models.size > 0) {
+        groups.push({
+          tool,
+          label: tool === "claude" ? "Claude" : "Codex",
+          models: Array.from(models).sort(),
+        });
+      }
+    }
+    return groups;
+  }, [gateway.config.modelRegistry]);
+
   useEffect(() => {
     api.getApiUsage().then(setUsage).catch(() => setUsage(null));
-  }, [gateway.status.state, gateway.config.pools.length]);
+  }, [gateway.status.state, gateway.config.combos.length]);
 
   useEffect(() => {
     if (!running) return;
@@ -743,19 +788,13 @@ function ApiGatewayView({
       rotationStrategy,
     });
 
-  const savePool = () => {
-    const members: ApiGatewayPoolMember[] = accounts
-      .filter(({ account }) => selectedMembers.has(account.id))
-      .map(({ tool, account }) => ({
-        toolId: tool.id,
-        accountId: account.id,
-        model: memberModels[account.id]?.trim() || defaultModelForTool(tool.id),
-        enabled: true,
-        state: "available",
-        cooldownUntil: null,
-        error: null,
-      }));
-    return onSavePool({ model: poolModel.trim(), members });
+  const openCreateCombo = () => {
+    setComboEditing(null);
+    setShowComboModal(true);
+  };
+  const openEditCombo = (combo: ApiGatewayCombo) => {
+    setComboEditing(combo);
+    setShowComboModal(true);
   };
 
   return (
@@ -844,14 +883,14 @@ function ApiGatewayView({
           <div className="apiInline">
             <button
               onClick={() => onCreateVirtual("claude")}
-              disabled={busy || !running || gateway.config.pools.length === 0}
+              disabled={busy || !running || gateway.config.combos.length === 0}
             >
               <Terminal />
               {hasVirtualClaude ? "Update Claude Code" : "Add to Claude Code"}
             </button>
             <button
               onClick={() => onCreateVirtual("codex")}
-              disabled={busy || !running || gateway.config.pools.length === 0}
+              disabled={busy || !running || gateway.config.combos.length === 0}
             >
               <Terminal />
               {hasVirtualCodex ? "Update Codex" : "Add to Codex"}
@@ -864,7 +903,7 @@ function ApiGatewayView({
             <KeyRound />
             <div>
               <strong>API keys</strong>
-              <small>All valid keys can call every pool.</small>
+              <small>Any valid key can call every combo.</small>
             </div>
             <button onClick={() => setShowKeyModal(true)} disabled={busy}>
               <Plus />
@@ -895,11 +934,23 @@ function ApiGatewayView({
 
         <section className="apiSection wide">
           <div className="settingsSectionHead">
-            <RotateCcw />
+            <Users />
             <div>
-              <strong>Pools</strong>
-              <small>The pool name is the model id your clients request.</small>
+              <strong>Accounts</strong>
+              <small>Toggle which subscription accounts the gateway may rotate through.</small>
             </div>
+            <label className="apiRotation">
+              Rotation
+              <select
+                value={rotationStrategy}
+                onChange={(event) =>
+                  setRotationStrategy(event.target.value as typeof rotationStrategy)
+                }
+              >
+                <option value="roundRobin">Round-robin</option>
+                <option value="fillFirst">Fill-first</option>
+              </select>
+            </label>
             <button
               className="iconButton"
               onClick={onRefreshModels}
@@ -909,81 +960,133 @@ function ApiGatewayView({
               <RefreshCw />
             </button>
           </div>
-          <div className="apiInline">
-            <label className="apiField">
-              Pool model name
-              <input
-                value={poolModel}
-                onChange={(event) => setPoolModel(event.target.value)}
-                placeholder="e.g. local-subscription"
-              />
-            </label>
-            <button onClick={savePool} disabled={busy || selectedMembers.size === 0}>
+          {accounts.length === 0 ? (
+            <p className="hint">No Claude or Codex subscription accounts yet.</p>
+          ) : (
+            <div className="apiList">
+              {accounts.map(({ tool, account, entry }) => {
+                const enabled = entry?.enabled ?? true;
+                const state = entry?.state ?? "available";
+                return (
+                  <div className="apiListItem" key={`${tool.id}-${account.id}`}>
+                    <div>
+                      <strong>{account.name}</strong>
+                      <small>
+                        {tool.name}
+                        {enabled ? (
+                          <>
+                            {" · "}
+                            <span className={`poolMemberState ${state}`}>{poolStateLabel(state)}</span>
+                          </>
+                        ) : (
+                          " · Off"
+                        )}
+                      </small>
+                    </div>
+                    <button
+                      className={`toggle ${enabled ? "on" : ""}`}
+                      role="switch"
+                      aria-checked={enabled}
+                      onClick={() =>
+                        onSetAccount({ toolId: tool.id, accountId: account.id, enabled: !enabled })
+                      }
+                      disabled={busy}
+                      title={enabled ? "Disable for gateway" : "Enable for gateway"}
+                    >
+                      <span className="toggleKnob" />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        <section className="apiSection wide">
+          <div className="settingsSectionHead">
+            <Layers />
+            <div>
+              <strong>Combos</strong>
+              <small>A combo name is the model id clients request; members are tried in order.</small>
+            </div>
+            <button onClick={openCreateCombo} disabled={busy}>
               <Plus />
-              Save pool
+              Add Combo
             </button>
           </div>
-          <div className="memberList">
-            {accounts.map(({ tool, account }) => {
-              const registry = gateway.config.modelRegistry.find(
-                (entry) => entry.toolId === tool.id && entry.accountId === account.id,
-              );
-              const listId = `api-models-${account.id}`;
-              return (
-              <label className="memberRow" key={account.id}>
-                <input
-                  type="checkbox"
-                  checked={selectedMembers.has(account.id)}
-                  onChange={(event) => {
-                    const next = new Set(selectedMembers);
-                    if (event.target.checked) next.add(account.id);
-                    else next.delete(account.id);
-                    setSelectedMembers(next);
-                  }}
-                />
-                <span>
-                  <strong>{account.name}</strong>
-                  <small>{tool.name}</small>
-                </span>
-                <input
-                  list={listId}
-                  value={memberModels[account.id] ?? defaultModelForTool(tool.id)}
-                  onChange={(event) => setMemberModels({ ...memberModels, [account.id]: event.target.value })}
-                />
-                <datalist id={listId}>
-                  {registry?.models.map((model) => <option value={model} key={model} />)}
-                </datalist>
-                {registry?.error && <small className="quotaError">{registry.error}</small>}
-              </label>
-              );
-            })}
-          </div>
-
           <div className="apiList">
-            {gateway.config.pools.map((pool: ApiGatewayPool) => (
-              <div className="apiListItem" key={pool.id}>
-                <div>
-                  <strong>{pool.model}</strong>
-                  <small>{pool.members.length} account(s)</small>
-                  <div className="poolMemberStates">
-                    {pool.members.map((member) => {
-                      const account = snapshot.tools
-                        .find((tool) => tool.id === member.toolId)
-                        ?.accounts.find((item) => item.id === member.accountId);
-                      return (
-                        <span className={`poolMemberState ${member.state}`} key={`${member.toolId}-${member.accountId}`}>
-                          {account?.name ?? member.accountId} · {poolStateLabel(member.state)}
+            {gateway.config.combos.length === 0 ? (
+              <p className="hint">Create a combo, then point your client at its name.</p>
+            ) : (
+              gateway.config.combos.map((combo: ApiGatewayCombo) => (
+                <div className="apiListItem comboItem" key={combo.id}>
+                  <div>
+                    <strong>{combo.name}</strong>
+                    <small>
+                      {(combo.strategy ?? rotationStrategy) === "fillFirst"
+                        ? "Fill-first"
+                        : "Round-robin"}
+                      {" · "}
+                      {combo.members.length} model(s)
+                    </small>
+                    <div className="poolMemberStates">
+                      {combo.members.map((model) => (
+                        <span className="poolMemberState available" key={model}>
+                          {model}
                         </span>
-                      );
-                    })}
+                      ))}
+                    </div>
+                  </div>
+                  <div className="apiItemActions">
+                    <button className="iconButton" onClick={() => onCopy(combo.name)} title="Copy combo name">
+                      <Copy />
+                    </button>
+                    <button className="iconButton" onClick={() => openEditCombo(combo)} disabled={busy} title="Edit combo">
+                      <Pencil />
+                    </button>
+                    <button className="iconButton danger" onClick={() => onDeleteCombo(combo.id)} disabled={busy} title="Delete combo">
+                      <Trash2 />
+                    </button>
                   </div>
                 </div>
-                <button className="iconButton danger" onClick={() => onDeletePool(pool.id)} disabled={busy} title="Delete pool">
-                  <Trash2 />
-                </button>
-              </div>
-            ))}
+              ))
+            )}
           </div>
+        </section>
+
+        <section className="apiSection wide">
+          <button className="apiCollapseHead" onClick={() => setShowModels((value) => !value)}>
+            <div className="settingsSectionHead">
+              <Boxes />
+              <div>
+                <strong>Available models</strong>
+                <small>
+                  {modelsByProvider.reduce((sum, group) => sum + group.models.length, 0)} model(s)
+                  from your enabled accounts
+                </small>
+              </div>
+            </div>
+            <ChevronDown className={showModels ? "rotated" : ""} />
+          </button>
+          {showModels &&
+            (modelsByProvider.length === 0 ? (
+              <p className="hint">No models yet — refresh while accounts are signed in.</p>
+            ) : (
+              modelsByProvider.map((group) => (
+                <div className="apiModelGroup" key={group.tool}>
+                  <small className="apiModelGroupLabel">
+                    {group.label} ({group.models.length})
+                  </small>
+                  <div className="apiModelChips">
+                    {group.models.map((model) => (
+                      <span className="apiModelChip" key={model}>
+                        {model}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))
+            ))}
         </section>
 
         <section className="apiSection wide">
@@ -1001,9 +1104,9 @@ function ApiGatewayView({
           </div>
           <div className="apiList">
             {usage?.rows.map((row) => (
-              <div className="apiListItem" key={`${row.poolModel}-${row.keyId}-${row.accountId}`}>
+              <div className="apiListItem" key={`${row.comboName}-${row.keyId}-${row.accountId}`}>
                 <div>
-                  <strong>{row.poolModel}</strong>
+                  <strong>{row.comboName}</strong>
                   <small>
                     {row.toolId} · {row.requests} request(s) · {formatCount(row.tokens.input + row.tokens.output)} tokens
                   </small>
@@ -1024,7 +1127,188 @@ function ApiGatewayView({
           }}
         />
       )}
+
+      {showComboModal && (
+        <ComboModal
+          busy={busy}
+          combo={comboEditing}
+          defaultStrategy={rotationStrategy}
+          modelsByProvider={modelsByProvider}
+          existingCombos={gateway.config.combos}
+          onClose={() => setShowComboModal(false)}
+          onSave={async (input) => {
+            const ok = await onSaveCombo(input);
+            if (ok) setShowComboModal(false);
+          }}
+        />
+      )}
     </section>
+  );
+}
+
+function ComboModal({
+  busy,
+  combo,
+  defaultStrategy,
+  modelsByProvider,
+  existingCombos,
+  onClose,
+  onSave,
+}: {
+  busy: boolean;
+  combo: ApiGatewayCombo | null;
+  defaultStrategy: ApiRotationStrategy;
+  modelsByProvider: { tool: ToolId; label: string; models: string[] }[];
+  existingCombos: ApiGatewayCombo[];
+  onClose: () => void;
+  onSave: (input: SaveApiGatewayComboInput) => Promise<void>;
+}) {
+  const [name, setName] = useState(combo?.name ?? "");
+  const [members, setMembers] = useState<string[]>(combo?.members ?? []);
+  const [roundRobin, setRoundRobin] = useState(
+    (combo?.strategy ?? defaultStrategy) === "roundRobin",
+  );
+  const [picking, setPicking] = useState(false);
+
+  const move = (index: number, delta: number) => {
+    const next = [...members];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    setMembers(next);
+  };
+  const toggleModel = (model: string) => {
+    setMembers((current) =>
+      current.includes(model) ? current.filter((item) => item !== model) : [...current, model],
+    );
+  };
+  const submit = () =>
+    onSave({
+      id: combo?.id ?? null,
+      name: name.trim(),
+      members,
+      strategy: roundRobin ? "roundRobin" : "fillFirst",
+    });
+
+  return (
+    <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>{combo ? "Edit Combo" : "Create Combo"}</h2>
+        <label>
+          Combo name
+          <input
+            autoFocus
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="e.g. claude-sonnet-4-6"
+          />
+          <small>Only letters, numbers, -, _ and . allowed. Clients request this name.</small>
+        </label>
+
+        <label className="checkRow">
+          <input
+            type="checkbox"
+            checked={roundRobin}
+            onChange={(event) => setRoundRobin(event.target.checked)}
+          />
+          <span>
+            Round-robin
+            <small>Rotate members each request. Off = fallback (try members top to bottom).</small>
+          </span>
+        </label>
+
+        <div className="comboModels">
+          <span className="labelRow">Models</span>
+          {members.length === 0 ? (
+            <p className="comboEmpty">
+              <Layers />
+              No models added yet
+            </p>
+          ) : (
+            members.map((model, index) => (
+              <div className="comboMemberRow" key={model}>
+                <span className="comboMemberIndex">{index + 1}</span>
+                <span className="comboMemberName">{model}</span>
+                <button
+                  className="iconButton"
+                  onClick={() => move(index, -1)}
+                  disabled={index === 0}
+                  title="Move up"
+                >
+                  <ArrowUp />
+                </button>
+                <button
+                  className="iconButton"
+                  onClick={() => move(index, 1)}
+                  disabled={index === members.length - 1}
+                  title="Move down"
+                >
+                  <ArrowDown />
+                </button>
+                <button className="iconButton danger" onClick={() => toggleModel(model)} title="Remove">
+                  <X />
+                </button>
+              </div>
+            ))
+          )}
+          <button className="comboAddModel" onClick={() => setPicking((value) => !value)}>
+            <Plus />
+            Add Model
+          </button>
+          {picking && (
+            <div className="comboPicker">
+              {existingCombos.filter((item) => item.id !== combo?.id).length > 0 && (
+                <div className="apiModelGroup">
+                  <small className="apiModelGroupLabel">Combos</small>
+                  <div className="apiModelChips">
+                    {existingCombos
+                      .filter((item) => item.id !== combo?.id)
+                      .map((item) => (
+                        <button
+                          key={item.id}
+                          className={`apiModelChip pickable ${members.includes(item.name) ? "picked" : ""}`}
+                          onClick={() => toggleModel(item.name)}
+                        >
+                          {item.name}
+                        </button>
+                      ))}
+                  </div>
+                </div>
+              )}
+              {modelsByProvider.map((group) => (
+                <div className="apiModelGroup" key={group.tool}>
+                  <small className="apiModelGroupLabel">
+                    {group.label} ({group.models.length})
+                  </small>
+                  <div className="apiModelChips">
+                    {group.models.map((model) => (
+                      <button
+                        key={model}
+                        className={`apiModelChip pickable ${members.includes(model) ? "picked" : ""}`}
+                        onClick={() => toggleModel(model)}
+                      >
+                        {model}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="modalActions">
+          <button onClick={onClose}>Cancel</button>
+          <button
+            className="primary"
+            onClick={submit}
+            disabled={busy || !name.trim() || members.length === 0}
+          >
+            {combo ? "Save" : "Create"}
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1076,11 +1360,7 @@ function AddKeyModal({
   );
 }
 
-function defaultModelForTool(toolId: ToolId) {
-  return toolId === "claude" ? "claude-sonnet-4-5-20250929" : "gpt-5-codex";
-}
-
-function poolStateLabel(state: ApiGatewayPoolMember["state"]) {
+function poolStateLabel(state: ApiPoolAccountState) {
   if (state === "coolingDown") return "Cooling down";
   if (state === "exhausted") return "Exhausted";
   if (state === "errored") return "Needs attention";

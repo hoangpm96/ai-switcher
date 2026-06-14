@@ -640,6 +640,211 @@ button.danger:hover:not(:disabled) {
   padding: 5px 10px;
 }
 
+/* Account on/off switch in the Accounts list. */
+.toggle {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  flex: none;
+  height: 22px;
+  min-height: 22px;
+  padding: 0;
+  position: relative;
+  transition: background 0.15s ease, border-color 0.15s ease;
+  width: 38px;
+}
+
+.toggle.on {
+  background: var(--accent-grad);
+  border-color: transparent;
+}
+
+.toggleKnob {
+  background: #fff;
+  border-radius: 999px;
+  height: 16px;
+  left: 3px;
+  position: absolute;
+  top: 2px;
+  transition: transform 0.15s ease;
+  width: 16px;
+}
+
+.toggle.on .toggleKnob {
+  transform: translateX(16px);
+}
+
+/* Inline rotation selector in a section header. */
+.apiRotation {
+  align-items: center;
+  color: var(--text-3);
+  display: flex;
+  font-size: 12px;
+  font-weight: 500;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.apiRotation select {
+  min-height: 30px;
+  min-width: 120px;
+}
+
+/* When a rotation control already pushed itself right, the trailing icon button hugs it. */
+.apiRotation + .iconButton {
+  margin-left: 8px;
+}
+
+.apiItemActions {
+  display: flex;
+  gap: 4px;
+}
+
+.comboItem strong {
+  font-size: 13.5px;
+}
+
+/* Collapsible "Available models" header. */
+.apiCollapseHead {
+  align-items: center;
+  background: none;
+  border: none;
+  box-shadow: none;
+  display: flex;
+  justify-content: space-between;
+  min-height: 0;
+  padding: 0;
+  width: 100%;
+}
+
+.apiCollapseHead:hover:not(:disabled) {
+  background: none;
+}
+
+.apiCollapseHead .settingsSectionHead {
+  flex: 1;
+}
+
+.apiCollapseHead svg {
+  color: var(--text-3);
+  transition: transform 0.15s ease;
+}
+
+.apiCollapseHead svg.rotated {
+  transform: rotate(180deg);
+}
+
+.apiModelGroup {
+  display: grid;
+  gap: 6px;
+}
+
+.apiModelGroupLabel {
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.apiModelChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.apiModelChip {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  padding: 4px 10px;
+}
+
+/* In the picker, chips are clickable; selected ones glow accent. */
+.apiModelChip.pickable {
+  cursor: pointer;
+  min-height: 0;
+}
+
+.apiModelChip.pickable:hover {
+  border-color: var(--line-strong);
+}
+
+.apiModelChip.picked {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Combo modal — member list + picker. */
+.comboModels {
+  display: grid;
+  gap: 8px;
+}
+
+.comboEmpty {
+  align-items: center;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-3);
+  display: flex;
+  flex-direction: column;
+  font-size: 12.5px;
+  gap: 8px;
+  justify-content: center;
+  margin: 0;
+  padding: 22px;
+}
+
+.comboEmpty svg {
+  color: var(--text-3);
+  height: 22px;
+  width: 22px;
+}
+
+.comboMemberRow {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: flex;
+  gap: 8px;
+  padding: 6px 8px;
+}
+
+.comboMemberIndex {
+  color: var(--text-3);
+  font-size: 12px;
+  min-width: 16px;
+  text-align: center;
+}
+
+.comboMemberName {
+  flex: 1;
+  font-size: 13px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.comboAddModel {
+  border-style: dashed;
+  color: var(--accent);
+  justify-content: center;
+  width: 100%;
+}
+
+.comboPicker {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 12px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 12px;
+}
+
 .status,
 .badge {
   border-radius: 999px;

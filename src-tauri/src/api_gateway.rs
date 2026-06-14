@@ -1,5 +1,5 @@
 use crate::models::{
-    Account, AccountState, ApiGatewayConfig, ApiGatewayPool, ApiGatewayPoolMember,
+    Account, AccountState, ApiGatewayCombo, ApiGatewayConfig,
     ApiGatewayServerState, ApiGatewayStatus, ApiRotationStrategy, ApiUsageReport, ApiUsageRow,
     ApiGatewayModelRegistry, TokenBreakdown, ToolId,
 };
@@ -70,10 +70,14 @@ struct GatewayRuntime {
     cooldowns: HashMap<String, Instant>,
 }
 
+/// A resolved routing target: a specific account serving a specific upstream model.
 #[derive(Clone)]
 struct SelectedMember {
-    member: ApiGatewayPoolMember,
+    tool_id: ToolId,
+    /// Upstream model name to send (the combo member).
+    model: String,
     account: Account,
+    /// Stable account identity used for cooldown/affinity (`tool:account_id`).
     key: String,
 }
 
@@ -142,7 +146,7 @@ async fn health(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     match state.store.load() {
         Ok(data) => Json(json!({
             "ok": true,
-            "pools": data.api_gateway.pools.len(),
+            "combos": data.api_gateway.combos.len(),
             "keys": data.api_gateway.keys.iter().filter(|key| key.enabled).count()
         }))
         .into_response(),
@@ -160,14 +164,9 @@ async fn models(State(state): State<Arc<GatewayState>>, headers: HeaderMap) -> R
         Err(response) => return response,
     };
     let mut ids = Vec::<String>::new();
-    for pool in &data.api_gateway.pools {
-        if !ids.contains(&pool.model) {
-            ids.push(pool.model.clone());
-        }
-        for member in pool.members.iter().filter(|member| member.enabled) {
-            if !ids.contains(&member.model) {
-                ids.push(member.model.clone());
-            }
+    for combo in &data.api_gateway.combos {
+        if combo.enabled && !ids.contains(&combo.name) {
+            ids.push(combo.name.clone());
         }
     }
     for registry in &data.api_gateway.model_registry {
@@ -249,7 +248,7 @@ async fn handle_ai_request(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let Some(pool) = resolve_pool(&data, &model) else {
+    let Some(combo) = resolve_combo(&data, &model) else {
         return model_not_found(&model);
     };
     let session_id = session_id(&headers, &body);
@@ -257,18 +256,18 @@ async fn handle_ai_request(
     let mut tried = HashSet::new();
 
     for _ in 0..max_attempts {
-        let Some(selected) = select_member(&state, &data, &pool, &session_id, &tried) else {
+        let Some(selected) = select_member(&state, &data, &combo, &session_id, &tried) else {
             return exhausted_response(&model);
         };
         tried.insert(selected.key.clone());
         bind_session(&state, &session_id, &selected.key);
 
         let mut request_body = body.clone();
-        request_body["model"] = Value::String(selected.member.model.clone());
-        let provider = match selected.member.tool_id {
+        request_body["model"] = Value::String(selected.model.clone());
+        let provider = match selected.tool_id {
             ToolId::Claude => ClientProtocol::Anthropic,
             ToolId::Codex => ClientProtocol::OpenAiResponses,
-            ToolId::Antigravity => unreachable!("Antigravity is not selectable for API pools"),
+            ToolId::Antigravity => unreachable!("Antigravity is not selectable for API combos"),
         };
         let request_body = match (protocol, provider) {
             (left, right) if left == right => request_body,
@@ -293,7 +292,7 @@ async fn handle_ai_request(
             }
         };
 
-        let builder = match selected.member.tool_id {
+        let builder = match selected.tool_id {
             ToolId::Claude => build_claude_request(&state, &data, &selected.account, request_body),
             ToolId::Codex => build_codex_request(&state, &data, &selected.account, request_body),
             ToolId::Antigravity => unreachable!("guarded above"),
@@ -353,7 +352,7 @@ async fn handle_ai_request(
             protocol,
             &model,
             &key_id,
-            &selected.member,
+            &selected,
         )
         .await;
     }
@@ -361,37 +360,78 @@ async fn handle_ai_request(
     exhausted_response(&model)
 }
 
-fn resolve_pool(data: &StoredState, model: &str) -> Option<ApiGatewayPool> {
-    if let Some(pool) = data
+/// Resolve the requested model into a combo: an ordered list of member model names plus a strategy.
+/// A name that matches a combo uses that combo; otherwise, if some enabled account supports the
+/// model directly, build a transient single-member combo so direct model ids still work.
+fn resolve_combo(data: &StoredState, model: &str) -> Option<ApiGatewayCombo> {
+    if let Some(combo) = data
         .api_gateway
-        .pools
+        .combos
         .iter()
-        .find(|pool| pool.model == model)
+        .find(|combo| combo.enabled && combo.name == model)
     {
-        return Some(pool.clone());
+        return Some(combo.clone());
     }
 
-    let mut seen = HashSet::new();
-    let members = data
-        .api_gateway
-        .pools
-        .iter()
-        .flat_map(|pool| pool.members.iter())
-        .filter(|member| member.enabled && member.model == model)
-        .filter(|member| seen.insert(account_key(member)))
-        .cloned()
-        .collect::<Vec<_>>();
-    if members.is_empty() {
-        return None;
+    // Direct model: usable only if some enabled account of a provider supports it.
+    if provider_for_model(data, model).is_some() {
+        return Some(ApiGatewayCombo {
+            id: format!("direct:{model}"),
+            name: model.to_string(),
+            members: vec![model.to_string()],
+            strategy: None,
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+        });
     }
-    Some(ApiGatewayPool {
-        id: format!("direct:{model}"),
-        model: model.to_string(),
-        members,
-        rr_index: 0,
-        created_at: String::new(),
-        updated_at: String::new(),
+    None
+}
+
+/// Which provider serves a given model: the provider whose enabled account's model registry lists
+/// it. Falls back to a name heuristic (Claude models start with `claude`, GPT/Codex with `gpt`/`o`)
+/// so freshly-typed models still route before a registry refresh.
+fn provider_for_model(data: &StoredState, model: &str) -> Option<ToolId> {
+    for tool_id in [ToolId::Claude, ToolId::Codex] {
+        let supported = data
+            .api_gateway
+            .model_registry
+            .iter()
+            .filter(|registry| registry.tool_id == tool_id)
+            .any(|registry| registry.models.iter().any(|candidate| candidate == model));
+        if supported && has_enabled_account(data, &tool_id) {
+            return Some(tool_id);
+        }
+    }
+    let lower = model.to_ascii_lowercase();
+    let guess = if lower.starts_with("claude") {
+        ToolId::Claude
+    } else if lower.starts_with("gpt") || lower.starts_with('o') || lower.contains("codex") {
+        ToolId::Codex
+    } else {
+        return None;
+    };
+    has_enabled_account(data, &guess).then_some(guess)
+}
+
+/// True if at least one subscription account of this provider is enabled for the gateway (default
+/// enabled when the participation list has no explicit entry yet).
+fn has_enabled_account(data: &StoredState, tool_id: &ToolId) -> bool {
+    data.accounts.iter().any(|account| {
+        &account.tool_id == tool_id
+            && account.api_provider.is_none()
+            && !matches!(account.state, AccountState::NeedsLogin)
+            && gateway_account_enabled(data, tool_id, &account.id)
     })
+}
+
+/// Whether an account participates in gateway rotation. Missing participation entry = enabled.
+fn gateway_account_enabled(data: &StoredState, tool_id: &ToolId, account_id: &str) -> bool {
+    data.api_gateway
+        .accounts
+        .iter()
+        .find(|entry| &entry.tool_id == tool_id && entry.account_id == account_id)
+        .is_none_or(|entry| entry.enabled)
 }
 
 fn authorized_state(
@@ -501,16 +541,17 @@ fn session_id(headers: &HeaderMap, body: &Value) -> String {
 fn select_member(
     state: &GatewayState,
     data: &StoredState,
-    pool: &ApiGatewayPool,
+    combo: &ApiGatewayCombo,
     session_id: &str,
     tried: &HashSet<String>,
 ) -> Option<SelectedMember> {
-    let candidates = available_candidates(state, data, pool, tried);
+    let candidates = available_candidates(state, data, combo, tried);
     if candidates.is_empty() {
         return None;
     }
 
     let mut runtime = state.runtime.lock().ok()?;
+    // Session affinity: stick to the bound account if it still has a live candidate.
     if let Some(bound_key) = runtime.affinity.get(session_id) {
         if let Some(candidate) = candidates
             .iter()
@@ -519,19 +560,28 @@ fn select_member(
             return Some(candidate.clone());
         }
     }
-    if data.api_gateway.rotation_strategy == ApiRotationStrategy::FillFirst {
+    // Per-combo strategy overrides the gateway default. Fallback = always take the first live
+    // candidate (member order = priority); round-robin = rotate the candidate list per combo.
+    let strategy = combo
+        .strategy
+        .clone()
+        .unwrap_or_else(|| data.api_gateway.rotation_strategy.clone());
+    if strategy == ApiRotationStrategy::FillFirst {
         return candidates.first().cloned();
     }
-    let index = runtime.rr_index.entry(pool.id.clone()).or_insert(0);
+    let index = runtime.rr_index.entry(combo.id.clone()).or_insert(0);
     let selected = candidates[*index % candidates.len()].clone();
     *index = index.saturating_add(1);
     Some(selected)
 }
 
+/// Build the ordered candidate list for a combo: for each member model (in priority order), every
+/// enabled, non-cooling, under-quota account of the provider that serves that model. The first
+/// account for a member is its primary; extra accounts give account-level fallback/rotation.
 fn available_candidates(
     state: &GatewayState,
     data: &StoredState,
-    pool: &ApiGatewayPool,
+    combo: &ApiGatewayCombo,
     tried: &HashSet<String>,
 ) -> Vec<SelectedMember> {
     let now = Instant::now();
@@ -542,27 +592,35 @@ fn available_candidates(
         .map(|runtime| runtime.cooldowns.clone())
         .unwrap_or_default();
     let mut candidates = Vec::new();
-    for member in pool.members.iter().filter(|member| member.enabled) {
-        let key = account_key(member);
-        if tried.contains(&key) || cooldowns.get(&key).is_some_and(|until| *until > now) {
-            continue;
-        }
-        let Some(account) = data.accounts.iter().find(|account| {
-            account.tool_id == member.tool_id
-                && account.id == member.account_id
-                && account.api_provider.is_none()
-                && !matches!(account.state, AccountState::NeedsLogin)
-        }) else {
+    let mut seen = HashSet::new();
+    for model in &combo.members {
+        let Some(tool_id) = provider_for_model(data, model) else {
             continue;
         };
-        if quota_percent(account) >= data.api_gateway.quota_threshold {
-            continue;
+        for account in data.accounts.iter().filter(|account| {
+            account.tool_id == tool_id
+                && account.api_provider.is_none()
+                && !matches!(account.state, AccountState::NeedsLogin)
+                && gateway_account_enabled(data, &tool_id, &account.id)
+        }) {
+            let key = account_key(&tool_id, &account.id);
+            // De-dupe (account, model) pairs and skip tried/cooling/over-quota accounts.
+            if !seen.insert((key.clone(), model.clone())) {
+                continue;
+            }
+            if tried.contains(&key) || cooldowns.get(&key).is_some_and(|until| *until > now) {
+                continue;
+            }
+            if quota_percent(account) >= data.api_gateway.quota_threshold {
+                continue;
+            }
+            candidates.push(SelectedMember {
+                tool_id: tool_id.clone(),
+                model: model.clone(),
+                account: account.clone(),
+                key,
+            });
         }
-        candidates.push(SelectedMember {
-            member: member.clone(),
-            account: account.clone(),
-            key,
-        });
     }
     candidates
 }
@@ -634,29 +692,49 @@ fn persist_member_state(
     cooldown_until: Option<String>,
     error: Option<String>,
 ) {
+    let Some((tool_id, account_id)) = parse_account_key(account_key_value) else {
+        return;
+    };
     let Ok(mut data) = state.store.load() else {
         return;
     };
-    let mut changed = false;
-    for member in data
+    // Upsert the participation entry's runtime state (it may not exist if the account was never
+    // toggled — default-enabled accounts have no row until something happens to them).
+    if let Some(entry) = data
         .api_gateway
-        .pools
+        .accounts
         .iter_mut()
-        .flat_map(|pool| pool.members.iter_mut())
-        .filter(|member| account_key(member) == account_key_value)
+        .find(|entry| entry.tool_id == tool_id && entry.account_id == account_id)
     {
-        member.state = member_state.clone();
-        member.cooldown_until = cooldown_until.clone();
-        member.error = error.clone();
-        changed = true;
+        entry.state = member_state;
+        entry.cooldown_until = cooldown_until;
+        entry.error = error;
+    } else {
+        data.api_gateway.accounts.push(crate::models::ApiGatewayAccount {
+            tool_id,
+            account_id,
+            enabled: true,
+            state: member_state,
+            cooldown_until,
+            error,
+        });
     }
-    if changed {
-        let _ = state.store.save(&data);
-    }
+    let _ = state.store.save(&data);
 }
 
-fn account_key(member: &ApiGatewayPoolMember) -> String {
-    format!("{}:{}", member.tool_id.as_str(), member.account_id)
+fn account_key(tool_id: &ToolId, account_id: &str) -> String {
+    format!("{}:{}", tool_id.as_str(), account_id)
+}
+
+fn parse_account_key(key: &str) -> Option<(ToolId, String)> {
+    let (tool, account_id) = key.split_once(':')?;
+    let tool_id = match tool {
+        "claude" => ToolId::Claude,
+        "codex" => ToolId::Codex,
+        "antigravity" => ToolId::Antigravity,
+        _ => return None,
+    };
+    Some((tool_id, account_id.to_string()))
 }
 
 fn should_retry_upstream(status: reqwest::StatusCode) -> bool {
@@ -1139,7 +1217,7 @@ async fn translate_response(
     client: ClientProtocol,
     model: &str,
     key_id: &str,
-    member: &ApiGatewayPoolMember,
+    member: &SelectedMember,
 ) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1223,17 +1301,18 @@ pub fn usage_report(store: &Store) -> ApiUsageReport {
 
 fn record_api_usage(
     store: &Store,
-    pool_model: &str,
+    combo_name: &str,
     key_id: &str,
-    member: &ApiGatewayPoolMember,
+    member: &SelectedMember,
     tokens: TokenBreakdown,
 ) {
+    let account_id = member.account.id.clone();
     let mut report = read_api_usage(store);
     let now = chrono::Utc::now().to_rfc3339();
     if let Some(row) = report.rows.iter_mut().find(|row| {
-        row.pool_model == pool_model
+        row.combo_name == combo_name
             && row.key_id == key_id
-            && row.account_id == member.account_id
+            && row.account_id == account_id
             && row.tool_id == member.tool_id
     }) {
         row.requests = row.requests.saturating_add(1);
@@ -1241,9 +1320,9 @@ fn record_api_usage(
         row.last_used_at = now;
     } else {
         report.rows.push(ApiUsageRow {
-            pool_model: pool_model.to_string(),
+            combo_name: combo_name.to_string(),
             key_id: key_id.to_string(),
-            account_id: member.account_id.clone(),
+            account_id,
             tool_id: member.tool_id.clone(),
             requests: 1,
             tokens,
@@ -1356,9 +1435,9 @@ fn merge_stream_usage(acc: &mut TokenBreakdown, next: TokenBreakdown) {
 /// disconnects), instead of recording a hardcoded zero up front.
 struct UsageRecorder {
     store: Store,
-    pool_model: String,
+    combo_name: String,
     key_id: String,
-    member: ApiGatewayPoolMember,
+    member: SelectedMember,
     provider: ClientProtocol,
     tokens: TokenBreakdown,
     recorded: bool,
@@ -1367,14 +1446,14 @@ struct UsageRecorder {
 impl UsageRecorder {
     fn new(
         store: &Store,
-        pool_model: &str,
+        combo_name: &str,
         key_id: &str,
-        member: &ApiGatewayPoolMember,
+        member: &SelectedMember,
         provider: ClientProtocol,
     ) -> Self {
         Self {
             store: store.clone(),
-            pool_model: pool_model.to_string(),
+            combo_name: combo_name.to_string(),
             key_id: key_id.to_string(),
             member: member.clone(),
             provider,
@@ -1400,7 +1479,7 @@ impl UsageRecorder {
         self.recorded = true;
         record_api_usage(
             &self.store,
-            &self.pool_model,
+            &self.combo_name,
             &self.key_id,
             &self.member,
             self.tokens,
@@ -2019,7 +2098,7 @@ fn exhausted_response(model: &str) -> Response {
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
         format!(
-            "All accounts in pool '{model}' are exhausted or cooling down. Retry after quota reset."
+            "All accounts in combo '{model}' are exhausted or cooling down. Retry after quota reset."
         ),
     )
 }
@@ -2111,14 +2190,34 @@ mod tests {
         }
     }
 
-    fn member(tool_id: ToolId, account_id: &str, model: &str) -> ApiGatewayPoolMember {
-        ApiGatewayPoolMember {
+    fn member(tool_id: ToolId, account_id: &str, model: &str) -> SelectedMember {
+        SelectedMember {
+            tool_id: tool_id.clone(),
+            model: model.to_string(),
+            account: account(tool_id.clone(), account_id, 0.0),
+            key: account_key(&tool_id, account_id),
+        }
+    }
+
+    fn combo(name: &str, members: &[&str]) -> ApiGatewayCombo {
+        ApiGatewayCombo {
+            id: format!("combo-{name}"),
+            name: name.to_string(),
+            members: members.iter().map(|model| model.to_string()).collect(),
+            strategy: None,
+            enabled: true,
+            created_at: "2026-06-14T00:00:00Z".to_string(),
+            updated_at: "2026-06-14T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Register a provider's supported models so `provider_for_model` can route them in tests.
+    fn registry(tool_id: ToolId, account_id: &str, models: &[&str]) -> ApiGatewayModelRegistry {
+        ApiGatewayModelRegistry {
             tool_id,
             account_id: account_id.to_string(),
-            model: model.to_string(),
-            enabled: true,
-            state: crate::models::ApiPoolAccountState::Available,
-            cooldown_until: None,
+            models: models.iter().map(|model| model.to_string()).collect(),
+            updated_at: "2026-06-14T00:00:00Z".to_string(),
             error: None,
         }
     }
@@ -2419,71 +2518,71 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
             account(ToolId::Claude, "a2", 30.0),
             account(ToolId::Claude, "a3", 99.0),
         ];
-        let pool = ApiGatewayPool {
-            id: "pool".to_string(),
-            model: "local".to_string(),
-            members: vec![
-                member(ToolId::Claude, "a1", "claude-1"),
-                member(ToolId::Claude, "a2", "claude-2"),
-                member(ToolId::Claude, "a3", "claude-3"),
-            ],
-            rr_index: 0,
-            created_at: "2026-06-14T00:00:00Z".to_string(),
-            updated_at: "2026-06-14T00:00:00Z".to_string(),
-        };
-        data.api_gateway.pools.push(pool.clone());
+        // One combo, one member model that all three Claude accounts serve → round-robin rotates
+        // across the accounts. The over-quota account (a3) is skipped.
+        data.api_gateway.model_registry = vec![
+            registry(ToolId::Claude, "a1", &["claude-1"]),
+            registry(ToolId::Claude, "a2", &["claude-1"]),
+            registry(ToolId::Claude, "a3", &["claude-1"]),
+        ];
+        let combo = combo("local", &["claude-1"]);
+        data.api_gateway.combos.push(combo.clone());
         state.store.save(&data).unwrap();
         let tried = HashSet::new();
 
-        let first = select_member(&state, &data, &pool, "s1", &tried).unwrap();
-        let second = select_member(&state, &data, &pool, "s2", &tried).unwrap();
+        let first = select_member(&state, &data, &combo, "s1", &tried).unwrap();
+        let second = select_member(&state, &data, &combo, "s2", &tried).unwrap();
         assert_eq!(first.account.id, "a1");
         assert_eq!(second.account.id, "a2");
 
-        bind_session(&state, "sticky", &account_key(&second.member));
-        let sticky = select_member(&state, &data, &pool, "sticky", &tried).unwrap();
+        let a2_key = account_key(&ToolId::Claude, "a2");
+        bind_session(&state, "sticky", &a2_key);
+        let sticky = select_member(&state, &data, &combo, "sticky", &tried).unwrap();
         assert_eq!(sticky.account.id, "a2");
 
-        mark_cooldown(&state, &account_key(&second.member));
+        mark_cooldown(&state, &a2_key);
         let persisted = state.store.load().unwrap();
-        assert_eq!(
-            persisted.api_gateway.pools[0].members[1].state,
-            crate::models::ApiPoolAccountState::CoolingDown
-        );
-        let after_cooldown = select_member(&state, &data, &pool, "sticky", &tried).unwrap();
+        let a2_entry = persisted
+            .api_gateway
+            .accounts
+            .iter()
+            .find(|entry| entry.tool_id == ToolId::Claude && entry.account_id == "a2")
+            .unwrap();
+        assert_eq!(a2_entry.state, crate::models::ApiPoolAccountState::CoolingDown);
+        let after_cooldown = select_member(&state, &data, &combo, "sticky", &tried).unwrap();
         assert_eq!(after_cooldown.account.id, "a1");
 
         state.runtime.lock().unwrap().cooldowns.clear();
         state.runtime.lock().unwrap().affinity.clear();
         data.api_gateway.rotation_strategy = ApiRotationStrategy::FillFirst;
-        let fill_first = select_member(&state, &data, &pool, "fill", &tried).unwrap();
+        let fill_first = select_member(&state, &data, &combo, "fill", &tried).unwrap();
         assert_eq!(fill_first.account.id, "a1");
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn resolves_pool_alias_before_direct_member_model() {
+    fn resolves_combo_name_before_direct_model() {
         let mut data = StoredState::default();
-        data.api_gateway.pools = vec![ApiGatewayPool {
-            id: "pool-1".to_string(),
-            model: "smart-pool".to_string(),
-            members: vec![
-                member(ToolId::Claude, "a1", "claude-real"),
-                member(ToolId::Codex, "a2", "gpt-real"),
-            ],
-            rr_index: 0,
-            created_at: String::new(),
-            updated_at: String::new(),
-        }];
+        data.accounts = vec![
+            account(ToolId::Claude, "a1", 0.0),
+            account(ToolId::Codex, "a2", 0.0),
+        ];
+        data.api_gateway.model_registry = vec![
+            registry(ToolId::Claude, "a1", &["claude-real"]),
+            registry(ToolId::Codex, "a2", &["gpt-real"]),
+        ];
+        data.api_gateway.combos = vec![combo("smart-combo", &["claude-real", "gpt-real"])];
 
-        let alias = resolve_pool(&data, "smart-pool").unwrap();
-        assert_eq!(alias.id, "pool-1");
-        assert_eq!(alias.members.len(), 2);
+        let by_name = resolve_combo(&data, "smart-combo").unwrap();
+        assert_eq!(by_name.id, "combo-smart-combo");
+        assert_eq!(by_name.members.len(), 2);
 
-        let direct = resolve_pool(&data, "gpt-real").unwrap();
+        let direct = resolve_combo(&data, "gpt-real").unwrap();
         assert_eq!(direct.id, "direct:gpt-real");
-        assert_eq!(direct.members.len(), 1);
-        assert_eq!(direct.members[0].account_id, "a2");
+        assert_eq!(direct.members, vec!["gpt-real".to_string()]);
+
+        // Unknown model with no provider support → no combo.
+        assert!(resolve_combo(&data, "mystery-model").is_none());
     }
 
     #[tokio::test]
@@ -2505,14 +2604,7 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
             expires_at: None,
             created_at: "2026-06-14T00:00:00Z".to_string(),
         });
-        data.api_gateway.pools.push(ApiGatewayPool {
-            id: "pool-1".to_string(),
-            model: "smart-pool".to_string(),
-            members: vec![member(ToolId::Claude, "a1", "claude-real")],
-            rr_index: 0,
-            created_at: String::new(),
-            updated_at: String::new(),
-        });
+        data.api_gateway.combos.push(combo("smart-combo", &["claude-real"]));
         data.api_gateway.model_registry.push(ApiGatewayModelRegistry {
             tool_id: ToolId::Codex,
             account_id: "x1".to_string(),
@@ -2554,7 +2646,7 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
             .iter()
             .filter_map(|item| item["id"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["smart-pool", "claude-real", "gpt-registry"]);
+        assert_eq!(ids, vec!["smart-combo", "gpt-registry", "claude-real"]);
 
         server.stop(&data.api_gateway);
         let mut restarted = start_server(

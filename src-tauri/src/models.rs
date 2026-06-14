@@ -81,13 +81,67 @@ pub struct ApiGatewayKey {
     pub created_at: String,
 }
 
+/// A combo (9router-style): a named, ordered list of model names. The combo `name` is the model id
+/// clients request; each member is just a model string (e.g. `gpt-5-codex`). The provider/account
+/// is resolved at request time from the gateway's enabled accounts — a member never names an
+/// account. Order is the fallback priority; `strategy` overrides the global default per combo.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ApiGatewayPoolMember {
+pub struct ApiGatewayCombo {
+    pub id: String,
+    /// The model id clients request. Unique. Was `model` in the old pool schema.
+    #[serde(alias = "model")]
+    pub name: String,
+    /// Ordered list of member model names. Old schema stored objects; migrated below.
+    #[serde(default, deserialize_with = "deserialize_combo_members")]
+    pub members: Vec<String>,
+    /// Per-combo rotation strategy. `None` = use the gateway's global strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<ApiRotationStrategy>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Accept both the new shape (array of model-name strings) and the legacy pool shape
+/// (array of `{model, ...}` objects), so an existing `state.json` migrates transparently.
+fn deserialize_combo_members<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Member {
+        Name(String),
+        Legacy { model: String },
+    }
+    let raw = Vec::<Member>::deserialize(deserializer)?;
+    let mut out = Vec::with_capacity(raw.len());
+    for member in raw {
+        let model = match member {
+            Member::Name(model) => model,
+            Member::Legacy { model } => model,
+        };
+        if !out.contains(&model) {
+            out.push(model);
+        }
+    }
+    Ok(out)
+}
+
+/// One subscription account's participation in the gateway: whether it may serve API traffic,
+/// plus its live rotation state (cooldown/errored). Replaces the per-pool-member state.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGatewayAccount {
     pub tool_id: ToolId,
     pub account_id: String,
-    pub model: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "api_pool_member_default_state")]
     pub state: ApiPoolAccountState,
@@ -99,18 +153,6 @@ pub struct ApiGatewayPoolMember {
 
 fn api_pool_member_default_state() -> ApiPoolAccountState {
     ApiPoolAccountState::Available
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApiGatewayPool {
-    pub id: String,
-    pub model: String,
-    pub members: Vec<ApiGatewayPoolMember>,
-    #[serde(default)]
-    pub rr_index: usize,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -140,8 +182,12 @@ pub struct ApiGatewayConfig {
     pub rotation_strategy: ApiRotationStrategy,
     #[serde(default)]
     pub keys: Vec<ApiGatewayKey>,
+    /// Combos (named model lists). Reads the legacy `pools` key too for migration.
+    #[serde(default, alias = "pools")]
+    pub combos: Vec<ApiGatewayCombo>,
+    /// Which subscription accounts may serve gateway traffic, plus their rotation state.
     #[serde(default)]
-    pub pools: Vec<ApiGatewayPool>,
+    pub accounts: Vec<ApiGatewayAccount>,
     #[serde(default)]
     pub model_registry: Vec<ApiGatewayModelRegistry>,
     #[serde(default)]
@@ -159,7 +205,8 @@ impl Default for ApiGatewayConfig {
             max_retries: default_api_max_retries(),
             rotation_strategy: default_api_rotation_strategy(),
             keys: Vec::new(),
-            pools: Vec::new(),
+            combos: Vec::new(),
+            accounts: Vec::new(),
             model_registry: Vec::new(),
             virtual_claude_enabled: false,
             virtual_codex_enabled: false,
@@ -211,7 +258,8 @@ pub struct ApiUsageReport {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiUsageRow {
-    pub pool_model: String,
+    #[serde(alias = "poolModel")]
+    pub combo_name: String,
     pub key_id: String,
     pub account_id: String,
     pub tool_id: ToolId,
@@ -548,11 +596,14 @@ pub struct CreateApiGatewayKeyResult {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SaveApiGatewayPoolInput {
+pub struct SaveApiGatewayComboInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    pub model: String,
-    pub members: Vec<ApiGatewayPoolMember>,
+    pub name: String,
+    /// Ordered list of member model names.
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<ApiRotationStrategy>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -563,8 +614,16 @@ pub struct DeleteApiGatewayKeyInput {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeleteApiGatewayPoolInput {
-    pub pool_id: String,
+pub struct DeleteApiGatewayComboInput {
+    pub combo_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetApiGatewayAccountInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

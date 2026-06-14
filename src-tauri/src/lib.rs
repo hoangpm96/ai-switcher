@@ -12,10 +12,10 @@ mod usage;
 use app_state::ManagedState;
 use models::{
     AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
-    CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayKeyInput,
-    DeleteApiGatewayPoolInput, DetectionReport, RenameAccountInput, SaveApiGatewayPoolInput,
-    SetLauncherInput, SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId,
-    UsageReport,
+    CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
+    DeleteApiGatewayKeyInput, DetectionReport, RenameAccountInput, SaveApiGatewayComboInput,
+    SetApiGatewayAccountInput, SetLauncherInput, SetToolSetupInput, StartApiGatewayInput,
+    SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -227,19 +227,27 @@ fn delete_api_gateway_key(
 }
 
 #[tauri::command]
-fn save_api_gateway_pool(
+fn save_api_gateway_combo(
     state: State<'_, ManagedState>,
-    input: SaveApiGatewayPoolInput,
+    input: SaveApiGatewayComboInput,
 ) -> Result<AppSnapshot, String> {
-    state.save_api_gateway_pool(input).map_err(display_error)
+    state.save_api_gateway_combo(input).map_err(display_error)
 }
 
 #[tauri::command]
-fn delete_api_gateway_pool(
+fn delete_api_gateway_combo(
     state: State<'_, ManagedState>,
-    input: DeleteApiGatewayPoolInput,
+    input: DeleteApiGatewayComboInput,
 ) -> Result<AppSnapshot, String> {
-    state.delete_api_gateway_pool(input).map_err(display_error)
+    state.delete_api_gateway_combo(input).map_err(display_error)
+}
+
+#[tauri::command]
+fn set_api_gateway_account(
+    state: State<'_, ManagedState>,
+    input: SetApiGatewayAccountInput,
+) -> Result<AppSnapshot, String> {
+    state.set_api_gateway_account(input).map_err(display_error)
 }
 
 #[tauri::command]
@@ -305,8 +313,9 @@ pub fn run() {
             stop_api_gateway,
             create_api_gateway_key,
             delete_api_gateway_key,
-            save_api_gateway_pool,
-            delete_api_gateway_pool,
+            save_api_gateway_combo,
+            delete_api_gateway_combo,
+            set_api_gateway_account,
             refresh_api_gateway_models,
             create_virtual_api_account
         ])

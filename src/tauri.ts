@@ -9,7 +9,8 @@ import type {
   CreateApiGatewayKeyInput,
   CreateApiGatewayKeyResult,
   CreateVirtualApiAccountInput,
-  SaveApiGatewayPoolInput,
+  SaveApiGatewayComboInput,
+  SetApiGatewayAccountInput,
   SetLauncherInput,
   SetToolSetupInput,
   StartApiGatewayInput,
@@ -61,7 +62,8 @@ const demoSnapshot: AppSnapshot = {
       maxRetries: 3,
       rotationStrategy: "roundRobin",
       keys: [],
-      pools: [],
+      combos: [],
+      accounts: [],
       modelRegistry: [],
       virtualClaudeEnabled: false,
       virtualCodexEnabled: false,
@@ -314,25 +316,43 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
     demoSnapshot.apiGateway.config.keys = demoSnapshot.apiGateway.config.keys.filter((key) => key.id !== keyId);
     return structuredClone(demoSnapshot) as T;
   }
-  if (command === "save_api_gateway_pool") {
-    const input = args?.input as SaveApiGatewayPoolInput;
+  if (command === "save_api_gateway_combo") {
+    const input = args?.input as SaveApiGatewayComboInput;
     const id = input.id || crypto.randomUUID();
-    const existing = demoSnapshot.apiGateway.config.pools.findIndex((pool) => pool.id === id);
-    const pool = {
+    const existing = demoSnapshot.apiGateway.config.combos.findIndex((combo) => combo.id === id);
+    const combo = {
       id,
-      model: input.model,
+      name: input.name,
       members: input.members,
-      rrIndex: 0,
+      strategy: input.strategy ?? null,
+      enabled: existing >= 0 ? demoSnapshot.apiGateway.config.combos[existing].enabled : true,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    if (existing >= 0) demoSnapshot.apiGateway.config.pools[existing] = pool;
-    else demoSnapshot.apiGateway.config.pools.push(pool);
+    if (existing >= 0) demoSnapshot.apiGateway.config.combos[existing] = combo;
+    else demoSnapshot.apiGateway.config.combos.push(combo);
     return structuredClone(demoSnapshot) as T;
   }
-  if (command === "delete_api_gateway_pool") {
-    const poolId = (args?.input as { poolId: string }).poolId;
-    demoSnapshot.apiGateway.config.pools = demoSnapshot.apiGateway.config.pools.filter((pool) => pool.id !== poolId);
+  if (command === "delete_api_gateway_combo") {
+    const comboId = (args?.input as { comboId: string }).comboId;
+    demoSnapshot.apiGateway.config.combos = demoSnapshot.apiGateway.config.combos.filter(
+      (combo) => combo.id !== comboId,
+    );
+    return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "set_api_gateway_account") {
+    const input = args?.input as SetApiGatewayAccountInput;
+    const entry = demoSnapshot.apiGateway.config.accounts.find(
+      (account) => account.toolId === input.toolId && account.accountId === input.accountId,
+    );
+    if (entry) entry.enabled = input.enabled;
+    else
+      demoSnapshot.apiGateway.config.accounts.push({
+        toolId: input.toolId,
+        accountId: input.accountId,
+        enabled: input.enabled,
+        state: "available",
+      });
     return structuredClone(demoSnapshot) as T;
   }
   if (command === "refresh_api_gateway_models") {
@@ -356,7 +376,7 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
         isDefault: false,
         apiProvider: {
           baseUrl: demoSnapshot.apiGateway.status.baseUrl,
-          model: demoSnapshot.apiGateway.config.pools[0]?.model ?? "local-subscription",
+          model: demoSnapshot.apiGateway.config.combos[0]?.name ?? "local-subscription",
           bypass: false,
         },
       });
@@ -406,10 +426,12 @@ export const api = {
     invoke<CreateApiGatewayKeyResult>("create_api_gateway_key", { input }),
   deleteApiGatewayKey: (keyId: string) =>
     invoke<AppSnapshot>("delete_api_gateway_key", { input: { keyId } }),
-  saveApiGatewayPool: (input: SaveApiGatewayPoolInput) =>
-    invoke<AppSnapshot>("save_api_gateway_pool", { input }),
-  deleteApiGatewayPool: (poolId: string) =>
-    invoke<AppSnapshot>("delete_api_gateway_pool", { input: { poolId } }),
+  saveApiGatewayCombo: (input: SaveApiGatewayComboInput) =>
+    invoke<AppSnapshot>("save_api_gateway_combo", { input }),
+  deleteApiGatewayCombo: (comboId: string) =>
+    invoke<AppSnapshot>("delete_api_gateway_combo", { input: { comboId } }),
+  setApiGatewayAccount: (input: SetApiGatewayAccountInput) =>
+    invoke<AppSnapshot>("set_api_gateway_account", { input }),
   refreshApiGatewayModels: () => invoke<AppSnapshot>("refresh_api_gateway_models"),
   createVirtualApiAccount: (toolId: ToolId) =>
     invoke<AppSnapshot>("create_virtual_api_account", { input: { toolId } }),

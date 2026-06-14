@@ -1,11 +1,11 @@
 use crate::models::{
-    Account, AccountState, AddAccountInput, AddApiAccountInput, ApiGatewayConfig, ApiGatewayKey,
-    ApiGatewayPool, ApiGatewayPoolMember, ApiGatewayServerState, ApiGatewaySnapshot, ApiProvider,
+    Account, AccountState, AddAccountInput, AddApiAccountInput, ApiGatewayAccount, ApiGatewayCombo,
+    ApiGatewayConfig, ApiGatewayKey, ApiGatewayServerState, ApiGatewaySnapshot, ApiProvider,
     ApiUsageReport, AppSnapshot, AutoSwitchSetting, CreateApiGatewayKeyInput,
-    CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayKeyInput,
-    DeleteApiGatewayPoolInput, DetectionReport, QuotaInfo, RenameAccountInput,
-    SaveApiGatewayPoolInput, SetLauncherInput, SetToolSetupInput, StartApiGatewayInput,
-    SwitchAccountInput, ToolId, ToolStatus, UsageReport,
+    CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
+    DeleteApiGatewayKeyInput, DetectionReport, QuotaInfo, RenameAccountInput,
+    SaveApiGatewayComboInput, SetApiGatewayAccountInput, SetLauncherInput, SetToolSetupInput,
+    StartApiGatewayInput, SwitchAccountInput, ToolId, ToolStatus, UsageReport,
 };
 use crate::quota::read_quota;
 use crate::store::{normalize_account_states, Store, StoredState};
@@ -246,10 +246,11 @@ impl ManagedState {
             };
             let model = data
                 .api_gateway
-                .pools
-                .first()
-                .map(|pool| pool.model.clone())
-                .context("Create at least one API pool before adding a local API account")?;
+                .combos
+                .iter()
+                .find(|combo| combo.enabled)
+                .map(|combo| combo.name.clone())
+                .context("Create at least one combo before adding a local API account")?;
             let base_url = crate::api_gateway::base_url(&data.api_gateway);
             let default_dir = configured_default_config_dir(&data, &input.tool_id)
                 .context("CLI setup is ambiguous — choose the tool's default config first")?;
@@ -429,21 +430,27 @@ impl ManagedState {
         self.snapshot()
     }
 
-    pub fn save_api_gateway_pool(&self, input: SaveApiGatewayPoolInput) -> Result<AppSnapshot> {
-        let model = input.model.trim();
-        if model.is_empty() {
-            anyhow::bail!("Pool model name is required");
+    pub fn save_api_gateway_combo(&self, input: SaveApiGatewayComboInput) -> Result<AppSnapshot> {
+        let name = input.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("Combo name is required");
         }
-        if input.members.is_empty() {
-            anyhow::bail!("Pool must include at least one account");
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            anyhow::bail!("Combo name allows only letters, numbers, '-', '_' and '.'");
         }
-        let mut member_ids = std::collections::HashSet::new();
-        if input
+        // De-dupe member models, preserving order; drop blanks.
+        let mut seen = std::collections::HashSet::new();
+        let members: Vec<String> = input
             .members
             .iter()
-            .any(|member| !member_ids.insert((member.tool_id.as_str(), member.account_id.as_str())))
-        {
-            anyhow::bail!("An account can only appear once in the same pool");
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty() && seen.insert(model.clone()))
+            .collect();
+        if members.is_empty() {
+            anyhow::bail!("A combo must include at least one model");
         }
         let timestamp = now();
         {
@@ -453,49 +460,86 @@ impl ManagedState {
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             if data
                 .api_gateway
-                .pools
+                .combos
                 .iter()
-                .any(|pool| pool.model == model && Some(pool.id.as_str()) != input.id.as_deref())
+                .any(|combo| combo.name == name && Some(combo.id.as_str()) != input.id.as_deref())
             {
-                anyhow::bail!("Pool model name must be unique");
+                anyhow::bail!("Combo name must be unique");
             }
-            for member in &input.members {
-                validate_pool_member(&data, member)?;
-            }
-            let pool = ApiGatewayPool {
+            let existing = input
+                .id
+                .as_deref()
+                .and_then(|id| data.api_gateway.combos.iter().find(|combo| combo.id == id));
+            let combo = ApiGatewayCombo {
                 id: input
                     .id
                     .clone()
                     .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                model: model.to_string(),
-                members: input.members,
-                rr_index: 0,
-                created_at: timestamp.clone(),
+                name: name.to_string(),
+                members,
+                strategy: input.strategy,
+                enabled: existing.is_none_or(|combo| combo.enabled),
+                created_at: existing.map_or_else(|| timestamp.clone(), |c| c.created_at.clone()),
                 updated_at: timestamp,
             };
             match data
                 .api_gateway
-                .pools
+                .combos
                 .iter()
-                .position(|existing| existing.id == pool.id)
+                .position(|existing| existing.id == combo.id)
             {
-                Some(index) => data.api_gateway.pools[index] = pool,
-                None => data.api_gateway.pools.push(pool),
+                Some(index) => data.api_gateway.combos[index] = combo,
+                None => data.api_gateway.combos.push(combo),
             }
             self.store.save(&data)?;
         }
         self.snapshot()
     }
 
-    pub fn delete_api_gateway_pool(&self, input: DeleteApiGatewayPoolInput) -> Result<AppSnapshot> {
+    pub fn delete_api_gateway_combo(
+        &self,
+        input: DeleteApiGatewayComboInput,
+    ) -> Result<AppSnapshot> {
         {
             let mut data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             data.api_gateway
-                .pools
-                .retain(|pool| pool.id != input.pool_id);
+                .combos
+                .retain(|combo| combo.id != input.combo_id);
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    /// Toggle whether a subscription account participates in gateway rotation. Upserts the
+    /// participation entry (missing = enabled by default).
+    pub fn set_api_gateway_account(
+        &self,
+        input: SetApiGatewayAccountInput,
+    ) -> Result<AppSnapshot> {
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            match data
+                .api_gateway
+                .accounts
+                .iter_mut()
+                .find(|entry| entry.tool_id == input.tool_id && entry.account_id == input.account_id)
+            {
+                Some(entry) => entry.enabled = input.enabled,
+                None => data.api_gateway.accounts.push(ApiGatewayAccount {
+                    tool_id: input.tool_id,
+                    account_id: input.account_id,
+                    enabled: input.enabled,
+                    state: crate::models::ApiPoolAccountState::Available,
+                    cooldown_until: None,
+                    error: None,
+                }),
+            }
             self.store.save(&data)?;
         }
         self.snapshot()
@@ -1696,50 +1740,62 @@ fn build_snapshot(
 }
 
 fn redacted_api_gateway_config(data: &StoredState) -> ApiGatewayConfig {
+    use crate::models::{ApiGatewayAccount, ApiPoolAccountState};
     let mut redacted = data.api_gateway.clone();
     for key in &mut redacted.keys {
         key.secret = None;
     }
-    for member in redacted
-        .pools
-        .iter_mut()
-        .flat_map(|pool| pool.members.iter_mut())
+    // Surface every eligible subscription account with a live participation state. Accounts with
+    // no stored entry default to enabled; the UI renders this list for on/off toggles + status.
+    let mut accounts = Vec::new();
+    for account in data
+        .accounts
+        .iter()
+        .filter(|account| matches!(account.tool_id, ToolId::Claude | ToolId::Codex))
+        .filter(|account| account.api_provider.is_none())
     {
-        if !member.enabled {
-            member.state = crate::models::ApiPoolAccountState::Excluded;
-            continue;
-        }
-        let Some(account) = data
+        let stored = data
+            .api_gateway
             .accounts
             .iter()
-            .find(|account| account.tool_id == member.tool_id && account.id == member.account_id)
-        else {
-            member.state = crate::models::ApiPoolAccountState::Errored;
-            member.error = Some("Account not found".to_string());
-            continue;
-        };
-        if matches!(account.state, AccountState::NeedsLogin) {
-            member.state = crate::models::ApiPoolAccountState::Errored;
-            member.error = Some("Account needs login".to_string());
-            continue;
+            .find(|entry| entry.tool_id == account.tool_id && entry.account_id == account.id);
+        let enabled = stored.is_none_or(|entry| entry.enabled);
+        let mut state = ApiPoolAccountState::Available;
+        let mut cooldown_until = None;
+        let mut error = None;
+        if !enabled {
+            state = ApiPoolAccountState::Excluded;
+        } else if matches!(account.state, AccountState::NeedsLogin) {
+            state = ApiPoolAccountState::Errored;
+            error = Some("Account needs login".to_string());
+        } else if max_percent_used(account) >= data.api_gateway.quota_threshold {
+            state = ApiPoolAccountState::Exhausted;
+        } else {
+            let cooling = stored
+                .and_then(|entry| entry.cooldown_until.as_deref())
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .is_some_and(|until| until > chrono::Utc::now());
+            if cooling {
+                state = ApiPoolAccountState::CoolingDown;
+                cooldown_until = stored.and_then(|entry| entry.cooldown_until.clone());
+            } else if matches!(
+                stored.map(|entry| &entry.state),
+                Some(ApiPoolAccountState::Errored)
+            ) {
+                state = ApiPoolAccountState::Errored;
+                error = stored.and_then(|entry| entry.error.clone());
+            }
         }
-        if max_percent_used(account) >= data.api_gateway.quota_threshold {
-            member.state = crate::models::ApiPoolAccountState::Exhausted;
-            continue;
-        }
-        let cooling = member
-            .cooldown_until
-            .as_deref()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .is_some_and(|until| until > chrono::Utc::now());
-        if cooling {
-            member.state = crate::models::ApiPoolAccountState::CoolingDown;
-        } else if member.state != crate::models::ApiPoolAccountState::Errored {
-            member.state = crate::models::ApiPoolAccountState::Available;
-            member.cooldown_until = None;
-            member.error = None;
-        }
+        accounts.push(ApiGatewayAccount {
+            tool_id: account.tool_id.clone(),
+            account_id: account.id.clone(),
+            enabled,
+            state,
+            cooldown_until,
+            error,
+        });
     }
+    redacted.accounts = accounts;
     redacted
 }
 
@@ -1882,29 +1938,6 @@ fn virtual_api_name(tool_id: &ToolId) -> &'static str {
 
 fn is_virtual_api_account(account: &Account) -> bool {
     account.fingerprint == "api-local"
-}
-
-fn validate_pool_member(data: &StoredState, member: &ApiGatewayPoolMember) -> Result<()> {
-    if !matches!(member.tool_id, ToolId::Claude | ToolId::Codex) {
-        anyhow::bail!("API pools only support Claude Code and Codex accounts");
-    }
-    if member.model.trim().is_empty() {
-        anyhow::bail!("Each pool account needs a model");
-    }
-    let Some(account) = data
-        .accounts
-        .iter()
-        .find(|account| account.tool_id == member.tool_id && account.id == member.account_id)
-    else {
-        anyhow::bail!("Pool account not found");
-    };
-    if account.api_provider.is_some() || is_virtual_api_account(account) {
-        anyhow::bail!("API/proxy accounts can't be used inside API pools");
-    }
-    if matches!(account.state, AccountState::NeedsLogin) {
-        anyhow::bail!("Pool account hasn't finished logging in yet");
-    }
-    Ok(())
 }
 
 fn generate_api_key() -> String {
