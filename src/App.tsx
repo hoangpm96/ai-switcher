@@ -1590,28 +1590,13 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
-// Curated known-model list per provider, unioned with live account discovery so the picker always
-// offers the full usable set (the way 9router does) even when an account's discovery is sparse.
+// The live per-account model registry is authoritative — it lists exactly the models each
+// subscription account can actually serve (e.g. a ChatGPT/Codex account can't use `gpt-5`, only
+// `gpt-5.4`/`gpt-5.5`). We deliberately keep no hardcoded fallback so the picker never offers a
+// model the account would reject; the registry refreshes on Start and when the combo modal opens.
 const FALLBACK_MODELS: Record<ToolId, string[]> = {
-  claude: [
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-opus-4-1-20250805",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-4-5",
-  ],
-  codex: [
-    "gpt-5-codex",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1",
-    "gpt-5.1-codex-max",
-    "gpt-5",
-    "gpt-5-mini",
-    "o3",
-    "o4-mini",
-  ],
+  claude: [],
+  codex: [],
   antigravity: [],
 };
 

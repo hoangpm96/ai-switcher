@@ -257,10 +257,19 @@ async fn handle_ai_request(
     let session_id = session_id(&headers, &body);
     let max_attempts = usize::from(data.api_gateway.max_retries.max(1));
     let mut tried = HashSet::new();
+    // Remember the last real upstream failure so that, if we run out of candidates, we surface
+    // *that* (e.g. a genuine 429 from the provider) instead of the generic "exhausted" message —
+    // which is misleading when the user still has quota but the provider is rate-limiting.
+    let mut last_upstream_error: Option<(StatusCode, String, Bytes)> = None;
 
     for _ in 0..max_attempts {
         let Some(selected) = select_member(&state, &data, &combo, &session_id, &tried) else {
-            return exhausted_response(&model);
+            return match last_upstream_error {
+                Some((status, content_type, body)) => {
+                    (status, [(header::CONTENT_TYPE, content_type)], body).into_response()
+                }
+                None => exhausted_response(&model),
+            };
         };
         tried.insert(selected.key.clone());
         bind_session(&state, &session_id, &selected.key);
@@ -334,22 +343,26 @@ async fn handle_ai_request(
                 &selected.key,
                 "Account token was rejected by upstream",
             );
-            if tried.len() < max_attempts {
-                continue;
-            }
         }
         let retryable_failed = should_retry_upstream(response.status());
         if retryable_failed {
             mark_cooldown(&state, &selected.key);
-            if tried.len() < max_attempts {
-                continue;
-            }
         }
         // Any other non-success (e.g. a 400 from a bad model on this member) → fall through to the
         // next combo member/account instead of returning a broken response, the way 9router does.
-        // Only the last attempt surfaces the upstream error verbatim (handled in translate_response).
         let other_failure = !response.status().is_success() && !credential_failed && !retryable_failed;
-        if other_failure && tried.len() < max_attempts {
+        // Any non-success and we still have attempts left → remember it, then try the next account.
+        if (credential_failed || retryable_failed || other_failure) && tried.len() < max_attempts {
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let body = response.bytes().await.unwrap_or_default();
+            last_upstream_error = Some((status, content_type, body));
             continue;
         }
         if response.status().is_success() {
