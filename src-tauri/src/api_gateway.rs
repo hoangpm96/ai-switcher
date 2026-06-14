@@ -1132,8 +1132,9 @@ fn build_codex_request(
     state: &GatewayState,
     data: &StoredState,
     account: &Account,
-    body: Value,
+    mut body: Value,
 ) -> std::result::Result<reqwest::RequestBuilder, Response> {
+    sanitize_codex_body(&mut body);
     let config_dir = account_config_dir(&state.store, data, account);
     let Some(token) = crate::quota::codex_access_token_fresh(&config_dir) else {
         return Err(api_error(
@@ -1156,6 +1157,36 @@ fn build_codex_request(
         request = request.header("ChatGPT-Account-Id", account_id);
     }
     Ok(request)
+}
+
+/// Enforce the fields the Codex backend `/responses` endpoint requires (and that the real Codex CLI
+/// always sends), so requests translated from another protocol — or sent by clients that omit them
+/// — aren't rejected (e.g. "Store must be set to false"). Also drops Chat/Anthropic-only fields the
+/// Responses API doesn't accept.
+fn sanitize_codex_body(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        // The backend rejects server-side storage outright.
+        object.insert("store".to_string(), Value::Bool(false));
+        // Codex streams by default; keep the caller's choice but default to streaming when absent.
+        object
+            .entry("stream".to_string())
+            .or_insert(Value::Bool(true));
+        // `instructions` is required; provide a default if a caller didn't set one.
+        if !object
+            .get("instructions")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        {
+            object.insert(
+                "instructions".to_string(),
+                Value::String("You are a helpful coding assistant.".to_string()),
+            );
+        }
+        // Chat-style / sampling fields the Responses endpoint doesn't accept.
+        for key in ["messages", "max_tokens", "max_completion_tokens", "top_p", "temperature"] {
+            object.remove(key);
+        }
+    }
 }
 
 pub fn discover_account_models(
@@ -2710,6 +2741,30 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
         }));
         assert_eq!(out3["instructions"], "Rules here.");
         assert_eq!(out3["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sanitize_codex_body_sets_required_responses_fields() {
+        let mut body = json!({
+            "model": "gpt-5-codex",
+            "input": [{"role": "user", "content": "hi"}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "temperature": 0.5
+        });
+        sanitize_codex_body(&mut body);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert!(body["instructions"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(body.get("messages").is_none());
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+
+        // A caller-supplied stream choice is preserved.
+        let mut streamed = json!({"input": [], "stream": false, "instructions": "x"});
+        sanitize_codex_body(&mut streamed);
+        assert_eq!(streamed["stream"], false);
+        assert_eq!(streamed["instructions"], "x");
     }
 
     #[test]
