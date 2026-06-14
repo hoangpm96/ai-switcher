@@ -1017,19 +1017,44 @@ fn anthropic_system_text(system: Option<&Value>) -> String {
 
 fn openai_tools_to_anthropic(tools: Option<&Value>) -> Option<Value> {
     let tools = tools?.as_array()?;
-    Some(Value::Array(
-        tools
-            .iter()
-            .map(|tool| {
-                let function = tool.get("function").unwrap_or(tool);
-                json!({
-                    "name": function.get("name").cloned().unwrap_or(Value::String(String::new())),
-                    "description": function.get("description").cloned().unwrap_or(Value::String(String::new())),
-                    "input_schema": function.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"}))
-                })
-            })
-            .collect(),
-    ))
+    // The OpenAI/Codex tool name can live under `function.name`, top-level `name`, or `custom.name`
+    // (custom/freeform tools). Anthropic requires a non-empty `name` and rejects the whole request
+    // otherwise ("tools.N.custom.name: String should have at least 1 character"), so resolve the
+    // name from any of those spots and skip tools that still have none.
+    let converted = tools
+        .iter()
+        .filter_map(|tool| {
+            let inner = tool
+                .get("function")
+                .or_else(|| tool.get("custom"))
+                .unwrap_or(tool);
+            let name = inner
+                .get("name")
+                .or_else(|| tool.get("name"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())?;
+            let schema = inner
+                .get("parameters")
+                .or_else(|| inner.get("input_schema"))
+                .or_else(|| tool.get("parameters"))
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object"}));
+            Some(json!({
+                "name": name,
+                "description": inner
+                    .get("description")
+                    .or_else(|| tool.get("description"))
+                    .cloned()
+                    .unwrap_or(Value::String(String::new())),
+                "input_schema": schema,
+            }))
+        })
+        .collect::<Vec<_>>();
+    if converted.is_empty() {
+        return None;
+    }
+    Some(Value::Array(converted))
 }
 
 fn anthropic_tools_to_openai(tools: Option<&Value>) -> Option<Value> {
@@ -1142,6 +1167,20 @@ fn sanitize_anthropic_body(body: &mut Value) {
     ];
     if let Some(object) = body.as_object_mut() {
         object.retain(|key, _| ALLOWED.contains(&key.as_str()));
+        // Anthropic rejects the whole request if any tool has an empty/missing name (seen when a
+        // Codex tool is translated over). Keep only well-formed Anthropic tools.
+        if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.retain(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.trim().is_empty())
+                    && tool.get("input_schema").is_some()
+            });
+            if tools.is_empty() {
+                object.remove("tools");
+                object.remove("tool_choice");
+            }
+        }
     }
 }
 
@@ -2927,6 +2966,43 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
         sanitize_codex_body(&mut streamed);
         assert_eq!(streamed["stream"], false);
         assert_eq!(streamed["instructions"], "x");
+    }
+
+    #[test]
+    fn openai_tools_to_anthropic_skips_nameless_and_reads_custom() {
+        // Codex sends function tools, custom tools (name under `custom`), and sometimes a nameless
+        // freeform tool. Anthropic rejects empty names, so those must be dropped.
+        let translated = openai_tools_to_anthropic(Some(&json!([
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}},
+            {"type": "custom", "custom": {"name": "shell", "description": "run"}},
+            {"type": "custom", "name": ""},
+            {"type": "function", "name": "fetch", "parameters": {"type": "object"}}
+        ])))
+        .unwrap();
+        let names: Vec<&str> = translated
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["lookup", "shell", "fetch"]);
+    }
+
+    #[test]
+    fn sanitize_anthropic_body_drops_nameless_tools() {
+        let mut body = json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"name": "ok", "input_schema": {"type": "object"}},
+                {"name": "", "input_schema": {"type": "object"}},
+                {"custom": {"name": "x"}}
+            ],
+            "tool_choice": {"type": "auto"}
+        });
+        sanitize_anthropic_body(&mut body);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["tools"][0]["name"], "ok");
     }
 
     #[test]
