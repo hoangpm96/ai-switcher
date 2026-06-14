@@ -802,6 +802,28 @@ fn openai_chat_to_responses(mut body: Value) -> Value {
             input.push(message);
         }
     }
+    // Chat tools are `{type:"function", function:{name, parameters}}`; the Responses API wants the
+    // name/parameters flattened to the top level (`{type:"function", name, parameters}`).
+    let tools = body.get("tools").and_then(Value::as_array).map(|tools| {
+        tools
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function").unwrap_or(tool);
+                let name = function
+                    .get("name")
+                    .or_else(|| tool.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())?;
+                Some(json!({
+                    "type": "function",
+                    "name": name,
+                    "description": function.get("description").cloned().unwrap_or(Value::String(String::new())),
+                    "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object"})),
+                }))
+            })
+            .collect::<Vec<_>>()
+    });
     if let Some(object) = body.as_object_mut() {
         object.remove("messages");
         object.insert("input".to_string(), Value::Array(input));
@@ -813,6 +835,14 @@ fn openai_chat_to_responses(mut body: Value) -> Value {
                 instructions.join("\n\n")
             }),
         );
+        match tools {
+            Some(tools) if !tools.is_empty() => {
+                object.insert("tools".to_string(), Value::Array(tools));
+            }
+            _ => {
+                object.remove("tools");
+            }
+        }
     }
     body
 }
@@ -3057,6 +3087,20 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
         assert_eq!(anth["content"][0]["text"], "Hi there");
         assert_eq!(anth["type"], "message");
         assert_eq!(anth["usage"]["input_tokens"], 23);
+    }
+
+    #[test]
+    fn openai_chat_to_responses_flattens_tools() {
+        // Chat tools are nested under `function`; the Responses API needs name/parameters flat.
+        let out = openai_chat_to_responses(json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+        }));
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["name"], "get_weather");
+        assert!(out["tools"][0].get("function").is_none());
+        assert_eq!(out["tools"][0]["parameters"]["type"], "object");
     }
 
     #[test]

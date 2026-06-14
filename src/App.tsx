@@ -1562,10 +1562,17 @@ function nextToastId() {
   return toastSeq;
 }
 
-/// Copy text to the clipboard, tolerating webviews that deny the async Clipboard API. Tries the
-/// modern API, falls back to a hidden-textarea execCommand, and never throws — returns whether it
-/// worked so callers can decide what to tell the user.
+/// Copy text to the clipboard. Prefers Tauri's clipboard plugin (writes via the OS, so it works
+/// even though the webview denies the JS Clipboard API), then falls back to navigator/execCommand
+/// for the browser demo. Never throws — returns whether it worked.
 async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+    await writeText(text);
+    return true;
+  } catch {
+    // Not in Tauri (browser demo) or plugin unavailable — try the web APIs.
+  }
   try {
     if (navigator.clipboard?.writeText) {
       await navigator.clipboard.writeText(text);
