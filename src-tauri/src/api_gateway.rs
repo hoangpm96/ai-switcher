@@ -567,8 +567,23 @@ fn available_candidates(
     candidates
 }
 
+/// Upper bound on remembered session→account bindings. Hashed (`body:…`) session ids create a new
+/// entry per distinct request body, so without a cap the affinity map would grow forever on a
+/// long-running gateway. Affinity is best-effort: when we hit the cap we drop the whole map and
+/// the next request simply re-picks an account.
+const MAX_AFFINITY_ENTRIES: usize = 10_000;
+
 fn bind_session(state: &GatewayState, session_id: &str, account_key: &str) {
     if let Ok(mut runtime) = state.runtime.lock() {
+        // Drop expired cooldowns while we hold the lock — they are checked by timestamp so stale
+        // entries are harmless, but they would otherwise accumulate indefinitely.
+        let now = Instant::now();
+        runtime.cooldowns.retain(|_, until| *until > now);
+        if runtime.affinity.len() >= MAX_AFFINITY_ENTRIES
+            && !runtime.affinity.contains_key(session_id)
+        {
+            runtime.affinity.clear();
+        }
         runtime
             .affinity
             .insert(session_id.to_string(), account_key.to_string());
@@ -1134,23 +1149,30 @@ async fn translate_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if content_type.contains("text/event-stream") && provider == client {
-        record_api_usage(store, model, key_id, member, TokenBreakdown::default());
-        return stream_response(response);
-    }
     if content_type.contains("text/event-stream") {
-        record_api_usage(store, model, key_id, member, TokenBreakdown::default());
-        let model = model.to_string();
-        let mut translator = SseTranslator::new(provider, client, model);
-        let stream = response
-            .bytes_stream()
-            .map_ok(move |chunk| Bytes::from(translator.push(&chunk)));
+        let recorder = UsageRecorder::new(store, model, key_id, member, provider);
+        // Same protocol → pass bytes through untouched; otherwise translate each event. Either
+        // way we sniff the upstream events for usage so the API report reflects real tokens
+        // (recorded when the stream ends via the recorder's Drop).
+        let translate = provider != client;
+        let mut sniffer = StreamUsageSniffer::new(provider, client, model.to_string(), recorder);
+        let stream = response.bytes_stream().map_ok(move |chunk| {
+            if translate {
+                Bytes::from(sniffer.push_translate(&chunk))
+            } else {
+                sniffer.push_passthrough(&chunk);
+                chunk
+            }
+        });
+        let header_content_type = if translate {
+            HeaderValue::from_static("text/event-stream")
+        } else {
+            HeaderValue::from_str(&content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream"))
+        };
         return (
             status,
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream"),
-            )],
+            [(header::CONTENT_TYPE, header_content_type)],
             Body::from_stream(
                 stream.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
             ),
@@ -1255,7 +1277,13 @@ fn read_api_usage(store: &Store) -> ApiUsageReport {
 }
 
 fn tokens_from_usage(provider: ClientProtocol, value: &Value) -> TokenBreakdown {
-    let usage = value.get("usage");
+    tokens_from_usage_obj(provider, value.get("usage"))
+}
+
+/// Extract a token breakdown from an already-located `usage` object (the shape differs
+/// between non-streaming bodies, where it sits under `usage`, and streaming events, where
+/// it is nested inside `message_start`/`message_delta`/`response.completed`).
+fn tokens_from_usage_obj(provider: ClientProtocol, usage: Option<&Value>) -> TokenBreakdown {
     match provider {
         ClientProtocol::Anthropic => TokenBreakdown {
             input: usage
@@ -1301,22 +1329,89 @@ fn tokens_from_usage(provider: ClientProtocol, value: &Value) -> TokenBreakdown 
     }
 }
 
-fn stream_response(response: reqwest::Response) -> Response {
-    let status =
-        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut headers = HeaderMap::new();
-    if let Some(content_type) = response.headers().get(header::CONTENT_TYPE) {
-        headers.insert(header::CONTENT_TYPE, content_type.clone());
-    } else {
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
+/// Locate the `usage` object inside a single streaming event, regardless of provider shape:
+/// Anthropic `message_start` nests it under `/message/usage`; Anthropic `message_delta` and the
+/// OpenAI Responses `response.completed` event nest it under `/response/usage` or top-level
+/// `usage`. Returns `None` when the event carries no usage.
+fn stream_event_usage(event: &Value) -> Option<&Value> {
+    event
+        .pointer("/message/usage")
+        .or_else(|| event.pointer("/response/usage"))
+        .or_else(|| event.get("usage"))
+        .filter(|usage| usage.is_object())
+}
+
+/// Merge usage seen across multiple streaming events. Anthropic splits the numbers across
+/// `message_start` (input + cache) and `message_delta` (final output), so we keep the max of
+/// each field rather than summing — summing would double-count fields that repeat.
+fn merge_stream_usage(acc: &mut TokenBreakdown, next: TokenBreakdown) {
+    acc.input = acc.input.max(next.input);
+    acc.output = acc.output.max(next.output);
+    acc.cache_read = acc.cache_read.max(next.cache_read);
+    acc.cache_creation = acc.cache_creation.max(next.cache_creation);
+}
+
+/// Records gateway usage exactly once for a single request. Holds the recording context so the
+/// streaming code path can persist the tokens it sniffed when the stream finishes (or the client
+/// disconnects), instead of recording a hardcoded zero up front.
+struct UsageRecorder {
+    store: Store,
+    pool_model: String,
+    key_id: String,
+    member: ApiGatewayPoolMember,
+    provider: ClientProtocol,
+    tokens: TokenBreakdown,
+    recorded: bool,
+}
+
+impl UsageRecorder {
+    fn new(
+        store: &Store,
+        pool_model: &str,
+        key_id: &str,
+        member: &ApiGatewayPoolMember,
+        provider: ClientProtocol,
+    ) -> Self {
+        Self {
+            store: store.clone(),
+            pool_model: pool_model.to_string(),
+            key_id: key_id.to_string(),
+            member: member.clone(),
+            provider,
+            tokens: TokenBreakdown::default(),
+            recorded: false,
+        }
+    }
+
+    /// Sniff a parsed upstream streaming event for usage and fold it into the accumulator.
+    fn observe_event(&mut self, event: &Value) {
+        if let Some(usage) = stream_event_usage(event) {
+            merge_stream_usage(
+                &mut self.tokens,
+                tokens_from_usage_obj(self.provider, Some(usage)),
+            );
+        }
+    }
+
+    fn record_now(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        record_api_usage(
+            &self.store,
+            &self.pool_model,
+            &self.key_id,
+            &self.member,
+            self.tokens,
         );
     }
-    let stream = response
-        .bytes_stream()
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
-    (status, headers, Body::from_stream(stream)).into_response()
+}
+
+impl Drop for UsageRecorder {
+    fn drop(&mut self) {
+        self.record_now();
+    }
 }
 
 fn translate_json_response(
@@ -1563,41 +1658,86 @@ fn openai_usage_to_anthropic(usage: Option<&Value>) -> Value {
     })
 }
 
-struct SseTranslator {
+/// Buffers an upstream SSE byte stream into complete lines, sniffs each `data:` event for usage
+/// (folding it into the `UsageRecorder`), and — when client and provider protocols differ —
+/// rewrites each event into the client's protocol. Usage is recorded when this struct is dropped,
+/// which covers both normal completion and a client disconnecting mid-stream.
+struct StreamUsageSniffer {
     pending: Vec<u8>,
     provider: ClientProtocol,
     client: ClientProtocol,
     model: String,
+    recorder: UsageRecorder,
 }
 
-impl SseTranslator {
-    fn new(provider: ClientProtocol, client: ClientProtocol, model: String) -> Self {
+impl StreamUsageSniffer {
+    fn new(
+        provider: ClientProtocol,
+        client: ClientProtocol,
+        model: String,
+        recorder: UsageRecorder,
+    ) -> Self {
         Self {
             pending: Vec::new(),
             provider,
             client,
             model,
+            recorder,
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) -> String {
+    /// Iterate over the complete lines currently buffered, invoking `on_line` for each. Leaves any
+    /// trailing partial line in the buffer for the next chunk.
+    fn for_each_line(&mut self, chunk: &[u8], mut on_line: impl FnMut(&str)) {
         self.pending.extend_from_slice(chunk);
-        let mut out = String::new();
         while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
             let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
             line.pop();
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            out.push_str(&translate_sse_line(
-                &String::from_utf8_lossy(&line),
-                self.provider,
-                self.client,
-                &self.model,
-            ));
+            on_line(&String::from_utf8_lossy(&line));
+        }
+    }
+
+    /// Passthrough mode (same protocol): only sniff usage, bytes are forwarded unchanged.
+    fn push_passthrough(&mut self, chunk: &[u8]) {
+        let mut events = Vec::new();
+        self.for_each_line(chunk, |line| {
+            if let Some(value) = parse_sse_data_line(line) {
+                events.push(value);
+            }
+        });
+        for event in &events {
+            self.recorder.observe_event(event);
+        }
+    }
+
+    /// Translate mode (cross-protocol): sniff usage and rewrite each event for the client.
+    fn push_translate(&mut self, chunk: &[u8]) -> String {
+        let provider = self.provider;
+        let client = self.client;
+        let model = self.model.clone();
+        let mut out = String::new();
+        let mut events = Vec::new();
+        self.for_each_line(chunk, |line| {
+            out.push_str(&translate_sse_line(line, provider, client, &model, &mut events));
+        });
+        for event in &events {
+            self.recorder.observe_event(event);
         }
         out
     }
+}
+
+/// Parse a single SSE line into its `data:` JSON payload, if any. Returns `None` for `event:`
+/// lines, comments, blank lines, `[DONE]`, and malformed JSON.
+fn parse_sse_data_line(line: &str) -> Option<Value> {
+    let data = line.strip_prefix("data:")?.trim();
+    if data == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<Value>(data).ok()
 }
 
 fn translate_sse_line(
@@ -1605,6 +1745,7 @@ fn translate_sse_line(
     provider: ClientProtocol,
     client: ClientProtocol,
     model: &str,
+    seen_events: &mut Vec<Value>,
 ) -> String {
     let mut out = String::new();
     {
@@ -1623,6 +1764,11 @@ fn translate_sse_line(
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return out;
         };
+        // Keep only events that actually carry usage, so the usage sniffer can fold them in
+        // without us cloning every text-delta event.
+        if stream_event_usage(&value).is_some() {
+            seen_events.push(value.clone());
+        }
         let translated = translate_stream_event(value, provider, client, model);
         if !translated.is_null() {
             out.push_str("data: ");
@@ -2098,26 +2244,92 @@ mod tests {
         );
     }
 
+    fn test_sniffer(
+        provider: ClientProtocol,
+        client: ClientProtocol,
+    ) -> (StreamUsageSniffer, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("aisw-api-sniffer-{}", uuid::Uuid::new_v4()));
+        let store = Store::for_test(root.clone()).unwrap();
+        let recorder = UsageRecorder::new(
+            &store,
+            "pool-model",
+            "key-1",
+            &member(ToolId::Claude, "a1", "claude-real"),
+            provider,
+        );
+        (
+            StreamUsageSniffer::new(provider, client, "pool-model".to_string(), recorder),
+            root,
+        )
+    }
+
     #[test]
     fn sse_translator_buffers_split_json_lines() {
-        let mut translator = SseTranslator::new(
-            ClientProtocol::Anthropic,
-            ClientProtocol::OpenAiChat,
-            "pool-model".to_string(),
-        );
-        let first = translator.push(
+        let (mut sniffer, root) =
+            test_sniffer(ClientProtocol::Anthropic, ClientProtocol::OpenAiChat);
+        let first = sniffer.push_translate(
             br#"event: content_block_delta
 data: {"type":"content_block_delta","delta":{"type":"text_delta","te"#,
         );
         assert!(first.is_empty());
 
-        let second = translator.push(
+        let second = sniffer.push_translate(
             br#"xt":"hello"}}
 
 "#,
         );
         assert!(second.contains(r#""content":"hello""#));
         assert!(second.contains(r#""object":"chat.completion.chunk""#));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn streaming_records_usage_from_anthropic_events() {
+        // Anthropic splits usage: input + cache in message_start, output in message_delta.
+        let (mut sniffer, root) =
+            test_sniffer(ClientProtocol::Anthropic, ClientProtocol::OpenAiChat);
+        sniffer.push_translate(
+            br#"data: {"type":"message_start","message":{"usage":{"input_tokens":120,"cache_read_input_tokens":40,"output_tokens":1}}}
+
+data: {"type":"message_delta","usage":{"output_tokens":77}}
+
+data: {"type":"message_stop"}
+
+"#,
+        );
+        let store = sniffer.recorder.store.clone();
+        drop(sniffer); // records on drop
+        let report = read_api_usage(&store);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].tokens.input, 120);
+        assert_eq!(report.rows[0].tokens.cache_read, 40);
+        assert_eq!(report.rows[0].tokens.output, 77);
+        assert_eq!(report.rows[0].requests, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn streaming_passthrough_records_responses_usage() {
+        // Native Codex (OpenAI Responses) passthrough: usage rides in response.completed.
+        let (mut sniffer, root) = test_sniffer(
+            ClientProtocol::OpenAiResponses,
+            ClientProtocol::OpenAiResponses,
+        );
+        sniffer.push_passthrough(
+            br#"data: {"type":"response.output_text.delta","delta":"hi"}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"output_tokens":17,"cached_input_tokens":4}}}
+
+"#,
+        );
+        let store = sniffer.recorder.store.clone();
+        drop(sniffer);
+        let report = read_api_usage(&store);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].tokens.input, 13);
+        assert_eq!(report.rows[0].tokens.output, 17);
+        assert_eq!(report.rows[0].tokens.cache_read, 4);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
