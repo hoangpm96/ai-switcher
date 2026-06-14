@@ -251,6 +251,9 @@ async fn handle_ai_request(
     let Some(combo) = resolve_combo(&data, &model) else {
         return model_not_found(&model);
     };
+    // Did the client ask to stream? We force Codex to stream upstream regardless, so we need this
+    // to decide whether to forward an SSE stream or aggregate it into one JSON response.
+    let client_wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let session_id = session_id(&headers, &body);
     let max_attempts = usize::from(data.api_gateway.max_retries.max(1));
     let mut tried = HashSet::new();
@@ -360,6 +363,7 @@ async fn handle_ai_request(
             &model,
             &key_id,
             &selected,
+            client_wants_stream,
         )
         .await;
     }
@@ -1365,6 +1369,7 @@ async fn translate_response(
     model: &str,
     key_id: &str,
     member: &SelectedMember,
+    client_wants_stream: bool,
 ) -> Response {
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1386,36 +1391,9 @@ async fn translate_response(
         };
         return (status, [(header::CONTENT_TYPE, content_type)], body).into_response();
     }
-    if content_type.contains("text/event-stream") {
-        let recorder = UsageRecorder::new(store, model, key_id, member, provider);
-        // Same protocol → pass bytes through untouched; otherwise translate each event. Either
-        // way we sniff the upstream events for usage so the API report reflects real tokens
-        // (recorded when the stream ends via the recorder's Drop).
-        let translate = provider != client;
-        let mut sniffer = StreamUsageSniffer::new(provider, client, model.to_string(), recorder);
-        let stream = response.bytes_stream().map_ok(move |chunk| {
-            if translate {
-                Bytes::from(sniffer.push_translate(&chunk))
-            } else {
-                sniffer.push_passthrough(&chunk);
-                chunk
-            }
-        });
-        let header_content_type = if translate {
-            HeaderValue::from_static("text/event-stream")
-        } else {
-            HeaderValue::from_str(&content_type)
-                .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream"))
-        };
-        return (
-            status,
-            [(header::CONTENT_TYPE, header_content_type)],
-            Body::from_stream(
-                stream.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err)),
-            ),
-        )
-            .into_response();
-    }
+
+    // We force Codex upstream to stream, and some providers send SSE without a clear content-type,
+    // so buffer the body and detect SSE by its shape too (not only the header).
     let body = match response.bytes().await {
         Ok(body) => body,
         Err(err) => {
@@ -1426,6 +1404,43 @@ async fn translate_response(
             )
         }
     };
+    let head = String::from_utf8_lossy(&body[..body.len().min(64)]);
+    let head = head.trim_start();
+    let looks_like_sse = content_type.contains("text/event-stream")
+        || head.starts_with("event:")
+        || head.starts_with("data:");
+
+    if looks_like_sse {
+        if client_wants_stream {
+            // Translate the SSE stream into the client's protocol on the fly.
+            let recorder = UsageRecorder::new(store, model, key_id, member, provider);
+            let translate = provider != client;
+            let mut sniffer =
+                StreamUsageSniffer::new(provider, client, model.to_string(), recorder);
+            let out = if translate {
+                sniffer.push_translate(&body)
+            } else {
+                sniffer.push_passthrough(&body);
+                String::from_utf8_lossy(&body).into_owned()
+            };
+            return (
+                status,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                )],
+                out,
+            )
+                .into_response();
+        }
+        // Client wants a single JSON answer: collapse the SSE into the final response object,
+        // record usage, then translate to the client's JSON shape.
+        let value = aggregate_sse_to_json(&body, provider);
+        record_api_usage(store, model, key_id, member, tokens_from_usage(provider, &value));
+        let translated = translate_json_response(value, provider, client, model);
+        return (status, Json(translated)).into_response();
+    }
+
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
@@ -1442,6 +1457,107 @@ async fn translate_response(
     );
     let translated = translate_json_response(value, provider, client, model);
     (status, Json(translated)).into_response()
+}
+
+/// Collapse a buffered SSE body into the single final response JSON for the given provider.
+/// Anthropic: assemble from message_start + content_block deltas; OpenAI Responses: take the last
+/// `response.completed`/`response` object (or assemble output_text from deltas as a fallback).
+fn aggregate_sse_to_json(body: &[u8], provider: ClientProtocol) -> Value {
+    let text = String::from_utf8_lossy(body);
+    let events: Vec<Value> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim)
+        .filter(|data| !data.is_empty() && *data != "[DONE]")
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect();
+
+    match provider {
+        ClientProtocol::OpenAiResponses => {
+            // Prefer the terminal response object; fall back to assembling output_text deltas.
+            if let Some(resp) = events.iter().rev().find_map(|event| {
+                if event.get("type").and_then(Value::as_str) == Some("response.completed") {
+                    event.get("response").cloned()
+                } else {
+                    None
+                }
+            }) {
+                // The completed event's `output` is sometimes empty; rebuild it from item events.
+                if resp
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .is_none_or(|output| output.is_empty())
+                {
+                    let mut resp = resp;
+                    resp["output"] = json!(collect_responses_output(&events));
+                    return resp;
+                }
+                return resp;
+            }
+            json!({
+                "object": "response",
+                "output": collect_responses_output(&events),
+                "usage": events.iter().rev().find_map(|e| e.pointer("/response/usage").cloned()),
+            })
+        }
+        ClientProtocol::Anthropic => {
+            // Assemble a Messages response from the streamed blocks.
+            let mut text_out = String::new();
+            for event in &events {
+                if event.get("type").and_then(Value::as_str) == Some("content_block_delta") {
+                    if let Some(delta) = event.pointer("/delta/text").and_then(Value::as_str) {
+                        text_out.push_str(delta);
+                    }
+                }
+            }
+            let usage = events
+                .iter()
+                .rev()
+                .find_map(|e| e.pointer("/usage").cloned())
+                .or_else(|| events.iter().find_map(|e| e.pointer("/message/usage").cloned()));
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": text_out}],
+                "stop_reason": "end_turn",
+                "usage": usage.unwrap_or(Value::Null),
+            })
+        }
+        ClientProtocol::OpenAiChat => events.into_iter().last().unwrap_or(Value::Null),
+    }
+}
+
+/// Rebuild the OpenAI Responses `output` array (text + function calls) from streamed item events.
+fn collect_responses_output(events: &[Value]) -> Vec<Value> {
+    let mut text = String::new();
+    let mut calls = Vec::new();
+    for event in events {
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    text.push_str(delta);
+                }
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item") {
+                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                        calls.push(item.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut output = Vec::new();
+    if !text.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        }));
+    }
+    output.extend(calls);
+    output
 }
 
 pub fn usage_report(store: &Store) -> ApiUsageReport {
@@ -2717,6 +2833,24 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":13,"outpu
         let fill_first = select_member(&state, &data, &combo, "fill", &tried).unwrap();
         assert_eq!(fill_first.account.id, "a1");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn aggregate_codex_sse_collapses_to_response_with_text() {
+        // Real Codex Responses SSE (trimmed): output_text deltas + a completed event whose
+        // response.output is empty — we must rebuild the text from the deltas.
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\" there\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"output\":[],\"usage\":{\"input_tokens\":23,\"output_tokens\":9}}}\n",
+            "data: [DONE]\n",
+        );
+        let value = aggregate_sse_to_json(sse.as_bytes(), ClientProtocol::OpenAiResponses);
+        // Translate to Anthropic the way a Claude client would receive it.
+        let anth = translate_json_response(value, ClientProtocol::OpenAiResponses, ClientProtocol::Anthropic, "gpt-5.5");
+        assert_eq!(anth["content"][0]["text"], "Hi there");
+        assert_eq!(anth["type"], "message");
+        assert_eq!(anth["usage"]["input_tokens"], 23);
     }
 
     #[test]
