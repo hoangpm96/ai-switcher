@@ -63,6 +63,7 @@ export interface AppSnapshot {
   autoSwitch: boolean;
   autoSwitchThreshold: number;
   autoSwitchSettings: Record<string, AutoSwitchSetting>;
+  autoPrime: Record<string, AutoPrimeSetting>;
   toolSetups: Record<string, ToolSetup>;
   apiGateway: ApiGatewaySnapshot;
 }
@@ -160,6 +161,17 @@ export interface AutoSwitchSetting {
   threshold: number;
 }
 
+export interface AutoPrimeSetting {
+  enabled: boolean;
+  /** Daily prime time, "HH:MM" 24h, machine local time. */
+  time: string;
+  lastPrimedDate?: string | null;
+  lastPrimedTime?: string | null;
+  /** "success" | "failed" | "skip" | "hold" */
+  lastResult?: string | null;
+  lastAttemptAt?: string | null;
+}
+
 export type DetectionSource = "env" | "default" | "path" | "appManaged" | "manual" | "fallback";
 
 export interface ToolSetup {
@@ -251,6 +263,20 @@ export interface SetLauncherInput {
   toolId: ToolId;
   accountId: string;
   name: string;
+}
+
+export interface SetAutoPrimeInput {
+  toolId: ToolId;
+  accountId: string;
+  enabled: boolean;
+  /** "HH:MM" 24h local time. */
+  time: string;
+}
+
+export interface SetAutoPrimeAllInput {
+  /** "HH:MM" 24h applied to every prime-eligible (subscription) account. */
+  time: string;
+  enabled: boolean;
 }
 
 export interface StartApiGatewayInput {

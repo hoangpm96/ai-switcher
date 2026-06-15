@@ -49,6 +49,15 @@ pub fn read_quota(tool_id: &ToolId, config_dir: &Path) -> QuotaInfo {
 static CLAUDE_CACHE: Mutex<BTreeMap<String, (Instant, QuotaInfo)>> = Mutex::new(BTreeMap::new());
 const CLAUDE_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Drop the cached Claude quota for one config dir so the next `read_quota` re-fetches.
+/// Auto-prime's confirmation re-check needs the fresh `resets_at` right after sending "hi",
+/// which the 60s cache would otherwise mask.
+pub(crate) fn invalidate_claude_cache(config_dir: &Path) {
+    if let Ok(mut guard) = CLAUDE_CACHE.lock() {
+        guard.remove(&config_dir.to_string_lossy().to_string());
+    }
+}
+
 fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
     let cache_key = config_dir.to_string_lossy().to_string();
     if let Ok(guard) = CLAUDE_CACHE.lock() {
@@ -501,6 +510,25 @@ fn read_codex_rollout_quota() -> Result<QuotaInfo> {
 /// `<config_dir>/auth.json` (`tokens.access_token`). Returns rate_limit.primary_window
 /// (5h, limit_window_seconds 18000) + secondary_window (weekly, 604800), each with
 /// `used_percent` + `reset_at` (unix seconds).
+/// Read the LIVE 5-hour window for one account, bypassing any cache or local rollout file.
+/// Auto-prime's confirmation step needs the truth straight from the provider right after
+/// sending "hi" — the Claude cache (60s) or the Codex rollout file (only updated by the CLI)
+/// would otherwise return a stale `reset_at`.
+pub(crate) fn read_live_five_hour(tool_id: &ToolId, config_dir: &Path) -> Option<QuotaWindow> {
+    match tool_id {
+        ToolId::Claude => {
+            invalidate_claude_cache(config_dir);
+            let quota = read_claude_quota(config_dir).ok()?;
+            Some(quota.five_hour)
+        }
+        ToolId::Codex => {
+            let quota = read_codex_usage_endpoint(config_dir).ok()?;
+            Some(quota.five_hour)
+        }
+        ToolId::Antigravity => None,
+    }
+}
+
 fn read_codex_usage_endpoint(config_dir: &Path) -> Result<QuotaInfo> {
     let token = codex_access_token(config_dir).context("couldn't get Codex's access_token")?;
     let body = curl_get(

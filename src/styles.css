@@ -2107,3 +2107,127 @@ button.danger:hover:not(:disabled) {
   font-weight: 400;
   margin-top: 2px;
 }
+
+/* ── Auto Session tab ─────────────────────────────────────────────── */
+.autoSession .panelHead h2 {
+  align-items: center;
+  display: flex;
+  font-size: 20px;
+  font-weight: 700;
+  gap: 8px;
+  letter-spacing: -0.01em;
+}
+
+.autoSession .panelHead p {
+  margin-top: 6px;
+  max-width: 60ch;
+}
+
+.autoAllRow {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+}
+
+.autoAllRow span {
+  color: var(--text-2);
+  font-size: 14px;
+}
+
+.autoGrid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+
+.autoCard {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+}
+
+.autoCard.on {
+  border-color: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent-soft);
+}
+
+.autoCardHead {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.autoCardHead strong {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.autoTool {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.autoCardBody {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.autoCardBody input[type="time"] {
+  flex: 1;
+}
+
+.autoCardFoot {
+  align-items: center;
+  display: flex;
+  font-size: 12px;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.autoBadge {
+  border-radius: 999px;
+  font-size: 11px;
+  padding: 2px 9px;
+}
+
+.autoBadge.on {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.autoBadge.off {
+  background: var(--surface-hover);
+  color: var(--text-3);
+}
+
+.autoLogBar {
+  display: flex;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+.autoLog {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  margin-top: 10px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 12px 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

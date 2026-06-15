@@ -1,5 +1,5 @@
 use crate::models::{
-    Account, AccountState, ApiGatewayConfig, AutoSwitchSetting, ToolId, ToolSetup,
+    Account, AccountState, ApiGatewayConfig, AutoPrimeSetting, AutoSwitchSetting, ToolId, ToolSetup,
 };
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -22,6 +22,10 @@ pub struct StoredState {
     /// Per-tool auto-switch settings. Claude/Codex are independent; Antigravity is not supported.
     #[serde(default)]
     pub auto_switch_settings: BTreeMap<String, AutoSwitchSetting>,
+    /// Per-account "auto session prime" schedules, keyed by account id. Only subscription
+    /// (OAuth) Claude/Codex accounts are eligible — API-proxy accounts have no 5h window.
+    #[serde(default)]
+    pub auto_prime: BTreeMap<String, AutoPrimeSetting>,
     /// Resolved CLI binary/config dirs per tool. Missing = detect on startup / ask user.
     #[serde(default)]
     pub tool_setups: BTreeMap<String, ToolSetup>,
@@ -42,6 +46,7 @@ impl Default for StoredState {
             auto_switch: false,
             auto_switch_threshold: default_threshold(),
             auto_switch_settings: BTreeMap::new(),
+            auto_prime: BTreeMap::new(),
             tool_setups: BTreeMap::new(),
             api_gateway: ApiGatewayConfig::default(),
         }
@@ -81,6 +86,11 @@ impl Store {
     /// because CLI JSONL scans may also see some proxy-originated requests.
     pub fn api_usage_path(&self) -> PathBuf {
         self.root.join("api_usage.json")
+    }
+
+    /// Human-readable activity log for auto session priming (one line per event).
+    pub fn auto_prime_log_path(&self) -> PathBuf {
+        self.root.join("auto-prime.log")
     }
 
     /// The tool's accounts root (`accounts/<tool>/`), holding one dir per profile account.

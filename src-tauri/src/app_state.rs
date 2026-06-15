@@ -28,6 +28,9 @@ pub struct ManagedState {
     pub store: Store,
     pub data: Mutex<StoredState>,
     pub api_server: Mutex<crate::api_gateway::ApiServerHandle>,
+    /// True while a prime batch is running, so the per-minute scheduler tick doesn't start a
+    /// second overlapping batch (a single attempt can block for minutes on send retries).
+    pub priming: std::sync::atomic::AtomicBool,
 }
 
 impl ManagedState {
@@ -43,6 +46,7 @@ impl ManagedState {
             store,
             data: Mutex::new(data),
             api_server: Mutex::new(server),
+            priming: std::sync::atomic::AtomicBool::new(false),
         };
         // Clean up orphan active files: pointing to a deleted profile → clear + reinstall the hook.
         managed.heal_active_profiles();
@@ -956,6 +960,254 @@ impl ManagedState {
         self.snapshot()
     }
 
+    // ---------------------------------------------------------------------------
+    // Auto session prime
+    // ---------------------------------------------------------------------------
+
+    /// Set (or clear) the daily prime schedule for one account. Setting overwrites the previous
+    /// time — there is exactly one prime time per account, and it persists until changed.
+    pub fn set_auto_prime(
+        &self,
+        tool_id: ToolId,
+        account_id: String,
+        enabled: bool,
+        time: String,
+    ) -> Result<AppSnapshot> {
+        let time = normalize_hhmm(&time)
+            .ok_or_else(|| anyhow::anyhow!("Giờ không hợp lệ (cần dạng HH:MM 24h)"))?;
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            if !prime_eligible_in_state(&data, &tool_id, &account_id) {
+                anyhow::bail!("Tài khoản này không hỗ trợ auto prime (chỉ Claude/Codex đăng nhập subscription)");
+            }
+            let entry = data.auto_prime.entry(account_id).or_default();
+            let time_changed = entry.time != time;
+            entry.enabled = enabled;
+            entry.time = time;
+            // Changing the time starts a fresh schedule: clear the "already primed today" guard
+            // so the new time can run today even if the old time already primed.
+            if time_changed {
+                entry.last_primed_date = None;
+                entry.last_primed_time = None;
+            }
+            let _ = tool_id;
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    /// Apply one time + enabled flag to EVERY prime-eligible account ("Apply all").
+    pub fn set_auto_prime_all(&self, time: String, enabled: bool) -> Result<AppSnapshot> {
+        let time = normalize_hhmm(&time)
+            .ok_or_else(|| anyhow::anyhow!("Giờ không hợp lệ (cần dạng HH:MM 24h)"))?;
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let eligible: Vec<String> = data
+                .accounts
+                .iter()
+                .filter(|a| crate::prime::is_prime_eligible(&a.tool_id, a.api_provider.is_some()))
+                .map(|a| a.id.clone())
+                .collect();
+            for account_id in eligible {
+                let entry = data.auto_prime.entry(account_id).or_default();
+                let time_changed = entry.time != time;
+                entry.enabled = enabled;
+                entry.time = time.clone();
+                if time_changed {
+                    entry.last_primed_date = None;
+                    entry.last_primed_time = None;
+                }
+            }
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    /// Read the human-readable auto-prime activity log (newest content at the bottom).
+    pub fn auto_prime_log(&self) -> String {
+        std::fs::read_to_string(self.store.auto_prime_log_path()).unwrap_or_default()
+    }
+
+    /// Append one event line to the auto-prime log. Wording is the brainstorm's exact strings.
+    fn append_prime_log(&self, line: &str) {
+        use std::io::Write;
+        let stamped = format!("[{}] {}\n", local_log_timestamp(), line);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.store.auto_prime_log_path())
+        {
+            let _ = file.write_all(stamped.as_bytes());
+        }
+    }
+
+    /// The scheduler tick: prime every account whose time has arrived and that hasn't yet primed
+    /// for that time today. Runs sequentially with a gap between accounts. Called by the background
+    /// thread (every minute) and once at startup (to catch a missed time → "primed muộn"). `late`
+    /// marks the startup catch-up so the log says so.
+    pub fn run_due_primes(&self, app: Option<&AppHandle>, late: bool) {
+        use std::sync::atomic::Ordering;
+        // Skip if a previous batch is still running (send retries can take minutes). The flag is
+        // cleared at the end of this call; `_guard` ensures that even on an early return.
+        if self
+            .priming
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        struct ClearOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = ClearOnDrop(&self.priming);
+
+        let today = local_today();
+        let now_hhmm = local_now_hhmm();
+
+        // Collect due accounts under a brief lock: enabled, eligible, time reached, not primed
+        // for this exact time today.
+        let due: Vec<(ToolId, String, String, std::path::PathBuf, Option<std::path::PathBuf>)> = {
+            let data = match self.data.lock() {
+                Ok(data) => data,
+                Err(_) => return,
+            };
+            data.accounts
+                .iter()
+                .filter_map(|account| {
+                    let setting = data.auto_prime.get(&account.id)?;
+                    if !setting.enabled {
+                        return None;
+                    }
+                    if !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some()) {
+                        return None;
+                    }
+                    if now_hhmm.as_str() < setting.time.as_str() {
+                        return None; // time not reached yet today
+                    }
+                    let already = setting.last_primed_date.as_deref() == Some(today.as_str())
+                        && setting.last_primed_time.as_deref() == Some(setting.time.as_str());
+                    if already {
+                        return None; // once per day for this time
+                    }
+                    let default_dir = resolved_default_config_dir(&data, &account.tool_id);
+                    let config_dir =
+                        account_config_dir_with_default(&self.store, account, &default_dir);
+                    let claude_binary = configured_binary_path(&data, &account.tool_id);
+                    Some((
+                        account.tool_id.clone(),
+                        account.id.clone(),
+                        account.name.clone(),
+                        config_dir,
+                        claude_binary,
+                    ))
+                })
+                .collect()
+        };
+
+        for (index, (tool_id, account_id, account_name, config_dir, claude_binary)) in
+            due.iter().enumerate()
+        {
+            if index > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(10)); // gap between accounts
+            }
+            let outcome = crate::prime::prime_account(
+                tool_id,
+                config_dir,
+                claude_binary.as_deref(),
+                std::thread::sleep,
+            );
+            self.record_prime_outcome(tool_id, account_id, account_name, &outcome, late, app);
+        }
+    }
+
+    /// Persist the per-account result + append the matching log line, and refresh the account's
+    /// displayed quota on success so the new reset shows immediately.
+    fn record_prime_outcome(
+        &self,
+        tool_id: &ToolId,
+        account_id: &str,
+        account_name: &str,
+        outcome: &crate::prime::PrimeOutcome,
+        late: bool,
+        app: Option<&AppHandle>,
+    ) {
+        use crate::prime::PrimeOutcome;
+        let tool_label = tool_id.display_name();
+        let (result, line): (&str, String) = match outcome {
+            PrimeOutcome::Success { new_reset_at } => {
+                let reset = local_hhmm_from_iso(new_reset_at);
+                if late {
+                    (
+                        "success",
+                        format!(
+                            "{tool_label} · account \"{account_name}\" — SUCCESS: primed muộn lúc {now} do máy không thức đúng giờ, reset mới = {reset}",
+                            now = local_now_hhmm()
+                        ),
+                    )
+                } else {
+                    (
+                        "success",
+                        format!("{tool_label} · account \"{account_name}\" — SUCCESS: primed, reset mới = {reset}"),
+                    )
+                }
+            }
+            PrimeOutcome::Hold { reset_at } => (
+                "hold",
+                format!(
+                    "{tool_label} · account \"{account_name}\" — HOÃN: phiên cũ còn tới {reset}, sẽ thử lại khi phiên cũ hết",
+                    reset = local_hhmm_from_iso(reset_at)
+                ),
+            ),
+            PrimeOutcome::SkipNoToken => (
+                "skip",
+                format!("{tool_label} · account \"{account_name}\" — SKIP: token hết hạn, cần đăng nhập lại"),
+            ),
+            PrimeOutcome::FailSend { reason } => (
+                "failed",
+                format!("{tool_label} · account \"{account_name}\" — FAIL: gửi lỗi sau 5 lần thử ({reason})"),
+            ),
+            PrimeOutcome::FailUnconfirmed => (
+                "failed",
+                format!("{tool_label} · account \"{account_name}\" — FAIL: gửi OK nhưng không xác nhận được phiên mới sau 5 lần kiểm tra"),
+            ),
+        };
+        self.append_prime_log(&line);
+
+        // Update the per-account schedule record. Mark "primed today for this time" only when we
+        // actually opened (or attempted to open) a new window — HOLD/SKIP don't consume the day.
+        if let Ok(mut data) = self.data.lock() {
+            if let Some(setting) = data.auto_prime.get_mut(account_id) {
+                setting.last_result = Some(result.to_string());
+                setting.last_attempt_at = Some(now());
+                if matches!(
+                    outcome,
+                    PrimeOutcome::Success { .. } | PrimeOutcome::FailUnconfirmed
+                ) {
+                    setting.last_primed_date = Some(local_today());
+                    setting.last_primed_time = Some(setting.time.clone());
+                }
+            }
+            let _ = self.store.save(&data);
+        }
+
+        // On success, refresh the account's displayed quota right away (don't wait for the poller).
+        if matches!(outcome, PrimeOutcome::Success { .. }) {
+            let _ = self.refresh_single_account(tool_id, account_id, app);
+            if let Some(app) = app {
+                let _ = app.emit("auto-prime-changed", ());
+            }
+        }
+    }
+
     /// If the tool's currently-used account (plain command) has hit the threshold → automatically
     /// switch to the healthiest account (same tool, not yet at the threshold). Claude/Codex only.
     /// Applied via the same switch mechanism (hook + active file), WITHOUT touching custom launchers.
@@ -1785,6 +2037,7 @@ fn build_snapshot(
         auto_switch: data.auto_switch,
         auto_switch_threshold: data.auto_switch_threshold,
         auto_switch_settings: data.auto_switch_settings.clone(),
+        auto_prime: data.auto_prime.clone(),
         tool_setups: data.tool_setups.clone(),
         api_gateway: ApiGatewaySnapshot {
             config: redacted_api_gateway_config(data),
@@ -2080,4 +2333,50 @@ fn notify_exhausted(app: &AppHandle, account: &Account) {
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// True if the account exists and is prime-eligible (subscription Claude/Codex).
+fn prime_eligible_in_state(data: &StoredState, tool_id: &ToolId, account_id: &str) -> bool {
+    data.accounts.iter().any(|a| {
+        a.id == account_id
+            && a.tool_id == *tool_id
+            && crate::prime::is_prime_eligible(&a.tool_id, a.api_provider.is_some())
+    })
+}
+
+/// Validate + normalize a `HH:MM` 24h string. Returns `Some("HH:MM")` (zero-padded) or None.
+fn normalize_hhmm(input: &str) -> Option<String> {
+    let (h, m) = input.trim().split_once(':')?;
+    let hour: u32 = h.parse().ok()?;
+    let minute: u32 = m.parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(format!("{hour:02}:{minute:02}"))
+}
+
+/// Local date `YYYY-MM-DD` (machine timezone) — the "once per day" key.
+fn local_today() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// Local time `HH:MM` (machine timezone) — compared against the scheduled prime time.
+fn local_now_hhmm() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
+}
+
+/// Local timestamp for log lines: `YYYY-MM-DD HH:MM:SS` (machine timezone).
+fn local_log_timestamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Render an ISO 8601 instant as local `HH:MM` for log lines. Falls back to the raw string.
+fn local_hhmm_from_iso(iso: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| iso.to_string())
 }

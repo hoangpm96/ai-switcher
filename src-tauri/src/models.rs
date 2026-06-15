@@ -406,6 +406,9 @@ pub struct AppSnapshot {
     pub auto_switch_threshold: f64,
     #[serde(default)]
     pub auto_switch_settings: std::collections::BTreeMap<String, AutoSwitchSetting>,
+    /// Per-account auto session prime schedules, keyed by account id.
+    #[serde(default)]
+    pub auto_prime: std::collections::BTreeMap<String, AutoPrimeSetting>,
     #[serde(default)]
     pub tool_setups: std::collections::BTreeMap<String, ToolSetup>,
     #[serde(default)]
@@ -426,6 +429,63 @@ impl Default for AutoSwitchSetting {
             threshold: 100.0,
         }
     }
+}
+
+/// Per-account "auto session prime" config. Keyed by account id in `StoredState.auto_prime`.
+/// At the scheduled `time` (machine local), the app sends a minimal "hi" to start a fresh
+/// 5-hour window, so the reset clock is anchored to the user's work rhythm. Each account
+/// primes at most once per day for a given `time` (the `last_primed_*` fields enforce this).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoPrimeSetting {
+    /// Whether scheduled priming is on for this account.
+    pub enabled: bool,
+    /// The single daily prime time, `HH:MM` 24h, in the machine's local timezone.
+    pub time: String,
+    /// Local date (`YYYY-MM-DD`) the account was last primed — guards "once per day".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_primed_date: Option<String>,
+    /// The `HH:MM` that was primed on `last_primed_date`. A new time differing from this
+    /// is allowed to prime again the same day (changing the schedule is not a re-run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_primed_time: Option<String>,
+    /// Short status of the most recent prime attempt: "success" | "failed" | "skip" | "hold".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<String>,
+    /// ISO timestamp of the most recent prime attempt (any outcome).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<String>,
+}
+
+impl Default for AutoPrimeSetting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            time: "05:30".to_string(),
+            last_primed_date: None,
+            last_primed_time: None,
+            last_result: None,
+            last_attempt_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoPrimeInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    pub enabled: bool,
+    /// `HH:MM` 24h local time.
+    pub time: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoPrimeAllInput {
+    /// `HH:MM` 24h applied to every prime-eligible (subscription) account.
+    pub time: String,
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -1,4 +1,5 @@
 import {
+  AlarmClock,
   AlertTriangle,
   ArrowDown,
   ArrowUp,
@@ -31,6 +32,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./tauri";
 import { UsageView } from "./UsageView";
+import { AutoSessionView } from "./AutoSessionView";
 import logoUrl from "./assets/logo.svg";
 import type {
   Account,
@@ -78,6 +80,7 @@ const emptySnapshot: AppSnapshot = {
   autoSwitch: false,
   autoSwitchThreshold: 100,
   autoSwitchSettings: {},
+  autoPrime: {},
   toolSetups: {},
   apiGateway: {
     config: {
@@ -100,7 +103,7 @@ const emptySnapshot: AppSnapshot = {
 export function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [selectedTool, setSelectedTool] = useState<ToolId>("claude");
-  const [view, setView] = useState<"accounts" | "api" | "usage" | "settings">("accounts");
+  const [view, setView] = useState<"accounts" | "api" | "usage" | "auto" | "settings">("accounts");
   // One unified notification channel for the whole app: success + error both render as a
   // top-right toast (see the Toasts renderer). `notify` is the single entry point.
   const [toasts, setToasts] = useState<{ id: number; kind: "success" | "error"; text: string }[]>(
@@ -358,6 +361,16 @@ export function App() {
               <small>Token &amp; cost</small>
             </button>
             <button
+              className={`toolTab ${view === "auto" ? "selected" : ""}`}
+              onClick={() => setView("auto")}
+            >
+              <span className="usageTabLabel">
+                <AlarmClock />
+                Auto Session
+              </span>
+              <small>Neo mốc reset 5h</small>
+            </button>
+            <button
               className={`toolTab ${view === "settings" ? "selected" : ""}`}
               onClick={() => setView("settings")}
             >
@@ -386,6 +399,10 @@ export function App() {
         </aside>
 
         {view === "usage" && <UsageView />}
+
+        {view === "auto" && (
+          <AutoSessionView snapshot={snapshot} setSnapshot={setSnapshot} notify={notify} />
+        )}
 
         {view === "api" && (
           <ApiGatewayView
