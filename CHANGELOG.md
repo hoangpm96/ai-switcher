@@ -5,6 +5,38 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-16
+
+### Added
+
+- **Auto Session — anchor your 5-hour reset to your work rhythm.** A new tab that
+  sends a minimal "hi" to a Claude/Codex subscription account at a time you choose,
+  so a fresh 5-hour window opens before you start coding instead of mid-session.
+  Each account has one daily prime time and primes at most once per day.
+- **Mac self-wake (pmset).** Optionally install a one-time privileged helper so the
+  Mac wakes itself ~5 minutes before a prime, runs it, and goes back to sleep — no
+  need to keep the machine on. Asks for admin once at install; falls back to
+  "prime when the machine is awake / app is open" when not installed.
+- **On-demand extend.** When a 5-hour window is about to end (≤30 minutes), the app
+  notifies and shows an "extend?" button on the account so you can open the next
+  window the moment the current one ends and keep coding without waiting. It asks
+  first by default; an optional per-account "auto-extend" toggle does it silently.
+- **Prime priming via the account's own CLI.** Priming runs `claude -p` / `codex exec`
+  with the account's config dir so the CLI refreshes its own token and uses the
+  provider's exact endpoint — robust against token expiry (the 401 that bare token
+  calls hit). A direct HTTP call remains a fallback.
+- **Activity log + stats.** Every prime (success, hold, skip, fail, late) is logged
+  with the exact reason; a per-day stats table summarizes outcomes, and the log file
+  can be opened or revealed from the tab.
+- **Live status on the account.** Subscription Claude/Codex accounts show their
+  auto-prime state, anchor time, and an estimated next reset; the displayed quota
+  refreshes immediately after a successful prime.
+
+### Fixed
+
+- Quota reads now refresh an expired access token before calling the usage endpoint
+  for both Claude and Codex, fixing intermittent 401s.
+
 ## [0.3.0] - 2026-06-15
 
 ### Added
@@ -95,6 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - API / proxy gateway accounts for Claude Code and Codex.
 - Universal macOS `.dmg` release via GitHub Actions.
 
+[0.4.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.4.0
 [0.3.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.3.0
 [0.2.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.2.0
 [0.1.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.1.0

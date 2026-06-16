@@ -20,6 +20,7 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 - **Per-tool auto-switch.** Configure separately for Claude and Codex — the bare command falls back to another account when the active one nears its quota.
 - **Usage & cost tab.** Token usage and estimated cost per tool, plus an aggregated **All** view across tools, charted over a selectable date range.
 - **Local API gateway.** Expose Claude/Codex subscription accounts through a local OpenAI/Anthropic-compatible server with API keys, model combos, fallback rotation, cooldown handling, and gateway usage tracking.
+- **Auto Session.** Anchor each Claude/Codex account's 5-hour reset to your work rhythm — the app primes a fresh window at a time you pick (optionally waking the Mac itself), and can open the next window the moment the current one ends so you keep coding without waiting.
 
 ### Claude Code & Codex (CLI)
 
@@ -34,6 +35,13 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 - Create local gateway API keys, enable the subscription accounts that may serve requests, and define named **combos** that resolve to ordered model fallbacks.
 - Create virtual Claude/Codex CLI accounts that point at the local gateway and pin a combo or single discovered model.
 - Gateway usage is tracked separately by combo, key, account, and tool.
+
+### Auto Session
+
+- Give each Claude/Codex subscription account **one daily prime time**; the app sends a minimal "hi" then to open a fresh 5-hour window, so your reset clock lands when you actually start coding. Primes at most once per day per account.
+- Priming runs the account's own `claude` / `codex` CLI (so it refreshes its own token), with a direct HTTP fallback. Each attempt — success, hold, skip, fail, or late catch-up — is written to an activity log, with a per-day stats summary.
+- Optionally install a **one-time privileged helper** so the Mac wakes itself ~5 minutes before a prime via `pmset` and sleeps again; without it, priming runs whenever the machine is awake / the app is open (a missed time is caught up on next launch).
+- **On-demand extend:** when a window is about to end (≤30 min) the app prompts on the account to open the next one the instant the current ends; a per-account toggle can do this automatically without asking.
 
 ### Antigravity IDE (GUI)
 

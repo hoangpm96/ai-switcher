@@ -2,19 +2,22 @@ mod api_gateway;
 mod app_state;
 mod detection;
 mod models;
+mod prime;
 mod pricing;
 mod quota;
 mod store;
 mod tools;
 mod tray;
 mod usage;
+mod wake;
 
 use app_state::ManagedState;
 use models::{
     AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, RenameAccountInput, SaveApiGatewayComboInput,
-    SetApiGatewayAccountInput, SetLauncherInput, SetToolSetupInput, StartApiGatewayInput,
+    ConfirmExtendInput, SetApiGatewayAccountInput, SetAutoExtendInput, SetAutoPrimeAllInput,
+    SetAutoPrimeInput, SetLauncherInput, SetToolSetupInput, StartApiGatewayInput,
     SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
@@ -162,6 +165,102 @@ fn set_auto_switch_setting(
     state
         .set_auto_switch_setting(tool_id, enabled, threshold)
         .map_err(display_error)
+}
+
+#[tauri::command]
+fn set_auto_prime(
+    state: State<'_, ManagedState>,
+    input: SetAutoPrimeInput,
+) -> Result<AppSnapshot, String> {
+    state
+        .set_auto_prime(input.tool_id, input.account_id, input.enabled, input.time)
+        .map_err(display_error)
+}
+
+#[tauri::command]
+fn set_auto_prime_all(
+    state: State<'_, ManagedState>,
+    input: SetAutoPrimeAllInput,
+) -> Result<AppSnapshot, String> {
+    state
+        .set_auto_prime_all(input.time, input.enabled)
+        .map_err(display_error)
+}
+
+#[tauri::command]
+fn confirm_extend(
+    state: State<'_, ManagedState>,
+    input: ConfirmExtendInput,
+) -> Result<AppSnapshot, String> {
+    state
+        .confirm_extend(input.tool_id, input.account_id, input.accept)
+        .map_err(display_error)
+}
+
+#[tauri::command]
+fn set_auto_extend(
+    state: State<'_, ManagedState>,
+    input: SetAutoExtendInput,
+) -> Result<AppSnapshot, String> {
+    state
+        .set_auto_extend(input.tool_id, input.account_id, input.enabled)
+        .map_err(display_error)
+}
+
+#[tauri::command]
+fn get_auto_prime_log(state: State<'_, ManagedState>) -> String {
+    state.auto_prime_log()
+}
+
+#[tauri::command]
+fn get_auto_prime_stats(state: State<'_, ManagedState>) -> Vec<models::AutoPrimeDayStat> {
+    state.auto_prime_stats(14)
+}
+
+/// Whether the pmset wake helper LaunchDaemon is installed (so the Mac can wake itself to prime).
+#[tauri::command]
+fn wake_helper_status() -> bool {
+    wake::helper_installed()
+}
+
+/// Install the root LaunchDaemon (one admin prompt) + write the first wake request.
+#[tauri::command]
+fn install_wake_helper(state: State<'_, ManagedState>) -> Result<bool, String> {
+    wake::install_helper(&state.store).map_err(|e| e.to_string())?;
+    state.update_wake_schedule();
+    Ok(true)
+}
+
+/// Remove the root LaunchDaemon (one admin prompt).
+#[tauri::command]
+fn uninstall_wake_helper() -> Result<bool, String> {
+    wake::uninstall_helper().map_err(|e| e.to_string())?;
+    Ok(false)
+}
+
+#[tauri::command]
+fn open_auto_prime_log(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = app.state::<ManagedState>().store.auto_prime_log_path();
+    // Ensure the file exists so the OS has something to open.
+    if !path.exists() {
+        let _ = std::fs::write(&path, "");
+    }
+    app.opener()
+        .open_path(path.to_string_lossy().to_string(), None::<String>)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn open_auto_prime_log_folder(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = app.state::<ManagedState>().store.auto_prime_log_path();
+    if !path.exists() {
+        let _ = std::fs::write(&path, "");
+    }
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -319,6 +418,17 @@ pub fn run() {
             antigravity_new_login,
             set_auto_switch,
             set_auto_switch_setting,
+            set_auto_prime,
+            set_auto_prime_all,
+            confirm_extend,
+            set_auto_extend,
+            get_auto_prime_log,
+            get_auto_prime_stats,
+            open_auto_prime_log,
+            open_auto_prime_log_folder,
+            wake_helper_status,
+            install_wake_helper,
+            uninstall_wake_helper,
             detect_tool_setup,
             validate_tool_setup,
             set_tool_setup,
@@ -349,12 +459,40 @@ pub fn run() {
                 for tool_id in [ToolId::Claude, ToolId::Codex] {
                     let _ = state.refresh_tool(tool_id, Some(&handle));
                 }
+                // Auto-prime mechanism 2: after refreshing quota, prompt to extend any window
+                // that's about to end (and log "no response" for ones that ended unacknowledged).
+                state.check_extend_reminders(Some(&handle));
                 // Keep the token-usage cache warm and nudge any open Usage tab to refetch
                 // (with whatever range the user has selected).
                 let _ = state.usage_report(0);
                 let _ = handle.emit("usage-changed", ());
                 // Refresh the tray menu's quota %/checkmarks with the new snapshot.
                 tray::rebuild(&handle);
+            });
+
+            // Auto session prime scheduler. On startup, catch up any prime time already passed
+            // today that hasn't run (machine was asleep/app was closed) → "primed muộn". Then
+            // tick every minute: prime accounts whose time has arrived (once/day per time).
+            // NOTE (milestone 1): this only fires while the machine is awake / app is running.
+            // pmset wake (Mac waking itself) is a later milestone.
+            let prime_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                // Brief delay so first quota refresh / login recheck can settle.
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                // Each batch runs on its own detached thread so a slow attempt (send retries can
+                // block for minutes) never delays the next tick; `run_due_primes` self-guards
+                // against overlapping batches.
+                let startup = prime_handle.clone();
+                std::thread::spawn(move || {
+                    startup.state::<ManagedState>().run_due_primes(Some(&startup), true);
+                });
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    let tick = prime_handle.clone();
+                    std::thread::spawn(move || {
+                        tick.state::<ManagedState>().run_due_primes(Some(&tick), false);
+                    });
+                }
             });
             Ok(())
         })

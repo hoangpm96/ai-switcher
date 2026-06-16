@@ -25,6 +25,15 @@ impl ToolId {
             ToolId::Antigravity => "Antigravity IDE",
         }
     }
+
+    /// Short label used in auto-prime log/notification lines (matches the brainstorm wording).
+    pub fn prime_label(&self) -> &'static str {
+        match self {
+            ToolId::Claude => "Claude",
+            ToolId::Codex => "Codex",
+            ToolId::Antigravity => "Antigravity",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -406,6 +415,9 @@ pub struct AppSnapshot {
     pub auto_switch_threshold: f64,
     #[serde(default)]
     pub auto_switch_settings: std::collections::BTreeMap<String, AutoSwitchSetting>,
+    /// Per-account auto session prime schedules, keyed by account id.
+    #[serde(default)]
+    pub auto_prime: std::collections::BTreeMap<String, AutoPrimeSetting>,
     #[serde(default)]
     pub tool_setups: std::collections::BTreeMap<String, ToolSetup>,
     #[serde(default)]
@@ -426,6 +438,119 @@ impl Default for AutoSwitchSetting {
             threshold: 100.0,
         }
     }
+}
+
+/// Per-account "auto session prime" config. Keyed by account id in `StoredState.auto_prime`.
+/// At the scheduled `time` (machine local), the app sends a minimal "hi" to start a fresh
+/// 5-hour window, so the reset clock is anchored to the user's work rhythm. Each account
+/// primes at most once per day for a given `time` (the `last_primed_*` fields enforce this).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoPrimeSetting {
+    /// Whether scheduled priming is on for this account.
+    pub enabled: bool,
+    /// The single daily prime time, `HH:MM` 24h, in the machine's local timezone.
+    pub time: String,
+    /// Local date (`YYYY-MM-DD`) the account was last primed — guards "once per day".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_primed_date: Option<String>,
+    /// The `HH:MM` that was primed on `last_primed_date`. A new time differing from this
+    /// is allowed to prime again the same day (changing the schedule is not a re-run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_primed_time: Option<String>,
+    /// Short status of the most recent prime attempt: "success" | "failed" | "skip" | "hold".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<String>,
+    /// ISO timestamp of the most recent prime attempt (any outcome).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<String>,
+    /// On-demand extend (mechanism 2): set true when the user accepts the "extend?" prompt.
+    /// The next time the current 5h window ends, the account is primed once, then this clears.
+    #[serde(default)]
+    pub extend_requested: bool,
+    /// The window's `reset_at` (ISO) the user was last reminded about, so the app prompts at most
+    /// once per window-ending (a new window has a different reset_at → prompts again).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extend_reminded_reset: Option<String>,
+    /// When true, the app auto-extends without asking: as the window nears its end it sets
+    /// `extend_requested` itself instead of prompting. Default false (the brainstorm default is
+    /// to ASK). A convenience for days the user doesn't want to confirm each time.
+    #[serde(default)]
+    pub auto_extend: bool,
+    /// When a prime is held (old window still active), the scheduler skips this account until this
+    /// ISO instant (= reset_at + 5min), so it doesn't re-attempt + re-log "HOÃN" every minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_until: Option<String>,
+    /// The reset_at the user explicitly dismissed the "extend?" prompt for, so the UI hides the
+    /// button and the poller doesn't re-prompt for that same window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extend_dismissed_reset: Option<String>,
+}
+
+impl Default for AutoPrimeSetting {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            time: "05:30".to_string(),
+            last_primed_date: None,
+            last_primed_time: None,
+            last_result: None,
+            last_attempt_at: None,
+            extend_requested: false,
+            extend_reminded_reset: None,
+            auto_extend: false,
+            deferred_until: None,
+            extend_dismissed_reset: None,
+        }
+    }
+}
+
+/// One day's tally of auto-prime outcomes, parsed from the activity log for the stats view.
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoPrimeDayStat {
+    /// Local date `YYYY-MM-DD`.
+    pub date: String,
+    pub success: u32,
+    pub failed: u32,
+    pub hold: u32,
+    pub skip: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoPrimeInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    pub enabled: bool,
+    /// `HH:MM` 24h local time.
+    pub time: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoPrimeAllInput {
+    /// `HH:MM` 24h applied to every prime-eligible (subscription) account.
+    pub time: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmExtendInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    /// true = user accepted "extend?"; false = user dismissed it.
+    pub accept: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoExtendInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    /// true = auto-extend without asking; false = ask each time (default).
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

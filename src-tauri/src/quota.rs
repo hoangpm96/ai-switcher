@@ -49,6 +49,15 @@ pub fn read_quota(tool_id: &ToolId, config_dir: &Path) -> QuotaInfo {
 static CLAUDE_CACHE: Mutex<BTreeMap<String, (Instant, QuotaInfo)>> = Mutex::new(BTreeMap::new());
 const CLAUDE_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// Drop the cached Claude quota for one config dir so the next `read_quota` re-fetches.
+/// Auto-prime's confirmation re-check needs the fresh `resets_at` right after sending "hi",
+/// which the 60s cache would otherwise mask.
+pub(crate) fn invalidate_claude_cache(config_dir: &Path) {
+    if let Ok(mut guard) = CLAUDE_CACHE.lock() {
+        guard.remove(&config_dir.to_string_lossy().to_string());
+    }
+}
+
 fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
     let cache_key = config_dir.to_string_lossy().to_string();
     if let Ok(guard) = CLAUDE_CACHE.lock() {
@@ -59,8 +68,8 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
         }
     }
 
-    let token =
-        claude_oauth_token(config_dir).context("couldn't get Claude's OAuth token")?;
+    let token = claude_oauth_token_fresh(config_dir, None)
+        .context("couldn't get Claude's OAuth token")?;
     let version = claude_version().unwrap_or_else(|| "0.0.0".to_string());
     let user_agent = format!("claude-code/{version}");
     let body = curl_get(
@@ -148,11 +157,31 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path, binary: Option<&Path>)
         .and_then(serde_json::Value::as_i64);
     let now_ms = chrono::Utc::now().timestamp_millis();
     if expires_at.is_some_and(|expiry| expiry <= now_ms + 300_000) {
+        // Run `claude auth status` to trigger a token refresh, but never let it hang the caller
+        // (it may stall on network or an interactive prompt). Spawn detached output + kill on a
+        // hard deadline.
         let mut command = Command::new(binary.unwrap_or_else(|| Path::new("claude")));
-        let _ = command
+        command
             .args(["auth", "status", "--json"])
             .env("CLAUDE_CONFIG_DIR", config_dir)
-            .output();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Ok(mut child) = command.spawn() {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() >= deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                    Err(_) => break,
+                }
+            }
+        }
     }
     claude_oauth_token(config_dir)
 }
@@ -501,8 +530,27 @@ fn read_codex_rollout_quota() -> Result<QuotaInfo> {
 /// `<config_dir>/auth.json` (`tokens.access_token`). Returns rate_limit.primary_window
 /// (5h, limit_window_seconds 18000) + secondary_window (weekly, 604800), each with
 /// `used_percent` + `reset_at` (unix seconds).
+/// Read the LIVE 5-hour window for one account, bypassing any cache or local rollout file.
+/// Auto-prime's confirmation step needs the truth straight from the provider right after
+/// sending "hi" — the Claude cache (60s) or the Codex rollout file (only updated by the CLI)
+/// would otherwise return a stale `reset_at`.
+pub(crate) fn read_live_five_hour(tool_id: &ToolId, config_dir: &Path) -> Option<QuotaWindow> {
+    match tool_id {
+        ToolId::Claude => {
+            invalidate_claude_cache(config_dir);
+            let quota = read_claude_quota(config_dir).ok()?;
+            Some(quota.five_hour)
+        }
+        ToolId::Codex => {
+            let quota = read_codex_usage_endpoint(config_dir).ok()?;
+            Some(quota.five_hour)
+        }
+        ToolId::Antigravity => None,
+    }
+}
+
 fn read_codex_usage_endpoint(config_dir: &Path) -> Result<QuotaInfo> {
-    let token = codex_access_token(config_dir).context("couldn't get Codex's access_token")?;
+    let token = codex_access_token_fresh(config_dir).context("couldn't get Codex's access_token")?;
     let body = curl_get(
         "https://chatgpt.com/backend-api/wham/usage",
         &[
@@ -513,16 +561,6 @@ fn read_codex_usage_endpoint(config_dir: &Path) -> Result<QuotaInfo> {
     let value: serde_json::Value =
         serde_json::from_str(&body).context("Codex usage response is not JSON")?;
     quota_from_codex_endpoint(&value)
-}
-
-pub(crate) fn codex_access_token(config_dir: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(config_dir.join("auth.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    value
-        .get("tokens")
-        .and_then(|tokens| tokens.get("access_token"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
 }
 
 pub(crate) fn codex_access_token_fresh(config_dir: &Path) -> Option<String> {
@@ -944,7 +982,6 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(codex_access_token(&dir).as_deref(), Some("secret-token"));
         assert_eq!(codex_account_id(&dir).as_deref(), Some("acct_123"));
         let _ = std::fs::remove_dir_all(dir);
     }
