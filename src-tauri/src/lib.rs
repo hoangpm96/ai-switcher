@@ -334,9 +334,9 @@ fn delete_api_gateway_key(
 #[tauri::command]
 fn reveal_api_gateway_key(
     state: State<'_, ManagedState>,
-    keyId: String,
+    key_id: String,
 ) -> Result<String, String> {
-    state.reveal_api_gateway_key(keyId).map_err(display_error)
+    state.reveal_api_gateway_key(key_id).map_err(display_error)
 }
 
 #[tauri::command]
