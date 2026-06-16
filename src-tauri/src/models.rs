@@ -25,6 +25,15 @@ impl ToolId {
             ToolId::Antigravity => "Antigravity IDE",
         }
     }
+
+    /// Short label used in auto-prime log/notification lines (matches the brainstorm wording).
+    pub fn prime_label(&self) -> &'static str {
+        match self {
+            ToolId::Claude => "Claude",
+            ToolId::Codex => "Codex",
+            ToolId::Antigravity => "Antigravity",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -455,6 +464,14 @@ pub struct AutoPrimeSetting {
     /// ISO timestamp of the most recent prime attempt (any outcome).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt_at: Option<String>,
+    /// On-demand extend (mechanism 2): set true when the user accepts the "extend?" prompt.
+    /// The next time the current 5h window ends, the account is primed once, then this clears.
+    #[serde(default)]
+    pub extend_requested: bool,
+    /// Local date (`YYYY-MM-DD`) the user was last reminded the window is about to end, so the
+    /// app prompts at most once per window-ending per day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extend_reminded_reset: Option<String>,
 }
 
 impl Default for AutoPrimeSetting {
@@ -466,6 +483,8 @@ impl Default for AutoPrimeSetting {
             last_primed_time: None,
             last_result: None,
             last_attempt_at: None,
+            extend_requested: false,
+            extend_reminded_reset: None,
         }
     }
 }
@@ -486,6 +505,15 @@ pub struct SetAutoPrimeAllInput {
     /// `HH:MM` 24h applied to every prime-eligible (subscription) account.
     pub time: String,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmExtendInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    /// true = user accepted "extend?"; false = user dismissed it.
+    pub accept: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

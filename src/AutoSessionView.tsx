@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { AlarmClock, FileText, FolderOpen, Loader2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { AlarmClock, FileText, FolderOpen, Loader2, Moon } from "lucide-react";
 import { api } from "./tauri";
 import type { Account, AppSnapshot, ToolId } from "./types";
 
@@ -38,6 +38,31 @@ export function AutoSessionView({
   const [allTime, setAllTime] = useState("05:30");
   const [log, setLog] = useState<string | null>(null);
   const [loadingLog, setLoadingLog] = useState(false);
+  const [wakeHelper, setWakeHelper] = useState<boolean | null>(null);
+  const [wakeBusy, setWakeBusy] = useState(false);
+
+  useEffect(() => {
+    void api.wakeHelperStatus().then(setWakeHelper).catch(() => setWakeHelper(false));
+  }, []);
+
+  async function toggleWakeHelper() {
+    setWakeBusy(true);
+    try {
+      const installed = wakeHelper
+        ? await api.uninstallWakeHelper()
+        : await api.installWakeHelper();
+      setWakeHelper(installed);
+      notify(
+        installed
+          ? "Đã cài trợ giúp đánh thức máy — Mac sẽ tự thức để prime đúng giờ"
+          : "Đã gỡ trợ giúp đánh thức máy",
+      );
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setWakeBusy(false);
+    }
+  }
 
   // Flatten every prime-eligible account across Claude + Codex, in tool order.
   const accounts = useMemo(() => {
@@ -117,10 +142,29 @@ export function AutoSessionView({
           </h2>
           <p className="muted">
             Tự gửi 1 tin nhắn mồi đúng giờ để neo mốc reset 5h theo nhịp làm việc. Mỗi tài khoản 1
-            giờ, prime tối đa 1 lần/ngày. (Hiện chạy khi máy đang thức / app đang mở.)
+            giờ, prime tối đa 1 lần/ngày.
           </p>
         </div>
       </header>
+
+      <div className="wakeRow">
+        <div className="wakeText">
+          <strong>
+            <Moon size={15} /> Đánh thức máy để prime (pmset)
+          </strong>
+          <span className="muted">
+            {wakeHelper === null
+              ? "Đang kiểm tra…"
+              : wakeHelper
+                ? "Đã bật — Mac sẽ tự thức ~5 phút trước giờ prime rồi ngủ lại."
+                : "Chưa bật — hiện chỉ prime khi máy đang thức / app đang mở. Bật để Mac tự thức (cần quyền admin 1 lần)."}
+          </span>
+        </div>
+        <button onClick={() => void toggleWakeHelper()} disabled={wakeBusy || wakeHelper === null}>
+          {wakeBusy ? <Loader2 className="spin" size={15} /> : null}
+          {wakeHelper ? "Tắt" : "Bật"}
+        </button>
+      </div>
 
       <div className="autoAllRow">
         <span>Áp 1 giờ cho tất cả:</span>

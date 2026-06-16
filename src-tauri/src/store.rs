@@ -93,6 +93,17 @@ impl Store {
         self.root.join("auto-prime.log")
     }
 
+    /// The root data dir (used to place the pmset wake helper's request/script files).
+    pub fn root_dir(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    /// File the app writes the next desired wake time into; the root LaunchDaemon helper watches
+    /// it and runs `pmset schedule wake`. Lives in the data dir so the unprivileged app can write it.
+    pub fn wake_request_path(&self) -> PathBuf {
+        self.root.join("wake-request.txt")
+    }
+
     /// The tool's accounts root (`accounts/<tool>/`), holding one dir per profile account.
     pub fn tool_accounts_root(&self, tool_id: &ToolId) -> PathBuf {
         self.root.join("accounts").join(tool_id.as_str())

@@ -170,6 +170,10 @@ export interface AutoPrimeSetting {
   /** "success" | "failed" | "skip" | "hold" */
   lastResult?: string | null;
   lastAttemptAt?: string | null;
+  /** User accepted "extend?" — prime once the current window ends. */
+  extendRequested?: boolean;
+  /** reset_at the user was last reminded for (so the "extend?" button shows). */
+  extendRemindedReset?: string | null;
 }
 
 export type DetectionSource = "env" | "default" | "path" | "appManaged" | "manual" | "fallback";
@@ -277,6 +281,13 @@ export interface SetAutoPrimeAllInput {
   /** "HH:MM" 24h applied to every prime-eligible (subscription) account. */
   time: string;
   enabled: boolean;
+}
+
+export interface ConfirmExtendInput {
+  toolId: ToolId;
+  accountId: string;
+  /** true = accept "extend?", false = dismiss. */
+  accept: boolean;
 }
 
 export interface StartApiGatewayInput {

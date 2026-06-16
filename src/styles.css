@@ -2231,3 +2231,67 @@ button.danger:hover:not(:disabled) {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* ── Auto prime on the account card (mechanism 2 + status) ─────────── */
+.autoStatusLine {
+  align-items: center;
+  color: var(--text-3);
+  display: flex;
+  font-size: 12px;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.extendPrompt {
+  background: var(--accent-soft);
+  border: 1px solid rgba(251, 106, 26, 0.3);
+  border-radius: var(--radius-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+}
+
+.extendPrompt > span {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.extendActions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ── pmset wake helper row (Auto Session) ─────────────────────────── */
+.wakeRow {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: flex;
+  gap: 14px;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  padding: 12px 14px;
+}
+
+.wakeText {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.wakeText strong {
+  align-items: center;
+  display: flex;
+  font-size: 14px;
+  font-weight: 600;
+  gap: 6px;
+}
+
+.wakeText .muted {
+  font-size: 12.5px;
+  max-width: 62ch;
+}

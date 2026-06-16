@@ -9,6 +9,7 @@ import type {
   CreateApiGatewayKeyInput,
   CreateApiGatewayKeyResult,
   CreateVirtualApiAccountInput,
+  ConfirmExtendInput,
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
   SetAutoPrimeAllInput,
@@ -207,7 +208,7 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   }
 
   await new Promise((resolve) => window.setTimeout(resolve, 120));
-  if (command === "load_snapshot" || command === "refresh_tool" || command === "set_auto_prime" || command === "set_auto_prime_all") {
+  if (command === "load_snapshot" || command === "refresh_tool" || command === "set_auto_prime" || command === "set_auto_prime_all" || command === "confirm_extend") {
     return structuredClone(demoSnapshot) as T;
   }
   if (command === "get_auto_prime_log") {
@@ -215,6 +216,12 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   }
   if (command === "open_auto_prime_log" || command === "open_auto_prime_log_folder") {
     return undefined as T;
+  }
+  if (command === "wake_helper_status" || command === "uninstall_wake_helper") {
+    return false as T;
+  }
+  if (command === "install_wake_helper") {
+    return true as T;
   }
   if (command === "get_usage") {
     return structuredClone(demoUsage) as T;
@@ -457,7 +464,11 @@ export const api = {
   setAutoPrime: (input: SetAutoPrimeInput) => invoke<AppSnapshot>("set_auto_prime", { input }),
   setAutoPrimeAll: (input: SetAutoPrimeAllInput) =>
     invoke<AppSnapshot>("set_auto_prime_all", { input }),
+  confirmExtend: (input: ConfirmExtendInput) => invoke<AppSnapshot>("confirm_extend", { input }),
   getAutoPrimeLog: () => invoke<string>("get_auto_prime_log"),
   openAutoPrimeLog: () => invoke<void>("open_auto_prime_log"),
   openAutoPrimeLogFolder: () => invoke<void>("open_auto_prime_log_folder"),
+  wakeHelperStatus: () => invoke<boolean>("wake_helper_status"),
+  installWakeHelper: () => invoke<boolean>("install_wake_helper"),
+  uninstallWakeHelper: () => invoke<boolean>("uninstall_wake_helper"),
 };

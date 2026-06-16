@@ -9,14 +9,16 @@ mod store;
 mod tools;
 mod tray;
 mod usage;
+mod wake;
 
 use app_state::ManagedState;
 use models::{
     AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, RenameAccountInput, SaveApiGatewayComboInput,
-    SetApiGatewayAccountInput, SetAutoPrimeAllInput, SetAutoPrimeInput, SetLauncherInput,
-    SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId, UsageReport,
+    ConfirmExtendInput, SetApiGatewayAccountInput, SetAutoPrimeAllInput, SetAutoPrimeInput,
+    SetLauncherInput, SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId,
+    UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -186,8 +188,39 @@ fn set_auto_prime_all(
 }
 
 #[tauri::command]
+fn confirm_extend(
+    state: State<'_, ManagedState>,
+    input: ConfirmExtendInput,
+) -> Result<AppSnapshot, String> {
+    state
+        .confirm_extend(input.tool_id, input.account_id, input.accept)
+        .map_err(display_error)
+}
+
+#[tauri::command]
 fn get_auto_prime_log(state: State<'_, ManagedState>) -> String {
     state.auto_prime_log()
+}
+
+/// Whether the pmset wake helper LaunchDaemon is installed (so the Mac can wake itself to prime).
+#[tauri::command]
+fn wake_helper_status() -> bool {
+    wake::helper_installed()
+}
+
+/// Install the root LaunchDaemon (one admin prompt) + write the first wake request.
+#[tauri::command]
+fn install_wake_helper(state: State<'_, ManagedState>) -> Result<bool, String> {
+    wake::install_helper(&state.store).map_err(|e| e.to_string())?;
+    state.update_wake_schedule(None);
+    Ok(true)
+}
+
+/// Remove the root LaunchDaemon (one admin prompt).
+#[tauri::command]
+fn uninstall_wake_helper() -> Result<bool, String> {
+    wake::uninstall_helper().map_err(|e| e.to_string())?;
+    Ok(false)
 }
 
 #[tauri::command]
@@ -372,9 +405,13 @@ pub fn run() {
             set_auto_switch_setting,
             set_auto_prime,
             set_auto_prime_all,
+            confirm_extend,
             get_auto_prime_log,
             open_auto_prime_log,
             open_auto_prime_log_folder,
+            wake_helper_status,
+            install_wake_helper,
+            uninstall_wake_helper,
             detect_tool_setup,
             validate_tool_setup,
             set_tool_setup,
@@ -405,6 +442,9 @@ pub fn run() {
                 for tool_id in [ToolId::Claude, ToolId::Codex] {
                     let _ = state.refresh_tool(tool_id, Some(&handle));
                 }
+                // Auto-prime mechanism 2: after refreshing quota, prompt to extend any window
+                // that's about to end (and log "no response" for ones that ended unacknowledged).
+                state.check_extend_reminders(Some(&handle));
                 // Keep the token-usage cache warm and nudge any open Usage tab to refetch
                 // (with whatever range the user has selected).
                 let _ = state.usage_report(0);

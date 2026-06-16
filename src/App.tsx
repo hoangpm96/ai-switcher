@@ -43,6 +43,7 @@ import type {
   ApiRotationStrategy,
   ApiUsageReport,
   AppSnapshot,
+  AutoPrimeSetting,
   BinaryCandidate,
   ConfigCandidate,
   CreateApiGatewayKeyInput,
@@ -171,6 +172,16 @@ export function App() {
       void unlisten.then((fn) => fn());
     };
   }, []);
+
+  // Auto session prime updated a schedule / reminded to extend / primed → re-pull the snapshot.
+  useEffect(() => {
+    const unlisten = listen("auto-prime-changed", () => {
+      void load();
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [load]);
 
   useEffect(() => {
     if (!snapshot.disclaimerAccepted || dialog) return;
@@ -558,6 +569,16 @@ export function App() {
                     account={account}
                     tool={currentTool}
                     busy={busy}
+                    autoPrime={snapshot.autoPrime[account.id] ?? null}
+                    onExtend={(accept) =>
+                      run("extend", () =>
+                        api.confirmExtend({
+                          toolId: currentTool.id,
+                          accountId: account.id,
+                          accept,
+                        }),
+                      )
+                    }
                     onSwitch={() => switchAccount(currentTool, account)}
                     onRename={() => {
                       setSelectedAccount(account);
@@ -1668,6 +1689,8 @@ function AccountCard({
   account,
   tool,
   busy,
+  autoPrime,
+  onExtend,
   onSwitch,
   onRename,
   onSetLauncher,
@@ -1679,6 +1702,8 @@ function AccountCard({
   account: Account;
   tool: ToolStatus;
   busy: string | null;
+  autoPrime: AutoPrimeSetting | null;
+  onExtend: (accept: boolean) => void;
   onSwitch: () => void;
   onRename: () => void;
   onSetLauncher: () => void;
@@ -1693,6 +1718,27 @@ function AccountCard({
   const isActive = account.id === tool.activeAccountId || account.state === "active";
   const exhausted = account.state === "exhausted";
   const needsLogin = account.state === "needs-login";
+
+  // Auto session prime status shown on the card (subscription Claude/Codex only).
+  const canPrime = (tool.id === "claude" || tool.id === "codex") && !isApi;
+  const primeOn = !!autoPrime?.enabled;
+  const resetAt = account.quota?.fiveHour.resetAt ?? null;
+  const minsToReset = resetAt ? Math.round((Date.parse(resetAt) - Date.now()) / 60000) : null;
+  // Offer "extend" when the window is about to end (≤30') and the user hasn't already accepted.
+  const showExtend =
+    canPrime &&
+    !!autoPrime?.extendRemindedReset &&
+    autoPrime.extendRemindedReset === resetAt &&
+    !autoPrime.extendRequested &&
+    minsToReset !== null &&
+    minsToReset >= 0 &&
+    minsToReset <= 30;
+  const autoStatus = (() => {
+    if (!canPrime || !primeOn) return null;
+    if (autoPrime?.extendRequested) return "Sẽ mở phiên mới khi phiên cũ hết";
+    if (autoPrime?.lastResult === "success") return `Auto ${autoPrime.time} · đã prime`;
+    return `Auto ${autoPrime?.time}`;
+  })();
 
   return (
     <article className={`account ${isActive ? "active" : ""} ${exhausted ? "exhausted" : ""}`}>
@@ -1745,6 +1791,28 @@ function AccountCard({
         </p>
       ) : (
         <Quota quota={account.quota} />
+      )}
+
+      {showExtend ? (
+        <div className="extendPrompt">
+          <span>
+            Phiên còn {minsToReset} phút. Mở phiên kế tiếp ngay khi hết để code liền mạch?
+          </span>
+          <div className="extendActions">
+            <button className="primary" onClick={() => onExtend(true)} disabled={busy !== null}>
+              <AlarmClock /> Có
+            </button>
+            <button onClick={() => onExtend(false)} disabled={busy !== null}>
+              Không
+            </button>
+          </div>
+        </div>
+      ) : (
+        autoStatus && (
+          <div className="autoStatusLine">
+            <AlarmClock size={13} /> {autoStatus}
+          </div>
+        )
       )}
 
       {needsLogin && (
