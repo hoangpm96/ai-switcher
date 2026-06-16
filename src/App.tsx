@@ -1724,12 +1724,14 @@ function AccountCard({
   const primeOn = !!autoPrime?.enabled;
   const resetAt = account.quota?.fiveHour.resetAt ?? null;
   const minsToReset = resetAt ? Math.round((Date.parse(resetAt) - Date.now()) / 60000) : null;
-  // Offer "extend" when the window is about to end (≤30') and the user hasn't already accepted.
+  // Offer "extend" when the window is about to end (≤30'), the user hasn't already accepted, and
+  // hasn't dismissed the prompt for this same window.
   const showExtend =
     canPrime &&
     !!autoPrime?.extendRemindedReset &&
     autoPrime.extendRemindedReset === resetAt &&
     !autoPrime.extendRequested &&
+    autoPrime.extendDismissedReset !== resetAt &&
     minsToReset !== null &&
     minsToReset >= 0 &&
     minsToReset <= 30;

@@ -157,11 +157,31 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path, binary: Option<&Path>)
         .and_then(serde_json::Value::as_i64);
     let now_ms = chrono::Utc::now().timestamp_millis();
     if expires_at.is_some_and(|expiry| expiry <= now_ms + 300_000) {
+        // Run `claude auth status` to trigger a token refresh, but never let it hang the caller
+        // (it may stall on network or an interactive prompt). Spawn detached output + kill on a
+        // hard deadline.
         let mut command = Command::new(binary.unwrap_or_else(|| Path::new("claude")));
-        let _ = command
+        command
             .args(["auth", "status", "--json"])
             .env("CLAUDE_CONFIG_DIR", config_dir)
-            .output();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Ok(mut child) = command.spawn() {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() >= deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                    Err(_) => break,
+                }
+            }
+        }
     }
     claude_oauth_token(config_dir)
 }

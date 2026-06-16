@@ -28,6 +28,9 @@ pub const SEND_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 /// Confirm-retry policy (D4): after a 2xx send, re-read the live window until `reset_at` moves.
 pub const CONFIRM_MAX_TRIES: u32 = 5;
 pub const CONFIRM_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Hard cap on how long a prime CLI invocation may run before we kill it (a hung CLI must never
+/// hold the prime worker — see the scheduler's overlap guard).
+pub const CLI_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The outcome of one prime attempt, mapped to the brainstorm's log wording by the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,22 +161,35 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
         }
         ToolId::Antigravity => return Err("antigravity unsupported".to_string()),
     }
-    // Don't inherit a TTY; capture output so the subprocess can't block on stdin.
-    let output = command
+    // Don't inherit a TTY; discard output so a hung/chatty CLI can't block on stdin or fill a pipe
+    // buffer. We only care about the exit status.
+    command
         .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("CLI: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        // Keep the reason short for the log; include a tail of stderr if any.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail = stderr.trim().lines().last().unwrap_or("").trim();
-        let code = output.status.code().unwrap_or(-1);
-        if tail.is_empty() {
-            Err(format!("CLI exit {code}"))
-        } else {
-            Err(format!("CLI exit {code}: {tail}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().map_err(|e| format!("CLI: {e}"))?;
+
+    // Hard timeout: a CLI that hangs (network stall, auth/update prompt) must NOT hold the prime
+    // worker forever — that would block the scheduler's overlap guard and skip every later prime.
+    let deadline = std::time::Instant::now() + CLI_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("CLI exit {}", status.code().unwrap_or(-1)))
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("CLI timeout".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return Err(format!("CLI: {e}")),
         }
     }
 }

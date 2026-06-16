@@ -1163,8 +1163,22 @@ impl ManagedState {
             if !prime_eligible_in_state(&data, &tool_id, &account_id) {
                 anyhow::bail!("Tài khoản này không hỗ trợ auto prime");
             }
+            // The window the user is answering about (to mark a dismiss against it).
+            let current_reset = data
+                .accounts
+                .iter()
+                .find(|a| a.id == account_id && a.tool_id == tool_id)
+                .and_then(|a| a.quota.as_ref())
+                .and_then(|q| q.five_hour.reset_at.clone());
             let entry = data.auto_prime.entry(account_id).or_default();
             entry.extend_requested = accept;
+            if accept {
+                entry.extend_dismissed_reset = None;
+            } else {
+                // Dismiss: remember it for THIS window so the UI hides the button and the poller
+                // doesn't prompt again for the same window-ending.
+                entry.extend_dismissed_reset = current_reset;
+            }
             self.store.save(&data)?;
         }
         self.snapshot()
@@ -1203,8 +1217,10 @@ impl ManagedState {
                 let entry = data.auto_prime.entry(account_id).or_default();
 
                 if (0..=EXTEND_THRESHOLD_MIN).contains(&mins) {
-                    // Window ending soon. Already accepted (or already handled this window) → skip.
+                    // Window ending soon. Skip if already accepted, already reminded for this
+                    // window, or the user explicitly dismissed this window.
                     if entry.extend_reminded_reset.as_deref() == Some(reset_at.as_str())
+                        || entry.extend_dismissed_reset.as_deref() == Some(reset_at.as_str())
                         || entry.extend_requested
                     {
                         continue;
@@ -1322,6 +1338,13 @@ impl ManagedState {
                     if !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some()) {
                         return None;
                     }
+                    // Held earlier (old window still active): wait until the defer instant before
+                    // re-attempting, so we don't read quota + log HOÃN every single minute.
+                    if let Some(until) = &setting.deferred_until {
+                        if minutes_until(until) > 0 {
+                            return None;
+                        }
+                    }
                     let scheduled_due = setting.enabled
                         && now_hhmm.as_str() >= setting.time.as_str()
                         && !(setting.last_primed_date.as_deref() == Some(today.as_str())
@@ -1420,21 +1443,41 @@ impl ManagedState {
         };
         self.append_prime_log(&line);
 
-        // Update the per-account schedule record. Mark "primed today for this time" only when we
-        // actually opened (or attempted to open) a new window — HOLD/SKIP don't consume the day.
+        // Update the per-account schedule record. A "terminal" outcome (we opened a window or gave
+        // up after the full retry budget) consumes today's scheduled attempt so the scheduler does
+        // NOT restart a fresh retry batch every minute. HOLD/SKIP are not terminal: HOLD defers,
+        // SKIP just waits for a valid token.
         if let Ok(mut data) = self.data.lock() {
             if let Some(setting) = data.auto_prime.get_mut(account_id) {
                 setting.last_result = Some(result.to_string());
                 setting.last_attempt_at = Some(now());
-                if matches!(
+                let terminal = matches!(
                     outcome,
-                    PrimeOutcome::Success { .. } | PrimeOutcome::FailUnconfirmed
-                ) {
+                    PrimeOutcome::Success { .. }
+                        | PrimeOutcome::FailUnconfirmed
+                        | PrimeOutcome::FailSend { .. }
+                );
+                if terminal {
                     setting.last_primed_date = Some(local_today());
                     setting.last_primed_time = Some(setting.time.clone());
-                    // The extend request is fulfilled once a new window opens (or we gave up
-                    // confirming it) — clear it so it doesn't re-fire on the next tick.
+                    // The extend request is resolved (opened, or exhausted retries) — clear it so it
+                    // doesn't re-fire next tick.
                     setting.extend_requested = false;
+                    setting.deferred_until = None;
+                }
+                match outcome {
+                    // Held: defer re-attempt until just after the old window ends, so we don't
+                    // read quota + log HOÃN every minute.
+                    PrimeOutcome::Hold { reset_at } => {
+                        setting.deferred_until = chrono::DateTime::parse_from_rfc3339(reset_at)
+                            .ok()
+                            .map(|t| {
+                                (t.with_timezone(&chrono::Utc) + chrono::Duration::minutes(5))
+                                    .to_rfc3339()
+                            });
+                    }
+                    PrimeOutcome::Success { .. } => setting.deferred_until = None,
+                    _ => {}
                 }
             }
             let _ = self.store.save(&data);

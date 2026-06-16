@@ -176,6 +176,10 @@ export interface AutoPrimeSetting {
   extendRemindedReset?: string | null;
   /** Auto-extend without asking (default false = ask each time). */
   autoExtend?: boolean;
+  /** reset_at the scheduler is deferring this account until (held; old window still active). */
+  deferredUntil?: string | null;
+  /** reset_at the user dismissed the "extend?" prompt for (UI hides the button). */
+  extendDismissedReset?: string | null;
 }
 
 export interface AutoPrimeDayStat {

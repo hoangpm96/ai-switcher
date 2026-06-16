@@ -477,6 +477,14 @@ pub struct AutoPrimeSetting {
     /// to ASK). A convenience for days the user doesn't want to confirm each time.
     #[serde(default)]
     pub auto_extend: bool,
+    /// When a prime is held (old window still active), the scheduler skips this account until this
+    /// ISO instant (= reset_at + 5min), so it doesn't re-attempt + re-log "HOÃN" every minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_until: Option<String>,
+    /// The reset_at the user explicitly dismissed the "extend?" prompt for, so the UI hides the
+    /// button and the poller doesn't re-prompt for that same window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extend_dismissed_reset: Option<String>,
 }
 
 impl Default for AutoPrimeSetting {
@@ -491,6 +499,8 @@ impl Default for AutoPrimeSetting {
             extend_requested: false,
             extend_reminded_reset: None,
             auto_extend: false,
+            deferred_until: None,
+            extend_dismissed_reset: None,
         }
     }
 }
