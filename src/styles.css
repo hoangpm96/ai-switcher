@@ -1684,6 +1684,19 @@ button.danger:hover:not(:disabled) {
   transform: translateX(20px);
 }
 
+/* Smaller switch variant (e.g. the per-account auto-extend toggle). */
+.switchTrack.small {
+  width: 38px;
+  height: 22px;
+}
+.switchTrack.small .switchThumb {
+  width: 18px;
+  height: 18px;
+}
+.switchTrack.small.on .switchThumb {
+  transform: translateX(16px);
+}
+
 .autoSwitchOpts {
   display: flex;
   align-items: center;
@@ -2123,20 +2136,26 @@ button.danger:hover:not(:disabled) {
   max-width: 60ch;
 }
 
+/* Header row: title on the left, "Apply all" controls flush right on the same line. */
+.autoHead {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .autoAllRow {
   align-items: center;
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
   display: flex;
-  gap: 10px;
-  margin-bottom: 16px;
-  padding: 12px 14px;
+  gap: 8px;
 }
 
 .autoAllRow span {
-  color: var(--text-2);
-  font-size: 14px;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+.autoAllRow input[type="time"] {
+  min-height: 30px;
 }
 
 .autoGrid {
@@ -2151,8 +2170,8 @@ button.danger:hover:not(:disabled) {
   border-radius: var(--radius-sm);
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 14px;
+  gap: 9px;
+  padding: 12px 14px;
 }
 
 .autoCard.on {
@@ -2161,15 +2180,25 @@ button.danger:hover:not(:disabled) {
 }
 
 .autoCardHead {
-  align-items: baseline;
+  align-items: center;
   display: flex;
   gap: 8px;
   justify-content: space-between;
 }
 
-.autoCardHead strong {
+.autoCardTitle {
+  align-items: baseline;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.autoCardTitle strong {
   font-size: 15px;
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .autoTool {
@@ -2180,41 +2209,47 @@ button.danger:hover:not(:disabled) {
 .autoCardBody {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+}
+
+/* Time inputs in the Auto Session tab — match the dark theme (default <input type=time> renders
+   light, giving white-on-white text). */
+.autoSession input[type="time"] {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  color-scheme: dark;
+  font: inherit;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.autoSession input[type="time"]:focus {
+  border-color: var(--accent);
+  outline: none;
 }
 
 .autoCardBody input[type="time"] {
-  flex: 1;
+  flex: 1 1 110px;
+  min-width: 0;
 }
 
-.autoCardFoot {
-  align-items: center;
-  display: flex;
-  font-size: 12px;
-  gap: 10px;
-  justify-content: space-between;
-}
-
-.autoBadge {
-  border-radius: 999px;
-  font-size: 11px;
-  padding: 2px 9px;
-}
-
-.autoBadge.on {
-  background: var(--green-soft);
-  color: var(--green);
-}
-
-.autoBadge.off {
-  background: var(--surface-hover);
+.autoCardHint {
   color: var(--text-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  margin: -2px 0 0;
 }
 
 .autoLogBar {
+  border-top: 1px solid var(--line);
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 18px;
+  padding-top: 16px;
 }
 
 .autoLog {
@@ -2296,22 +2331,34 @@ button.danger:hover:not(:disabled) {
   max-width: 62ch;
 }
 
+.wakeToggle {
+  align-items: center;
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
 /* ── Auto Session P2: auto-extend toggle + stats table ────────────── */
 .autoExtendToggle {
   align-items: center;
-  color: var(--text-3);
-  cursor: pointer;
+  border-top: 1px solid var(--line);
+  color: var(--text-2);
   display: flex;
   font-size: 12px;
-  gap: 6px;
-  margin-top: 8px;
+  gap: 8px;
+  padding-top: 9px;
 }
 
-.autoExtendToggle input {
-  accent-color: var(--accent);
-  cursor: pointer;
-  height: 14px;
-  width: 14px;
+/* Last-result status, pushed to the right of the auto-extend row. */
+.autoCardResult {
+  color: var(--text-3);
+  margin-left: auto;
+}
+
+.autoEmpty {
+  color: var(--text-3);
+  font-size: 13px;
+  margin-top: 14px;
 }
 
 .autoStatsTable {

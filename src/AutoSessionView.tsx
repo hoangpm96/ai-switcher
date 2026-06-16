@@ -10,18 +10,26 @@ function isPrimeEligible(account: Account): boolean {
   return PRIME_TOOLS.includes(account.toolId) && !account.apiProvider;
 }
 
+/** "HH:MM" + 5 hours (the 5h window length), wrapping past midnight. Empty if input is invalid. */
+function plusFiveHours(hhmm: string): string {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim());
+  if (!m) return "";
+  const total = (Number(m[1]) * 60 + Number(m[2]) + 5 * 60) % (24 * 60);
+  return `${String(Math.floor(total / 60)).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+}
+
 function resultLabel(result?: string | null): string {
   switch (result) {
     case "success":
-      return "Lần gần nhất: thành công";
+      return "✓ đã prime";
     case "failed":
-      return "Lần gần nhất: thất bại";
+      return "✗ lỗi";
     case "skip":
-      return "Lần gần nhất: bỏ qua (token)";
+      return "bỏ qua (token)";
     case "hold":
-      return "Lần gần nhất: hoãn";
+      return "đã hoãn";
     default:
-      return "Chưa prime lần nào";
+      return "chưa prime";
   }
 }
 
@@ -161,15 +169,21 @@ export function AutoSessionView({
 
   return (
     <section className="panel autoSession">
-      <header className="panelHead">
-        <div>
-          <h2>
-            <AlarmClock size={18} /> Auto Session
-          </h2>
-          <p className="muted">
-            Tự gửi 1 tin nhắn mồi đúng giờ để neo mốc reset 5h theo nhịp làm việc. Mỗi tài khoản 1
-            giờ, prime tối đa 1 lần/ngày.
-          </p>
+      <header className="panelHead autoHead">
+        <h2>
+          <AlarmClock size={18} /> Auto Session
+        </h2>
+        <div className="autoAllRow">
+          <span>Áp 1 giờ cho tất cả:</span>
+          <input
+            type="time"
+            value={allTime}
+            onChange={(e) => setAllTime(e.target.value)}
+            aria-label="Giờ áp cho tất cả"
+          />
+          <button className="primary" onClick={() => void applyAll()} disabled={busyId !== null}>
+            {busyId === "__all__" ? <Loader2 className="spin" size={15} /> : null} Apply all
+          </button>
         </div>
       </header>
 
@@ -182,27 +196,24 @@ export function AutoSessionView({
             {wakeHelper === null
               ? "Đang kiểm tra…"
               : wakeHelper
-                ? "Đã bật — Mac sẽ tự thức ~5 phút trước giờ prime rồi ngủ lại."
-                : "Chưa bật — hiện chỉ prime khi máy đang thức / app đang mở. Bật để Mac tự thức (cần quyền admin 1 lần)."}
+                ? "Mac tự thức ~5 phút trước giờ prime rồi ngủ lại."
+                : "Bật để Mac tự thức đúng giờ (cần quyền admin 1 lần)."}
           </span>
         </div>
-        <button onClick={() => void toggleWakeHelper()} disabled={wakeBusy || wakeHelper === null}>
+        <div className="wakeToggle">
           {wakeBusy ? <Loader2 className="spin" size={15} /> : null}
-          {wakeHelper ? "Tắt" : "Bật"}
-        </button>
-      </div>
-
-      <div className="autoAllRow">
-        <span>Áp 1 giờ cho tất cả:</span>
-        <input
-          type="time"
-          value={allTime}
-          onChange={(e) => setAllTime(e.target.value)}
-          aria-label="Giờ áp cho tất cả"
-        />
-        <button className="primary" onClick={() => void applyAll()} disabled={busyId !== null}>
-          {busyId === "__all__" ? <Loader2 className="spin" size={15} /> : null} Apply all
-        </button>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={!!wakeHelper}
+            className={`switchTrack ${wakeHelper ? "on" : ""}`}
+            disabled={wakeBusy || wakeHelper === null}
+            onClick={() => void toggleWakeHelper()}
+            aria-label="Đánh thức máy để prime"
+          >
+            <span className="switchThumb" />
+          </button>
+        </div>
       </div>
 
       {accounts.length === 0 ? (
@@ -219,8 +230,22 @@ export function AutoSessionView({
             return (
               <div key={account.id} className={`autoCard ${enabled ? "on" : ""}`}>
                 <div className="autoCardHead">
-                  <strong>{account.name}</strong>
-                  <span className="autoTool">{tool}</span>
+                  <div className="autoCardTitle">
+                    <strong>{account.name}</strong>
+                    <span className="autoTool">{tool}</span>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={enabled}
+                    className={`switchTrack small ${enabled ? "on" : ""}`}
+                    disabled={busy}
+                    onClick={() => void save(account, !enabled)}
+                    aria-label={enabled ? "Tắt auto prime" : "Bật auto prime"}
+                    title={enabled ? "Tắt auto prime" : "Bật auto prime"}
+                  >
+                    <span className="switchThumb" />
+                  </button>
                 </div>
                 <div className="autoCardBody">
                   <input
@@ -232,30 +257,30 @@ export function AutoSessionView({
                     aria-label={`Giờ prime cho ${account.name}`}
                   />
                   <button className="primary" onClick={() => void save(account, true)} disabled={busy}>
-                    {busy ? <Loader2 className="spin" size={15} /> : null} Set
+                    {busy ? <Loader2 className="spin" size={15} /> : null} Lưu giờ
                   </button>
+                </div>
+                {plusFiveHours(timeOf(account)) && (
+                  <p className="autoCardHint" title="Dự kiến (giờ neo + 5h). Nếu phiên cũ chưa hết, app sẽ hoãn nên mốc thực tế có thể muộn hơn.">
+                    {timeOf(account)} → reset ~{plusFiveHours(timeOf(account))}
+                  </p>
+                )}
+                <div className="autoExtendToggle">
                   <button
-                    onClick={() => void save(account, !enabled)}
-                    disabled={busy}
-                    title={enabled ? "Tắt auto prime" : "Bật auto prime"}
+                    type="button"
+                    role="switch"
+                    aria-checked={setting?.autoExtend ?? false}
+                    className={`switchTrack small ${setting?.autoExtend ? "on" : ""}`}
+                    onClick={() => void toggleAutoExtend(account, !(setting?.autoExtend ?? false))}
+                    aria-label="Tự gia hạn không hỏi"
                   >
-                    {enabled ? "Tắt" : "Bật"}
+                    <span className="switchThumb" />
                   </button>
-                </div>
-                <div className="autoCardFoot muted">
-                  <span className={`autoBadge ${enabled ? "on" : "off"}`}>
-                    {enabled ? `Bật · ${setting?.time}` : "Tắt"}
+                  <span title="Khi phiên 5h sắp hết (≤30 phút), tự mở phiên kế tiếp mà không cần hỏi. Tắt = app sẽ hỏi trước.">
+                    Tự gia hạn
                   </span>
-                  <span>{resultLabel(setting?.lastResult)}</span>
+                  <span className="autoCardResult">{resultLabel(setting?.lastResult)}</span>
                 </div>
-                <label className="autoExtendToggle" title="Khi sắp hết phiên, tự gia hạn không cần hỏi">
-                  <input
-                    type="checkbox"
-                    checked={setting?.autoExtend ?? false}
-                    onChange={(e) => void toggleAutoExtend(account, e.target.checked)}
-                  />
-                  <span>Tự gia hạn (không hỏi)</span>
-                </label>
               </div>
             );
           })}
@@ -281,7 +306,7 @@ export function AutoSessionView({
 
       {stats !== null &&
         (stats.length === 0 ? (
-          <p className="muted">Chưa có dữ liệu thống kê.</p>
+          <p className="autoEmpty">Chưa có dữ liệu thống kê.</p>
         ) : (
           <table className="autoStatsTable">
             <thead>

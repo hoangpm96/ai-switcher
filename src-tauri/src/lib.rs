@@ -227,7 +227,7 @@ fn wake_helper_status() -> bool {
 #[tauri::command]
 fn install_wake_helper(state: State<'_, ManagedState>) -> Result<bool, String> {
     wake::install_helper(&state.store).map_err(|e| e.to_string())?;
-    state.update_wake_schedule(None);
+    state.update_wake_schedule();
     Ok(true)
 }
 

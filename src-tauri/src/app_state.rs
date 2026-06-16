@@ -992,11 +992,13 @@ impl ManagedState {
             if time_changed {
                 entry.last_primed_date = None;
                 entry.last_primed_time = None;
+                // A pending hold-defer from the OLD time must not suppress the NEW time.
+                entry.deferred_until = None;
             }
             let _ = tool_id;
             self.store.save(&data)?;
         }
-        self.update_wake_schedule(None);
+        self.update_wake_schedule();
         self.snapshot()
     }
 
@@ -1023,11 +1025,12 @@ impl ManagedState {
                 if time_changed {
                     entry.last_primed_date = None;
                     entry.last_primed_time = None;
+                    entry.deferred_until = None;
                 }
             }
             self.store.save(&data)?;
         }
-        self.update_wake_schedule(None);
+        self.update_wake_schedule();
         self.snapshot()
     }
 
@@ -1038,27 +1041,31 @@ impl ManagedState {
 
     /// Recompute the next pmset wake (earliest upcoming prime time, minus the lead) and write it to
     /// the helper's request file. No-op (clears the wake) if the helper isn't installed or nothing
-    /// is scheduled. Safe to call after any schedule change. `hold_until` lets a deferred prime ask
-    /// for a wake right after the old window ends.
-    pub fn update_wake_schedule(&self, hold_until: Option<chrono::DateTime<chrono::Local>>) {
+    /// is scheduled. Safe to call after any schedule change. Derives the wake from persisted state
+    /// (each account's anchor time + any pending hold-defer), so it's correct no matter which path
+    /// triggers the recompute.
+    pub fn update_wake_schedule(&self) {
         if !crate::wake::helper_installed() {
             return; // milestone-1 behavior: rely on the app being awake
         }
-        let next = self.next_wake_time(hold_until);
+        let next = self.next_wake_time();
         let _ = crate::wake::write_wake_request(&self.store, next);
     }
 
     /// The earliest moment the Mac should wake: min over enabled accounts of (today/tomorrow's
-    /// prime time − lead), combined with any `hold_until` (a deferred prime's retarget). Returns
-    /// None if nothing is scheduled.
-    fn next_wake_time(
-        &self,
-        hold_until: Option<chrono::DateTime<chrono::Local>>,
-    ) -> Option<chrono::DateTime<chrono::Local>> {
+    /// prime time − lead) AND any account's pending hold-defer (`deferred_until`, when a prime was
+    /// held until the old window ends). Returns None if nothing is scheduled.
+    fn next_wake_time(&self) -> Option<chrono::DateTime<chrono::Local>> {
         use chrono::TimeZone;
         let data = self.data.lock().ok()?;
         let now = chrono::Local::now();
-        let mut earliest: Option<chrono::DateTime<chrono::Local>> = hold_until;
+        let mut earliest: Option<chrono::DateTime<chrono::Local>> = None;
+        let mut consider = |candidate: chrono::DateTime<chrono::Local>| {
+            earliest = Some(match earliest {
+                Some(current) if current <= candidate => current,
+                _ => candidate,
+            });
+        };
         for account in &data.accounts {
             let Some(setting) = data.auto_prime.get(&account.id) else {
                 continue;
@@ -1067,6 +1074,15 @@ impl ManagedState {
                 || !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some())
             {
                 continue;
+            }
+            // A pending hold-defer: wake right at the defer instant (old window just ended).
+            if let Some(until) = &setting.deferred_until {
+                if let Ok(t) = chrono::DateTime::parse_from_rfc3339(until) {
+                    let local = t.with_timezone(&chrono::Local);
+                    if local > now {
+                        consider(local);
+                    }
+                }
             }
             let Some((h, m)) = parse_hhmm(&setting.time) else {
                 continue;
@@ -1079,11 +1095,7 @@ impl ManagedState {
             if target <= now {
                 target += chrono::Duration::days(1);
             }
-            let wake = target - chrono::Duration::minutes(crate::wake::WAKE_LEAD_MIN);
-            earliest = Some(match earliest {
-                Some(current) if current <= wake => current,
-                _ => wake,
-            });
+            consider(target - chrono::Duration::minutes(crate::wake::WAKE_LEAD_MIN));
         }
         // Never schedule a wake in the past.
         earliest.filter(|t| *t > now)
@@ -1487,18 +1499,15 @@ impl ManagedState {
             // On success, refresh the displayed quota right away + recompute the next wake.
             PrimeOutcome::Success { .. } => {
                 let _ = self.refresh_single_account(tool_id, account_id, app);
-                self.update_wake_schedule(None);
+                self.update_wake_schedule();
                 if let Some(app) = app {
                     let _ = app.emit("auto-prime-changed", ());
                 }
             }
-            // Held because the old window is still active → ask the Mac to wake again right after
-            // it ends (reset_at + 5'), so a deferred prime fires promptly even from sleep.
-            PrimeOutcome::Hold { reset_at } => {
-                let retarget = chrono::DateTime::parse_from_rfc3339(reset_at)
-                    .ok()
-                    .map(|t| t.with_timezone(&chrono::Local) + chrono::Duration::minutes(5));
-                self.update_wake_schedule(retarget);
+            // Held: `deferred_until` was just persisted above (= reset_at + 5'). Recompute the wake
+            // so the Mac wakes right after the old window ends — next_wake_time folds it in.
+            PrimeOutcome::Hold { .. } => {
+                self.update_wake_schedule();
             }
             _ => {}
         }

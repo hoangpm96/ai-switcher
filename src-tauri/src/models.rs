@@ -468,8 +468,8 @@ pub struct AutoPrimeSetting {
     /// The next time the current 5h window ends, the account is primed once, then this clears.
     #[serde(default)]
     pub extend_requested: bool,
-    /// Local date (`YYYY-MM-DD`) the user was last reminded the window is about to end, so the
-    /// app prompts at most once per window-ending per day.
+    /// The window's `reset_at` (ISO) the user was last reminded about, so the app prompts at most
+    /// once per window-ending (a new window has a different reset_at → prompts again).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extend_reminded_reset: Option<String>,
     /// When true, the app auto-extends without asking: as the window nears its end it sets
