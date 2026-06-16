@@ -1259,13 +1259,13 @@ impl ManagedState {
                     let default_dir = resolved_default_config_dir(&data, &account.tool_id);
                     let config_dir =
                         account_config_dir_with_default(&self.store, account, &default_dir);
-                    let claude_binary = configured_binary_path(&data, &account.tool_id);
+                    let binary = configured_binary_path(&data, &account.tool_id);
                     Some(PrimeJob {
                         tool_id: account.tool_id.clone(),
                         account_id: account.id.clone(),
                         account_name: account.name.clone(),
                         config_dir,
-                        claude_binary,
+                        binary,
                         is_extend: extend_due && !scheduled_due,
                     })
                 })
@@ -1279,7 +1279,7 @@ impl ManagedState {
             let outcome = crate::prime::prime_account(
                 &job.tool_id,
                 &job.config_dir,
-                job.claude_binary.as_deref(),
+                job.binary.as_deref(),
                 std::thread::sleep,
             );
             self.record_prime_outcome(job, &outcome, late, app);
@@ -2523,7 +2523,8 @@ struct PrimeJob {
     account_id: String,
     account_name: String,
     config_dir: std::path::PathBuf,
-    claude_binary: Option<std::path::PathBuf>,
+    /// The account's resolved CLI path (claude/codex), used to prime via the CLI when available.
+    binary: Option<std::path::PathBuf>,
     /// True when this job was triggered by an on-demand extend request (mechanism 2) rather than
     /// the scheduled time — used to clear the request on success.
     is_extend: bool,

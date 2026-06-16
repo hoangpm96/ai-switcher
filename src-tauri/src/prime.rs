@@ -51,15 +51,17 @@ pub fn is_prime_eligible(tool_id: &ToolId, has_api_provider: bool) -> bool {
 }
 
 /// Run one full prime attempt for an account. Blocking — the caller runs it on a worker thread.
-/// `sleeper` is invoked for retry delays so tests can run without real waiting.
+/// `sleeper` is invoked for retry delays so tests can run without real waiting. `binary` is the
+/// account's resolved CLI path (claude/codex) — used to prime via the CLI (preferred) and to
+/// refresh Claude's token; None falls back to the HTTP path.
 pub fn prime_account(
     tool_id: &ToolId,
     config_dir: &Path,
-    claude_binary: Option<&Path>,
+    binary: Option<&Path>,
     mut sleeper: impl FnMut(Duration),
 ) -> PrimeOutcome {
     // D1 — token must be valid.
-    if read_token(tool_id, config_dir, claude_binary).is_none() {
+    if read_token(tool_id, config_dir, binary).is_none() {
         return PrimeOutcome::SkipNoToken;
     }
 
@@ -78,7 +80,7 @@ pub fn prime_account(
     let mut last_reason = String::new();
     let mut sent = false;
     for attempt in 1..=SEND_MAX_ATTEMPTS {
-        match send_hi(tool_id, config_dir, claude_binary) {
+        match send_hi(tool_id, config_dir, binary) {
             Ok(()) => {
                 sent = true;
                 break;
@@ -114,16 +116,70 @@ pub fn prime_account(
     PrimeOutcome::FailUnconfirmed
 }
 
-fn read_token(tool_id: &ToolId, config_dir: &Path, claude_binary: Option<&Path>) -> Option<String> {
+fn read_token(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Option<String> {
     match tool_id {
-        ToolId::Claude => quota::claude_oauth_token_fresh(config_dir, claude_binary),
+        ToolId::Claude => quota::claude_oauth_token_fresh(config_dir, binary),
         ToolId::Codex => quota::codex_access_token_fresh(config_dir),
         ToolId::Antigravity => None,
     }
 }
 
-/// POST a minimal "hi". Returns Ok(()) on a 2xx, Err(reason) otherwise (network / non-2xx).
-fn send_hi(tool_id: &ToolId, config_dir: &Path, claude_binary: Option<&Path>) -> Result<(), String> {
+/// Send a minimal "hi" to open a fresh window. Prefer the account's own CLI (`claude -p` /
+/// `codex exec`) — it refreshes its own token and uses the provider's exact endpoint/model, which
+/// is far more robust against token expiry (the 401 the user hit) and provider changes. Fall back
+/// to a direct HTTP call only when no CLI binary is configured.
+fn send_hi(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Result<(), String> {
+    if let Some(binary) = binary {
+        match send_hi_cli(tool_id, config_dir, binary) {
+            Ok(()) => return Ok(()),
+            // CLI binary exists but the run failed (not a "missing binary"): surface that error
+            // rather than silently masking it with an HTTP attempt that shares the same auth.
+            Err(reason) => return Err(reason),
+        }
+    }
+    send_hi_http(tool_id, config_dir)
+}
+
+/// Prime by running the account's CLI non-interactively, with the account's config dir in the
+/// environment so the CLI uses the right profile/token. Exit 0 = success.
+fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(), String> {
+    use std::process::Command;
+    let mut command = Command::new(binary);
+    match tool_id {
+        ToolId::Claude => {
+            command
+                .args(["-p", "hi", "--max-turns", "1"])
+                .env("CLAUDE_CONFIG_DIR", config_dir);
+        }
+        ToolId::Codex => {
+            command
+                .args(["exec", "hi"])
+                .env("CODEX_HOME", config_dir);
+        }
+        ToolId::Antigravity => return Err("antigravity unsupported".to_string()),
+    }
+    // Don't inherit a TTY; capture output so the subprocess can't block on stdin.
+    let output = command
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("CLI: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        // Keep the reason short for the log; include a tail of stderr if any.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr.trim().lines().last().unwrap_or("").trim();
+        let code = output.status.code().unwrap_or(-1);
+        if tail.is_empty() {
+            Err(format!("CLI exit {code}"))
+        } else {
+            Err(format!("CLI exit {code}: {tail}"))
+        }
+    }
+}
+
+/// POST a minimal "hi" directly. Returns Ok(()) on a 2xx, Err(reason) otherwise.
+fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -131,7 +187,8 @@ fn send_hi(tool_id: &ToolId, config_dir: &Path, claude_binary: Option<&Path>) ->
 
     let response = match tool_id {
         ToolId::Claude => {
-            let token = quota::claude_oauth_token_fresh(config_dir, claude_binary)
+            // No binary here (HTTP fallback only runs when binary is None).
+            let token = quota::claude_oauth_token_fresh(config_dir, None)
                 .ok_or_else(|| "token".to_string())?;
             let version = quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());
             let body = json!({
