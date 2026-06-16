@@ -2295,3 +2295,45 @@ button.danger:hover:not(:disabled) {
   font-size: 12.5px;
   max-width: 62ch;
 }
+
+/* ── Auto Session P2: auto-extend toggle + stats table ────────────── */
+.autoExtendToggle {
+  align-items: center;
+  color: var(--text-3);
+  cursor: pointer;
+  display: flex;
+  font-size: 12px;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.autoExtendToggle input {
+  accent-color: var(--accent);
+  cursor: pointer;
+  height: 14px;
+  width: 14px;
+}
+
+.autoStatsTable {
+  border-collapse: collapse;
+  font-size: 13px;
+  margin-top: 12px;
+  width: 100%;
+}
+
+.autoStatsTable th,
+.autoStatsTable td {
+  border-bottom: 1px solid var(--line);
+  padding: 7px 10px;
+  text-align: left;
+}
+
+.autoStatsTable th {
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+.autoStatsTable td:first-child,
+.autoStatsTable th:first-child {
+  font-variant-numeric: tabular-nums;
+}

@@ -16,9 +16,9 @@ use models::{
     AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, RenameAccountInput, SaveApiGatewayComboInput,
-    ConfirmExtendInput, SetApiGatewayAccountInput, SetAutoPrimeAllInput, SetAutoPrimeInput,
-    SetLauncherInput, SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId,
-    UsageReport,
+    ConfirmExtendInput, SetApiGatewayAccountInput, SetAutoExtendInput, SetAutoPrimeAllInput,
+    SetAutoPrimeInput, SetLauncherInput, SetToolSetupInput, StartApiGatewayInput,
+    SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -198,8 +198,23 @@ fn confirm_extend(
 }
 
 #[tauri::command]
+fn set_auto_extend(
+    state: State<'_, ManagedState>,
+    input: SetAutoExtendInput,
+) -> Result<AppSnapshot, String> {
+    state
+        .set_auto_extend(input.tool_id, input.account_id, input.enabled)
+        .map_err(display_error)
+}
+
+#[tauri::command]
 fn get_auto_prime_log(state: State<'_, ManagedState>) -> String {
     state.auto_prime_log()
+}
+
+#[tauri::command]
+fn get_auto_prime_stats(state: State<'_, ManagedState>) -> Vec<models::AutoPrimeDayStat> {
+    state.auto_prime_stats(14)
 }
 
 /// Whether the pmset wake helper LaunchDaemon is installed (so the Mac can wake itself to prime).
@@ -406,7 +421,9 @@ pub fn run() {
             set_auto_prime,
             set_auto_prime_all,
             confirm_extend,
+            set_auto_extend,
             get_auto_prime_log,
+            get_auto_prime_stats,
             open_auto_prime_log,
             open_auto_prime_log_folder,
             wake_helper_status,

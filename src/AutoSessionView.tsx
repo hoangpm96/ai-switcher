@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlarmClock, FileText, FolderOpen, Loader2, Moon } from "lucide-react";
+import { AlarmClock, BarChart3, FileText, FolderOpen, Loader2, Moon } from "lucide-react";
 import { api } from "./tauri";
-import type { Account, AppSnapshot, ToolId } from "./types";
+import type { Account, AppSnapshot, AutoPrimeDayStat, ToolId } from "./types";
 
 const PRIME_TOOLS: ToolId[] = ["claude", "codex"];
 
@@ -40,10 +40,36 @@ export function AutoSessionView({
   const [loadingLog, setLoadingLog] = useState(false);
   const [wakeHelper, setWakeHelper] = useState<boolean | null>(null);
   const [wakeBusy, setWakeBusy] = useState(false);
+  const [stats, setStats] = useState<AutoPrimeDayStat[] | null>(null);
+  const [loadingStats, setLoadingStats] = useState(false);
 
   useEffect(() => {
     void api.wakeHelperStatus().then(setWakeHelper).catch(() => setWakeHelper(false));
   }, []);
+
+  async function viewStats() {
+    setLoadingStats(true);
+    try {
+      setStats(await api.getAutoPrimeStats());
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setLoadingStats(false);
+    }
+  }
+
+  async function toggleAutoExtend(account: Account, enabled: boolean) {
+    try {
+      const next = await api.setAutoExtend({
+        toolId: account.toolId,
+        accountId: account.id,
+        enabled,
+      });
+      setSnapshot(next);
+    } catch (e) {
+      notify(String(e), "error");
+    }
+  }
 
   async function toggleWakeHelper() {
     setWakeBusy(true);
@@ -222,6 +248,14 @@ export function AutoSessionView({
                   </span>
                   <span>{resultLabel(setting?.lastResult)}</span>
                 </div>
+                <label className="autoExtendToggle" title="Khi sắp hết phiên, tự gia hạn không cần hỏi">
+                  <input
+                    type="checkbox"
+                    checked={setting?.autoExtend ?? false}
+                    onChange={(e) => void toggleAutoExtend(account, e.target.checked)}
+                  />
+                  <span>Tự gia hạn (không hỏi)</span>
+                </label>
               </div>
             );
           })}
@@ -232,6 +266,9 @@ export function AutoSessionView({
         <button onClick={() => void viewLog()} disabled={loadingLog}>
           {loadingLog ? <Loader2 className="spin" size={15} /> : <FileText size={15} />} Xem log
         </button>
+        <button onClick={() => void viewStats()} disabled={loadingStats}>
+          {loadingStats ? <Loader2 className="spin" size={15} /> : <BarChart3 size={15} />} Thống kê
+        </button>
         <button onClick={() => void api.openAutoPrimeLog().catch((e) => notify(String(e), "error"))}>
           <FileText size={15} /> Mở log
         </button>
@@ -241,6 +278,34 @@ export function AutoSessionView({
           <FolderOpen size={15} /> Mở thư mục log
         </button>
       </div>
+
+      {stats !== null &&
+        (stats.length === 0 ? (
+          <p className="muted">Chưa có dữ liệu thống kê.</p>
+        ) : (
+          <table className="autoStatsTable">
+            <thead>
+              <tr>
+                <th>Ngày</th>
+                <th>Thành công</th>
+                <th>Thất bại</th>
+                <th>Hoãn</th>
+                <th>Bỏ qua</th>
+              </tr>
+            </thead>
+            <tbody>
+              {stats.map((d) => (
+                <tr key={d.date}>
+                  <td>{d.date}</td>
+                  <td>{d.success}</td>
+                  <td>{d.failed}</td>
+                  <td>{d.hold}</td>
+                  <td>{d.skip}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ))}
 
       {log !== null && (
         <pre className="autoLog">{log.trim() ? log : "Chưa có hoạt động nào được ghi."}</pre>

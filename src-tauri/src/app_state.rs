@@ -1089,6 +1089,64 @@ impl ManagedState {
         earliest.filter(|t| *t > now)
     }
 
+    /// Per-account auto-extend toggle: when on, the app extends without asking.
+    pub fn set_auto_extend(
+        &self,
+        tool_id: ToolId,
+        account_id: String,
+        enabled: bool,
+    ) -> Result<AppSnapshot> {
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            if !prime_eligible_in_state(&data, &tool_id, &account_id) {
+                anyhow::bail!("Tài khoản này không hỗ trợ auto prime");
+            }
+            data.auto_prime.entry(account_id).or_default().auto_extend = enabled;
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    /// Tally auto-prime outcomes per local day from the activity log, newest day first, capped to
+    /// the most recent `max_days`. Pure read of the log file; no state needed.
+    pub fn auto_prime_stats(&self, max_days: usize) -> Vec<crate::models::AutoPrimeDayStat> {
+        use crate::models::AutoPrimeDayStat;
+        use std::collections::BTreeMap;
+        let log = self.auto_prime_log();
+        let mut by_day: BTreeMap<String, AutoPrimeDayStat> = BTreeMap::new();
+        for line in log.lines() {
+            // Lines look like: `[YYYY-MM-DD HH:MM:SS] <Tool> · account "X" — STATUS: ...`
+            let Some(date) = line
+                .strip_prefix('[')
+                .and_then(|rest| rest.get(0..10))
+                .filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-')
+            else {
+                continue;
+            };
+            let entry = by_day.entry(date.to_string()).or_insert_with(|| AutoPrimeDayStat {
+                date: date.to_string(),
+                ..Default::default()
+            });
+            // Classify by the marker the wording uses (see brainstorm Mục 7.3).
+            if line.contains("— SUCCESS") {
+                entry.success += 1;
+            } else if line.contains("— FAIL") {
+                entry.failed += 1;
+            } else if line.contains("— HOÃN") {
+                entry.hold += 1;
+            } else if line.contains("— SKIP") {
+                entry.skip += 1;
+            }
+        }
+        let mut days: Vec<AutoPrimeDayStat> = by_day.into_values().collect();
+        days.sort_by(|a, b| b.date.cmp(&a.date)); // newest first
+        days.truncate(max_days);
+        days
+    }
+
     /// On-demand extend (mechanism 2): record the user's answer to the "extend?" prompt.
     /// Accept → prime once the current window ends. Dismiss → clear the request.
     pub fn confirm_extend(
@@ -1117,6 +1175,7 @@ impl ManagedState {
     /// notification + flags the account so the UI shows an "extend?" button.
     pub fn check_extend_reminders(&self, app: Option<&AppHandle>) {
         let mut to_remind: Vec<(String, String)> = Vec::new(); // (tool_label, account_name)
+        let mut auto_extended: Vec<(String, String)> = Vec::new(); // accepted automatically
         let mut no_response: Vec<String> = Vec::new(); // log lines
         let mut changed = false;
         {
@@ -1144,15 +1203,25 @@ impl ManagedState {
                 let entry = data.auto_prime.entry(account_id).or_default();
 
                 if (0..=EXTEND_THRESHOLD_MIN).contains(&mins) {
-                    // Window ending soon: prompt once per this window-ending, unless already accepted.
+                    // Window ending soon. Already accepted (or already handled this window) → skip.
                     if entry.extend_reminded_reset.as_deref() == Some(reset_at.as_str())
                         || entry.extend_requested
                     {
                         continue;
                     }
-                    entry.extend_reminded_reset = Some(reset_at.clone());
-                    changed = true;
-                    to_remind.push((tool_label, account_name));
+                    if entry.auto_extend {
+                        // Auto-extend ON: accept on the user's behalf, no prompt. Mark the window
+                        // handled so the "no response" path below doesn't also fire.
+                        entry.extend_requested = true;
+                        entry.extend_reminded_reset = Some(reset_at.clone());
+                        changed = true;
+                        auto_extended.push((tool_label, account_name));
+                    } else {
+                        // Default: prompt once per this window-ending.
+                        entry.extend_reminded_reset = Some(reset_at.clone());
+                        changed = true;
+                        to_remind.push((tool_label, account_name));
+                    }
                 } else if mins < 0 {
                     // Window has ended. If we reminded for THIS window and the user never accepted,
                     // log the "no response" note once, then clear the reminder.
@@ -1173,6 +1242,11 @@ impl ManagedState {
         }
         for line in &no_response {
             self.append_prime_log(line);
+        }
+        for (tool_label, account_name) in &auto_extended {
+            self.append_prime_log(&format!(
+                "{tool_label} · account \"{account_name}\" — auto-extend BẬT: sẽ tự mở phiên mới khi phiên cũ hết"
+            ));
         }
         if let Some(app) = app {
             for (tool_label, account_name) in &to_remind {

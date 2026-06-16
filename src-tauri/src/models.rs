@@ -472,6 +472,11 @@ pub struct AutoPrimeSetting {
     /// app prompts at most once per window-ending per day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extend_reminded_reset: Option<String>,
+    /// When true, the app auto-extends without asking: as the window nears its end it sets
+    /// `extend_requested` itself instead of prompting. Default false (the brainstorm default is
+    /// to ASK). A convenience for days the user doesn't want to confirm each time.
+    #[serde(default)]
+    pub auto_extend: bool,
 }
 
 impl Default for AutoPrimeSetting {
@@ -485,8 +490,21 @@ impl Default for AutoPrimeSetting {
             last_attempt_at: None,
             extend_requested: false,
             extend_reminded_reset: None,
+            auto_extend: false,
         }
     }
+}
+
+/// One day's tally of auto-prime outcomes, parsed from the activity log for the stats view.
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoPrimeDayStat {
+    /// Local date `YYYY-MM-DD`.
+    pub date: String,
+    pub success: u32,
+    pub failed: u32,
+    pub hold: u32,
+    pub skip: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -514,6 +532,15 @@ pub struct ConfirmExtendInput {
     pub account_id: String,
     /// true = user accepted "extend?"; false = user dismissed it.
     pub accept: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAutoExtendInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    /// true = auto-extend without asking; false = ask each time (default).
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

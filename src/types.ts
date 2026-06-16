@@ -174,6 +174,16 @@ export interface AutoPrimeSetting {
   extendRequested?: boolean;
   /** reset_at the user was last reminded for (so the "extend?" button shows). */
   extendRemindedReset?: string | null;
+  /** Auto-extend without asking (default false = ask each time). */
+  autoExtend?: boolean;
+}
+
+export interface AutoPrimeDayStat {
+  date: string;
+  success: number;
+  failed: number;
+  hold: number;
+  skip: number;
 }
 
 export type DetectionSource = "env" | "default" | "path" | "appManaged" | "manual" | "fallback";
@@ -288,6 +298,13 @@ export interface ConfirmExtendInput {
   accountId: string;
   /** true = accept "extend?", false = dismiss. */
   accept: boolean;
+}
+
+export interface SetAutoExtendInput {
+  toolId: ToolId;
+  accountId: string;
+  /** true = auto-extend without asking; false = ask each time (default). */
+  enabled: boolean;
 }
 
 export interface StartApiGatewayInput {
