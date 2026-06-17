@@ -16,9 +16,9 @@ use models::{
     AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, RenameAccountInput, SaveApiGatewayComboInput,
-    ConfirmExtendInput, SetApiGatewayAccountInput, SetAutoExtendInput, SetAutoPrimeAllInput,
-    SetAutoPrimeInput, SetLauncherInput, SetToolSetupInput, StartApiGatewayInput,
-    SwitchAccountInput, ToolId, UsageReport,
+    ConfirmExtendInput, PrimeNowInput, SetApiGatewayAccountInput, SetAutoExtendInput,
+    SetAutoPrimeAllInput, SetAutoPrimeInput, SetLauncherInput, SetToolSetupInput,
+    StartApiGatewayInput, SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -205,6 +205,20 @@ fn set_auto_extend(
     state
         .set_auto_extend(input.tool_id, input.account_id, input.enabled)
         .map_err(display_error)
+}
+
+/// On-demand "Prime ngay": open a fresh 5h window for one account right now. Runs on a blocking
+/// worker (the prime can take tens of seconds) and returns a short status message for a UI toast.
+#[tauri::command]
+async fn prime_now(app: tauri::AppHandle, input: PrimeNowInput) -> Result<String, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app2.state::<ManagedState>()
+            .prime_now(input.tool_id, input.account_id, Some(&app2))
+            .map_err(display_error)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -422,6 +436,7 @@ pub fn run() {
             set_auto_prime_all,
             confirm_extend,
             set_auto_extend,
+            prime_now,
             get_auto_prime_log,
             get_auto_prime_stats,
             open_auto_prime_log,

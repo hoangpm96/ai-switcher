@@ -68,7 +68,8 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
         }
     }
 
-    let token = claude_oauth_token_fresh(config_dir, None)
+    let binary = crate::tools::command_path("claude");
+    let token = claude_oauth_token_fresh(config_dir, binary.as_deref())
         .context("couldn't get Claude's OAuth token")?;
     let version = claude_version().unwrap_or_else(|| "0.0.0".to_string());
     let user_agent = format!("claude-code/{version}");
@@ -160,7 +161,16 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path, binary: Option<&Path>)
         // Run `claude auth status` to trigger a token refresh, but never let it hang the caller
         // (it may stall on network or an interactive prompt). Spawn detached output + kill on a
         // hard deadline.
-        let mut command = Command::new(binary.unwrap_or_else(|| Path::new("claude")));
+        //
+        // Resolve the binary's full path: a GUI .app launched from Finder/Dock has a minimal PATH
+        // (typically just /usr/bin:/bin), so a bare `Command::new("claude")` fails to spawn and the
+        // refresh is silently skipped — leaving an expired token that 401s. `command_path` scans the
+        // usual install dirs (homebrew, npm-global, ~/.local/bin) the same way `claude_version` does.
+        let resolved = binary
+            .map(Path::to_path_buf)
+            .or_else(|| crate::tools::command_path("claude"))
+            .unwrap_or_else(|| PathBuf::from("claude"));
+        let mut command = Command::new(&resolved);
         command
             .args(["auth", "status", "--json"])
             .env("CLAUDE_CONFIG_DIR", config_dir)

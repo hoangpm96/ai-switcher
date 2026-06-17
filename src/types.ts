@@ -311,6 +311,11 @@ export interface SetAutoExtendInput {
   enabled: boolean;
 }
 
+export interface PrimeNowInput {
+  toolId: ToolId;
+  accountId: string;
+}
+
 export interface StartApiGatewayInput {
   bindHost: string;
   port: number;

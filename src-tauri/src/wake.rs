@@ -18,8 +18,12 @@ use std::path::Path;
 pub const HELPER_LABEL: &str = "dev.hoangphan.ai-account-switcher.wake-helper";
 const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.hoangphan.ai-account-switcher.wake-helper.plist";
 
-/// Wake the Mac this many minutes before the prime time (brainstorm: T − 5 min).
-pub const WAKE_LEAD_MIN: i64 = 5;
+/// Wake the Mac this many minutes before the prime time. The brainstorm specified 5 min, but a
+/// pmset wake leaves only a short awake window before macOS idle-sleeps again — too tight when the
+/// prime has to wait out the tail of the old window or retry a stalled CLI. 10 min gives the
+/// scheduler room; `caffeinate` (see `prime::send_hi_cli`) then holds the Mac awake while a prime
+/// is actually in flight so it can't sleep mid-attempt.
+pub const WAKE_LEAD_MIN: i64 = 10;
 
 /// The shell helper run by the LaunchDaemon as root. Reads the request file (one line:
 /// `MM/dd/yy HH:mm:ss`, local time) and schedules a single wake. An empty/missing file clears

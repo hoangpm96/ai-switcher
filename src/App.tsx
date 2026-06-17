@@ -29,6 +29,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./tauri";
 import { UsageView } from "./UsageView";
@@ -160,6 +161,67 @@ export function App() {
     });
     return () => {
       void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Auto-refresh real quota only while the app window is FOCUSED. Losing focus (typing in another
+  // app, even if this window is still visible) stops the polling; refocusing refreshes immediately
+  // and resumes. `refresh_tool` fetches live usage; an `inFlight` guard coalesces overlapping
+  // refreshes and the 60s per-account backend cache absorbs the rest, so fast focus toggling can't
+  // hammer the provider's usage endpoint.
+  useEffect(() => {
+    let timer: number | undefined;
+    let cancelled = false; // set on cleanup: blocks any async callback that resolves post-unmount
+    let inFlight = false; // skip a new tick while the previous refresh pair is still running
+    let unlisten: (() => void) | undefined;
+
+    const tick = () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      Promise.allSettled([
+        api.refreshTool("claude").then(setSnapshot),
+        api.refreshTool("codex").then(setSnapshot),
+      ]).finally(() => {
+        inFlight = false;
+      });
+    };
+    const start = () => {
+      if (cancelled || timer !== undefined) return;
+      tick(); // refresh right away on (re)gaining focus
+      timer = window.setInterval(tick, 150_000);
+    };
+    const stop = () => {
+      if (timer !== undefined) {
+        window.clearInterval(timer);
+        timer = undefined;
+      }
+    };
+
+    // Register the focus listener BEFORE reading the current focus, so we can't miss a blur that
+    // happens between the isFocused() read and the listener being installed.
+    const appWindow = getCurrentWindow();
+    void appWindow
+      .onFocusChanged(({ payload: focused }) => {
+        if (cancelled) return;
+        if (focused) start();
+        else stop();
+      })
+      .then((fn) => {
+        if (cancelled) {
+          fn(); // effect already cleaned up while we were registering — unlisten immediately
+          return;
+        }
+        unlisten = fn;
+        // Now that the listener is live, sync to the current focus state.
+        void appWindow.isFocused().then((focused) => {
+          if (!cancelled && focused) start();
+        });
+      });
+
+    return () => {
+      cancelled = true;
+      stop();
+      unlisten?.();
     };
   }, []);
 
@@ -579,6 +641,22 @@ export function App() {
                         }),
                       )
                     }
+                    onPrimeNow={async () => {
+                      setBusy(`prime:${account.id}`);
+                      setError(null);
+                      try {
+                        const msg = await api.primeNow({
+                          toolId: currentTool.id,
+                          accountId: account.id,
+                        });
+                        // The backend emits auto-prime-changed → snapshot re-pulls itself; just toast.
+                        notify(msg, msg.startsWith("Đã mở phiên mới") ? "success" : "error");
+                      } catch (err) {
+                        notify(errorMessage(err), "error");
+                      } finally {
+                        setBusy(null);
+                      }
+                    }}
                     onSwitch={() => switchAccount(currentTool, account)}
                     onRename={() => {
                       setSelectedAccount(account);
@@ -1691,6 +1769,7 @@ function AccountCard({
   busy,
   autoPrime,
   onExtend,
+  onPrimeNow,
   onSwitch,
   onRename,
   onSetLauncher,
@@ -1704,6 +1783,7 @@ function AccountCard({
   busy: string | null;
   autoPrime: AutoPrimeSetting | null;
   onExtend: (accept: boolean) => void;
+  onPrimeNow: () => void;
   onSwitch: () => void;
   onRename: () => void;
   onSetLauncher: () => void;
@@ -1724,8 +1804,10 @@ function AccountCard({
   const primeOn = !!autoPrime?.enabled;
   const resetAt = account.quota?.fiveHour.resetAt ?? null;
   const minsToReset = resetAt ? Math.round((Date.parse(resetAt) - Date.now()) / 60000) : null;
-  // Offer "extend" when the window is about to end (≤30'), the user hasn't already accepted, and
-  // hasn't dismissed the prompt for this same window.
+  // Offer "extend" when the window is about to end (still has time left, ≤30'), the reminder is for
+  // THIS exact window (reset_at match — so it never lingers onto the next window), the user hasn't
+  // already accepted, and hasn't dismissed it. `minsToReset > 0`: once the window hits 0/expired we
+  // stop offering — that window is gone; a fresh one earns its own reminder from the poller.
   const showExtend =
     canPrime &&
     !!autoPrime?.extendRemindedReset &&
@@ -1733,7 +1815,7 @@ function AccountCard({
     !autoPrime.extendRequested &&
     autoPrime.extendDismissedReset !== resetAt &&
     minsToReset !== null &&
-    minsToReset >= 0 &&
+    minsToReset > 0 &&
     minsToReset <= 30;
   const autoStatus = (() => {
     if (!canPrime || !primeOn) return null;
@@ -1741,6 +1823,17 @@ function AccountCard({
     if (autoPrime?.lastResult === "success") return `Auto ${autoPrime.time} · đã prime`;
     return `Auto ${autoPrime?.time}`;
   })();
+  // "Prime ngay": let the user open a new 5h window on demand — for exactly the case where the old
+  // window has KNOWN to have ended and they don't want to drop to a terminal to send a message.
+  // Hidden while a window is still live (priming then only HOLDs), once an extend is already armed
+  // (it'll open the window itself), or when reset state is unknown (quota not loaded / read error —
+  // `resetAt === null`). Compare the raw timestamp (not the rounded `minsToReset`, which rounds a
+  // window with up to 29s left down to 0) so the button only appears once the window has genuinely
+  // passed — the backend's D2 is still the real guard, this just avoids a premature button.
+  const windowEnded = resetAt !== null && Date.parse(resetAt) <= Date.now();
+  const showPrimeNow =
+    canPrime && windowEnded && !needsLogin && !autoPrime?.extendRequested;
+  const primingNow = busy === `prime:${account.id}`;
 
   return (
     <article className={`account ${isActive ? "active" : ""} ${exhausted ? "exhausted" : ""}`}>
@@ -1796,18 +1889,14 @@ function AccountCard({
       )}
 
       {showExtend ? (
-        <div className="extendPrompt">
-          <span>
-            Phiên còn {minsToReset} phút. Mở phiên kế tiếp ngay khi hết để code liền mạch?
-          </span>
-          <div className="extendActions">
-            <button className="primary" onClick={() => onExtend(true)} disabled={busy !== null}>
-              <AlarmClock /> Có
-            </button>
-            <button onClick={() => onExtend(false)} disabled={busy !== null}>
-              Không
-            </button>
-          </div>
+        // One quiet inline line, not a banner with two buttons: "Phiên còn 20' · Gia hạn". Clicking
+        // "Gia hạn" arms the extend; doing nothing just lets the window end (no dismiss button — not
+        // acting IS the decline). Keeps the card calm even when several accounts end at once.
+        <div className="autoStatusLine extendLine">
+          <AlarmClock size={13} /> Phiên còn {minsToReset}′ ·{" "}
+          <button className="linkBtn" onClick={() => onExtend(true)} disabled={busy !== null}>
+            Gia hạn
+          </button>
         </div>
       ) : (
         autoStatus && (
@@ -1815,6 +1904,17 @@ function AccountCard({
             <AlarmClock size={13} /> {autoStatus}
           </div>
         )
+      )}
+
+      {showPrimeNow && (
+        <button
+          className="primeNowBtn"
+          onClick={onPrimeNow}
+          disabled={busy !== null}
+          title="Gửi một tin nhắn tối thiểu để mở phiên 5 giờ mới ngay bây giờ"
+        >
+          {primingNow ? <Loader2 className="spin" size={14} /> : <AlarmClock size={14} />} Prime ngay
+        </button>
       )}
 
       {needsLogin && (

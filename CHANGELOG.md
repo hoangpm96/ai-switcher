@@ -5,6 +5,41 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-18
+
+### Added
+
+- **"Prime ngay" — open a new 5-hour window on demand.** When an account's window has
+  ended, a button on the Claude/Codex card opens the next window right away, so you
+  don't have to drop to a terminal and send a message by hand. A toast reports the
+  result (opened / old window still running / token expired / send failed). A manual
+  attempt is a single fast send (no long retry), and a manual failure never consumes
+  that day's scheduled prime.
+
+### Fixed
+
+- **Auto-extend no longer fires too early.** Previously, when a window had ≤30 minutes
+  left, auto-extend armed immediately and the scheduler retried every minute — the old
+  window was still running, so each attempt only logged "HOÃN", filling the log and
+  often failing right at the boundary. Auto-extend now defers to just after the window
+  actually ends (a small grace absorbs provider clock skew), priming once, cleanly.
+- **Mac self-wake survives the gap before a prime.** The wake lead grew from 5 to 10
+  minutes, and the app now holds the Mac awake (`caffeinate`) both while a prime runs
+  and across the wait between the pmset wake and a deferred prime — so the machine no
+  longer idle-sleeps before the window-ending it woke up for.
+- **Disabling / toggling off auto-extend cancels any already-armed extend**, and the
+  next wake is recomputed, so the Mac doesn't wake for a prime that's no longer going
+  to happen. A scheduled defer left on a disabled account is also cleared.
+- **Token refresh before quota reads now resolves the CLI's full path**, so a GUI launch
+  with a minimal PATH can still refresh an expired Claude token instead of silently
+  skipping it and 401-ing.
+
+### Changed
+
+- **Calmer extend UI.** The window-ending prompt is now one quiet inline line
+  ("Phiên còn 20′ · Gia hạn") instead of an orange two-button banner on every card,
+  and several accounts ending at once collapse into a single notification.
+
 ## [0.4.0] - 2026-06-16
 
 ### Added

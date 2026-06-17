@@ -995,6 +995,12 @@ impl ManagedState {
                 // A pending hold-defer from the OLD time must not suppress the NEW time.
                 entry.deferred_until = None;
             }
+            // Disabling clears a SCHEDULED hold-defer so it can't linger as stale state and suppress
+            // due-collection if the same schedule is re-enabled later. An extend's defer is left
+            // alone (it's governed by extend_requested, not the enabled flag).
+            if !enabled && !entry.extend_requested {
+                entry.deferred_until = None;
+            }
             let _ = tool_id;
             self.store.save(&data)?;
         }
@@ -1025,6 +1031,11 @@ impl ManagedState {
                 if time_changed {
                     entry.last_primed_date = None;
                     entry.last_primed_time = None;
+                    entry.deferred_until = None;
+                }
+                // Same as set_auto_prime: disabling clears a stale scheduled hold-defer (but not an
+                // extend's defer).
+                if !enabled && !entry.extend_requested {
                     entry.deferred_until = None;
                 }
             }
@@ -1070,19 +1081,30 @@ impl ManagedState {
             let Some(setting) = data.auto_prime.get(&account.id) else {
                 continue;
             };
-            if !setting.enabled
-                || !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some())
-            {
+            if !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some()) {
                 continue;
             }
-            // A pending hold-defer: wake right at the defer instant (old window just ended).
-            if let Some(until) = &setting.deferred_until {
-                if let Ok(t) = chrono::DateTime::parse_from_rfc3339(until) {
-                    let local = t.with_timezone(&chrono::Local);
-                    if local > now {
-                        consider(local);
+            // A pending, ACTIONABLE defer (a held prime, or an armed auto-extend waiting for the
+            // window to end) is a commitment the scheduler WILL act on regardless of the daily
+            // `enabled` flag — `run_due_primes` fires `extend_requested` whether or not auto-prime is
+            // enabled. So fold it into the wake REGARDLESS of `enabled`; otherwise an extend armed on
+            // an account with daily auto-prime off would run only if the app happened to be awake,
+            // never waking the Mac for it. `defer_is_actionable` filters out a stale leftover defer
+            // on a disabled account with no extend armed. Wake `lead` minutes early.
+            if defer_is_actionable(&account.tool_id, account.api_provider.is_some(), setting) {
+                if let Some(until) = &setting.deferred_until {
+                    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(until) {
+                        let local = t.with_timezone(&chrono::Local)
+                            - chrono::Duration::minutes(crate::wake::WAKE_LEAD_MIN);
+                        if local > now {
+                            consider(local);
+                        }
                     }
                 }
+            }
+            // The daily scheduled time only matters when auto-prime is enabled for this account.
+            if !setting.enabled {
+                continue;
             }
             let Some((h, m)) = parse_hhmm(&setting.time) else {
                 continue;
@@ -1101,6 +1123,33 @@ impl ManagedState {
         earliest.filter(|t| *t > now)
     }
 
+    /// Minutes until the soonest ACTIONABLE pending defer (held prime or armed extend) that is due
+    /// within the wake-lead window — INCLUDING ones already overdue (negative minutes), so a defer
+    /// that lapsed while we were busy still counts as "there's work here". `None` when no actionable
+    /// defer is in range. Used to (a) decide whether to keep the Mac awake and (b) drive the
+    /// scheduler's wait-and-reprime loop. Capped at `+lead`: a defer further out isn't our concern
+    /// yet (the pmset wake will bring us back ~lead minutes ahead of it).
+    fn soonest_actionable_defer_mins(&self) -> Option<i64> {
+        let data = self.data.lock().ok()?;
+        data.accounts
+            .iter()
+            .filter_map(|account| {
+                let setting = data.auto_prime.get(&account.id)?;
+                if !defer_is_actionable(&account.tool_id, account.api_provider.is_some(), setting) {
+                    return None;
+                }
+                let mins = minutes_until(setting.deferred_until.as_deref()?);
+                // In range = anytime up to `lead` ahead, OR already overdue (negative) but not yet
+                // acted on. The upper bound keeps far-future defers out; there's no lower bound.
+                if mins <= crate::wake::WAKE_LEAD_MIN {
+                    Some(mins)
+                } else {
+                    None
+                }
+            })
+            .min()
+    }
+
     /// Per-account auto-extend toggle: when on, the app extends without asking.
     pub fn set_auto_extend(
         &self,
@@ -1116,9 +1165,21 @@ impl ManagedState {
             if !prime_eligible_in_state(&data, &tool_id, &account_id) {
                 anyhow::bail!("Tài khoản này không hỗ trợ auto prime");
             }
-            data.auto_prime.entry(account_id).or_default().auto_extend = enabled;
+            let entry = data.auto_prime.entry(account_id).or_default();
+            entry.auto_extend = enabled;
+            // Turning auto-extend OFF must also cancel any extend this toggle already armed for the
+            // current window-ending (check_extend_reminders sets extend_requested + deferred_until).
+            // Otherwise the scheduler would still fire the auto-extend the user just disabled.
+            if !enabled {
+                entry.extend_requested = false;
+                entry.deferred_until = None;
+                entry.extend_reminded_reset = None;
+            }
             self.store.save(&data)?;
         }
+        // The cancelled defer may have been the soonest wake — recompute so the Mac doesn't wake for
+        // a prime that's no longer scheduled.
+        self.update_wake_schedule();
         self.snapshot()
     }
 
@@ -1186,6 +1247,11 @@ impl ManagedState {
             entry.extend_requested = accept;
             if accept {
                 entry.extend_dismissed_reset = None;
+                // Defer the prime to just after the window actually ends (same grace as auto-extend),
+                // so accepting mid-window doesn't trigger an immediate attempt that just HOLDs and
+                // logs "HOÃN". If we don't know the current reset_at, fall through with no defer and
+                // let prime_account's D2 HOLD handle it.
+                entry.deferred_until = current_reset.as_deref().map(reset_at_plus_grace);
             } else {
                 // Dismiss: remember it for THIS window so the UI hides the button and the poller
                 // doesn't prompt again for the same window-ending.
@@ -1193,6 +1259,8 @@ impl ManagedState {
             }
             self.store.save(&data)?;
         }
+        // Accepting may have set a defer that's now the soonest wake; recompute so the Mac wakes for it.
+        self.update_wake_schedule();
         self.snapshot()
     }
 
@@ -1201,7 +1269,10 @@ impl ManagedState {
     /// notification + flags the account so the UI shows an "extend?" button.
     pub fn check_extend_reminders(&self, app: Option<&AppHandle>) {
         let mut to_remind: Vec<(String, String)> = Vec::new(); // (tool_label, account_name)
-        let mut auto_extended: Vec<(String, String)> = Vec::new(); // accepted automatically
+        // (tool_label, account_name, deferred_until ISO): accepted automatically. The defer instant
+        // is the reset boundary OR the daily anchor (when the schedule governs the next window) —
+        // carried so the log can say which it is.
+        let mut auto_extended: Vec<(String, String, String)> = Vec::new();
         let mut no_response: Vec<String> = Vec::new(); // log lines
         let mut changed = false;
         {
@@ -1238,12 +1309,25 @@ impl ManagedState {
                         continue;
                     }
                     if entry.auto_extend {
-                        // Auto-extend ON: accept on the user's behalf, no prompt. Mark the window
-                        // handled so the "no response" path below doesn't also fire.
+                        // Auto-extend ON: accept on the user's behalf, no prompt. But DON'T prime
+                        // now — the old window is still running (mins ≥ 0), so a prime would land
+                        // inside it and HOLD, spamming "HOÃN" every tick for the whole final 30'.
+                        // Instead, arm the request AND defer it: the scheduler skips the account
+                        // (deferred_until is still future) until the defer instant, then primes once.
+                        //
+                        // Defer target: prefer the daily anchor if it falls inside the window this
+                        // extend would open — the schedule, not the drifting boundary, should set
+                        // when the fresh 5h starts (issue #7: a 3am extend must not steal the 11:00
+                        // boundary the user actually wants). If the anchor doesn't apply, fall back
+                        // to just AFTER the reset instant; the grace past reset_at absorbs provider
+                        // clock skew (priming a beat early reads the old window as still-live → HOLD).
                         entry.extend_requested = true;
+                        let defer = scheduled_anchor_within_window(&reset_at, &entry.time)
+                            .unwrap_or_else(|| reset_at_plus_grace(&reset_at));
+                        entry.deferred_until = Some(defer.clone());
                         entry.extend_reminded_reset = Some(reset_at.clone());
                         changed = true;
-                        auto_extended.push((tool_label, account_name));
+                        auto_extended.push((tool_label, account_name, defer));
                     } else {
                         // Default: prompt once per this window-ending.
                         entry.extend_reminded_reset = Some(reset_at.clone());
@@ -1271,21 +1355,48 @@ impl ManagedState {
         for line in &no_response {
             self.append_prime_log(line);
         }
-        for (tool_label, account_name) in &auto_extended {
+        for (tool_label, account_name, defer) in &auto_extended {
             self.append_prime_log(&format!(
-                "{tool_label} · account \"{account_name}\" — auto-extend BẬT: sẽ tự mở phiên mới khi phiên cũ hết"
+                "{tool_label} · account \"{account_name}\" — auto-extend BẬT: sẽ tự mở phiên mới lúc {at} (theo lịch nếu lịch rơi trong 5h tới, không thì ngay khi phiên cũ hết)",
+                at = local_hhmm_from_iso(defer)
             ));
         }
+        // An armed auto-extend just set a new `deferred_until` (= reset_at + grace). That instant may
+        // be the soonest upcoming prime, so the Mac must be told to wake for it — otherwise it could
+        // stay asleep through the window-ending and the extend would only fire late ("primed muộn").
+        if !auto_extended.is_empty() {
+            self.update_wake_schedule();
+        }
         if let Some(app) = app {
-            for (tool_label, account_name) in &to_remind {
-                let _ = app
-                    .notification()
-                    .builder()
-                    .title("Phiên sắp hết")
-                    .body(format!(
-                        "Phiên {tool_label} account \"{account_name}\" còn {EXTEND_THRESHOLD_MIN} phút. Mở phiên kế tiếp ngay khi hết để code liền mạch không?"
-                    ))
-                    .show();
+            // Coalesce: when several accounts enter the final 30' together (common after "Apply
+            // all"), fire ONE notification instead of one per account, so the OS isn't spammed.
+            match to_remind.as_slice() {
+                [] => {}
+                [(tool_label, account_name)] => {
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title("Phiên sắp hết")
+                        .body(format!(
+                            "Phiên {tool_label} account \"{account_name}\" còn {EXTEND_THRESHOLD_MIN} phút. Mở app để gia hạn nếu muốn code liền mạch."
+                        ))
+                        .show();
+                }
+                many => {
+                    let names = many
+                        .iter()
+                        .map(|(_, name)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title(format!("{} phiên sắp hết", many.len()))
+                        .body(format!(
+                            "{names} còn ≤{EXTEND_THRESHOLD_MIN} phút. Mở app để gia hạn nếu muốn."
+                        ))
+                        .show();
+                }
             }
             if changed {
                 let _ = app.emit("auto-prime-changed", ());
@@ -1329,15 +1440,61 @@ impl ManagedState {
         }
         let _guard = ClearOnDrop(&self.priming);
 
+        // Hold the Mac awake for the WHOLE tick — created up front and unconditionally, so it also
+        // covers a defer that the first prime pass itself creates (a Hold sets `deferred_until`
+        // within the lead window). `caffeinate -i` is cheap; if there's nothing to wait for, the
+        // loop below exits immediately and the hold drops (kill + reap) on return.
+        let _awake = CaffeinateHold::active();
+
+        // Prime-then-bridge loop. Each iteration: prime everything due RIGHT NOW (so a scheduled
+        // account whose time just arrived never waits behind another account's not-yet-due defer),
+        // then look at the soonest actionable defer:
+        //   - overdue / due now (mins <= 0): loop again immediately to prime it (this is the case
+        //     Codex flagged — a defer that lapsed *during* the previous prime must not be skipped);
+        //   - still ahead but within the lead window: sleep a short beat (Mac kept awake by the hold)
+        //     and loop, so the new window opens the moment the old one ends, not a tick later;
+        //   - nothing actionable in range: done.
+        // Bounded by a wall-clock deadline (lead window) so a miscomputed/stuck defer can't pin the
+        // scheduler. The `priming` overlap guard keeps concurrent ticks from starting a second batch.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs((crate::wake::WAKE_LEAD_MIN as u64) * 60);
+        let mut last_overdue: Option<i64> = None;
+        loop {
+            self.collect_and_prime_due(late, app);
+            match self.soonest_actionable_defer_mins() {
+                Some(mins) if mins > 0 => {
+                    last_overdue = None;
+                    if std::time::Instant::now() >= deadline {
+                        break; // safety cap — don't wait past the lead window
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                }
+                // Overdue (mins <= 0): the prime pass should have handled it. If the SAME overdue
+                // defer is still here after a pass (collect_and_prime_due couldn't act on it — e.g.
+                // an enabled account whose held defer lapsed but whose daily slot is already consumed
+                // for today, so neither scheduled_due nor extend_due is true), don't spin: a tiny
+                // sleep + one more look, then bail. This avoids a busy-loop on a defer nothing primes.
+                Some(mins) => {
+                    if last_overdue == Some(mins) {
+                        break; // no progress on this overdue defer → stop, let a later tick retry
+                    }
+                    last_overdue = Some(mins);
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Collect the accounts due to prime right now and prime each, sequentially with a short gap.
+    /// "Due" = a scheduled prime whose time has arrived (once/day, enabled) OR an armed extend; an
+    /// account whose `deferred_until` is still in the future is skipped (it isn't due yet).
+    fn collect_and_prime_due(&self, late: bool, app: Option<&AppHandle>) {
         let today = local_today();
         let now_hhmm = local_now_hhmm();
-
-        // Collect due accounts under a brief lock. An account is due when EITHER:
-        //   - scheduled: enabled, eligible, its time has been reached, and it hasn't primed for
-        //     that exact time today (once/day); OR
-        //   - extend: the user accepted "extend?" (mechanism 2) — prime regardless of the time;
-        //     prime_account's D2 will HOLD until the running window ends, so the per-minute tick
-        //     keeps retrying until it actually opens a new window.
         let due: Vec<PrimeJob> = {
             let data = match self.data.lock() {
                 Ok(data) => data,
@@ -1375,7 +1532,11 @@ impl ManagedState {
                         account_name: account.name.clone(),
                         config_dir,
                         binary,
-                        is_extend: extend_due && !scheduled_due,
+                        // An accepted extend request is an extend, even if the daily time also
+                        // happens to have arrived (deferred extends can come due after `time`):
+                        // log it as "gia hạn", not a scheduled prime.
+                        is_extend: extend_due,
+                        manual: false,
                     })
                 })
                 .collect()
@@ -1389,10 +1550,105 @@ impl ManagedState {
                 &job.tool_id,
                 &job.config_dir,
                 job.binary.as_deref(),
+                crate::prime::SEND_MAX_ATTEMPTS,
                 std::thread::sleep,
             );
             self.record_prime_outcome(job, &outcome, late, app);
         }
+    }
+
+    /// Prime ONE account on demand ("Prime ngay" button) — open a fresh 5h window right now instead
+    /// of waiting for the scheduled time or for the app to do it. Used when a window has already
+    /// ended and the user wants the next one started without dropping to a terminal. Shares the
+    /// scheduler's `priming` overlap guard (so it can't run concurrently with a batch) and the same
+    /// `prime_account` flow + outcome recording. Returns a short human message describing what
+    /// happened (success / still-held / failure), surfaced to the UI as a toast.
+    pub fn prime_now(
+        &self,
+        tool_id: ToolId,
+        account_id: String,
+        app: Option<&AppHandle>,
+    ) -> Result<String> {
+        use crate::prime::PrimeOutcome;
+        use std::sync::atomic::Ordering;
+
+        // Build the job under a brief lock; reject early if the account isn't prime-eligible.
+        let job = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let account = data
+                .accounts
+                .iter()
+                .find(|a| a.id == account_id && a.tool_id == tool_id)
+                .ok_or_else(|| anyhow::anyhow!("Không tìm thấy tài khoản"))?;
+            if !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some()) {
+                anyhow::bail!("Tài khoản này không hỗ trợ prime (chỉ Claude/Codex đăng nhập subscription)");
+            }
+            let default_dir = resolved_default_config_dir(&data, &account.tool_id);
+            let config_dir = account_config_dir_with_default(&self.store, account, &default_dir);
+            let binary = configured_binary_path(&data, &account.tool_id);
+            PrimeJob {
+                tool_id: account.tool_id.clone(),
+                account_id: account.id.clone(),
+                account_name: account.name.clone(),
+                config_dir,
+                binary,
+                // Manual prime is its own thing — not a scheduled run, not an extend acceptance.
+                is_extend: false,
+                manual: true,
+            }
+        };
+
+        // Don't run on top of an in-flight scheduler batch (or another manual prime).
+        if self
+            .priming
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            anyhow::bail!("Đang có một lượt prime khác chạy — thử lại sau giây lát.");
+        }
+        struct ClearOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = ClearOnDrop(&self.priming);
+        // Keep the Mac awake for the duration (the prime itself also holds caffeinate; this covers
+        // the whole on-demand op for symmetry).
+        let _awake = CaffeinateHold::active();
+
+        // On-demand prime fails fast: a SINGLE send attempt (no 5×5' backoff that the scheduler
+        // uses), so a button press returns in seconds and the user can just tap again. D4's short
+        // confirm polls (5 × 30s) still run with real sleeps — they're needed to see the new window,
+        // and prime_account's per-attempt CLI timeout bounds the rest.
+        let outcome = crate::prime::prime_account(
+            &job.tool_id,
+            &job.config_dir,
+            job.binary.as_deref(),
+            1,
+            std::thread::sleep,
+        );
+        self.record_prime_outcome(&job, &outcome, false, app);
+
+        Ok(match &outcome {
+            PrimeOutcome::Success { new_reset_at } => {
+                format!("Đã mở phiên mới — reset lúc {}", local_hhmm_from_iso(new_reset_at))
+            }
+            PrimeOutcome::Hold { reset_at } => format!(
+                "Phiên hiện tại chưa hết (còn tới {}). Phiên mới chỉ mở được sau khi phiên cũ kết thúc.",
+                local_hhmm_from_iso(reset_at)
+            ),
+            PrimeOutcome::SkipNoToken => {
+                "Token đã hết hạn — cần đăng nhập lại tài khoản này.".to_string()
+            }
+            PrimeOutcome::FailSend { reason } => format!("Gửi không thành công: {reason}"),
+            PrimeOutcome::FailUnconfirmed => {
+                "Đã gửi nhưng chưa xác nhận được phiên mới. Thử lại sau giây lát.".to_string()
+            }
+        })
     }
 
     /// Persist the per-account result + append the matching log line, and refresh the account's
@@ -1409,6 +1665,7 @@ impl ManagedState {
         let account_id = job.account_id.as_str();
         let account_name = job.account_name.as_str();
         let is_extend = job.is_extend;
+        let is_manual = job.manual;
         let tool_label = tool_id.prime_label();
         let (result, line): (&str, String) = match outcome {
             PrimeOutcome::Success { new_reset_at } => {
@@ -1446,7 +1703,11 @@ impl ManagedState {
             ),
             PrimeOutcome::FailSend { reason } => (
                 "failed",
-                format!("{tool_label} · account \"{account_name}\" — FAIL: gửi lỗi sau 5 lần thử ({reason})"),
+                if is_manual {
+                    format!("{tool_label} · account \"{account_name}\" — FAIL: prime tay gửi lỗi ({reason})")
+                } else {
+                    format!("{tool_label} · account \"{account_name}\" — FAIL: gửi lỗi sau 5 lần thử ({reason})")
+                },
             ),
             PrimeOutcome::FailUnconfirmed => (
                 "failed",
@@ -1459,28 +1720,55 @@ impl ManagedState {
         // up after the full retry budget) consumes today's scheduled attempt so the scheduler does
         // NOT restart a fresh retry batch every minute. HOLD/SKIP are not terminal: HOLD defers,
         // SKIP just waits for a valid token.
+        // Track whether anything user-visible changed, so we only nudge the UI to re-pull when it
+        // matters — a SkipNoToken that repeats every minute (expired token) shouldn't trigger a
+        // reload (and a flash of disabled controls) each time.
+        let mut visible_change = false;
         if let Ok(mut data) = self.data.lock() {
             if let Some(setting) = data.auto_prime.get_mut(account_id) {
+                visible_change = setting.last_result.as_deref() != Some(result);
                 setting.last_result = Some(result.to_string());
                 setting.last_attempt_at = Some(now());
+                let succeeded = matches!(outcome, PrimeOutcome::Success { .. });
                 let terminal = matches!(
                     outcome,
                     PrimeOutcome::Success { .. }
                         | PrimeOutcome::FailUnconfirmed
                         | PrimeOutcome::FailSend { .. }
                 );
-                if terminal {
+                // A manual ("Prime ngay") FAILURE must not consume the day's scheduled attempt — the
+                // user retrying by hand shouldn't disable the automatic run. A manual SUCCESS still
+                // does (a fresh window is open; the scheduled run would be redundant). Scheduler jobs
+                // consume on any terminal outcome (it gave the full retry budget and is done for now).
+                let consume_scheduled = if job.manual { succeeded } else { terminal };
+                if consume_scheduled {
                     setting.last_primed_date = Some(local_today());
                     setting.last_primed_time = Some(setting.time.clone());
+                }
+                // Resolve the extend/defer state only when this attempt actually settled THIS
+                // account's pending request — i.e. a terminal SCHEDULER/extend job, or a manual
+                // SUCCESS. A manual FAILURE must leave any armed auto-extend untouched: the manual
+                // job set is_extend=false and isn't the extend, so clearing here would silently
+                // disarm an extend the user is still waiting on. (`resolve_pending` mirrors
+                // `consume_scheduled`'s manual-fail carve-out, for the extend flags this time.)
+                let resolve_pending = if job.manual { succeeded } else { terminal };
+                if resolve_pending {
                     // The extend request is resolved (opened, or exhausted retries) — clear it so it
-                    // doesn't re-fire next tick.
+                    // doesn't re-fire next tick. Also clear the "reminded for this window" marker:
+                    // it belongs to the window that just ended, and leaving it set is stale state.
+                    // (The UI already hides the prompt via reset_at mismatch, but don't rely on that
+                    // — a fresh window earns a fresh reminder from the poller.)
                     setting.extend_requested = false;
                     setting.deferred_until = None;
+                    setting.extend_reminded_reset = None;
                 }
                 match outcome {
                     // Held: defer re-attempt until just after the old window ends, so we don't
-                    // read quota + log HOÃN every minute.
-                    PrimeOutcome::Hold { reset_at } => {
+                    // read quota + log HOÃN every minute. Skip for a MANUAL prime — it's a one-shot
+                    // (the user taps again if they want), so it must not arm an automatic retry, and
+                    // crucially must not stomp a `deferred_until` an auto-extend already set on this
+                    // account. The manual attempt just reported "Hold" to the user via the toast.
+                    PrimeOutcome::Hold { reset_at } if !job.manual => {
                         setting.deferred_until = chrono::DateTime::parse_from_rfc3339(reset_at)
                             .ok()
                             .map(|t| {
@@ -1488,7 +1776,9 @@ impl ManagedState {
                                     .to_rfc3339()
                             });
                     }
-                    PrimeOutcome::Success { .. } => setting.deferred_until = None,
+                    // Manual success already cleared deferred_until via resolve_pending; a scheduler
+                    // success clears it here.
+                    PrimeOutcome::Success { .. } if !job.manual => setting.deferred_until = None,
                     _ => {}
                 }
             }
@@ -1500,9 +1790,6 @@ impl ManagedState {
             PrimeOutcome::Success { .. } => {
                 let _ = self.refresh_single_account(tool_id, account_id, app);
                 self.update_wake_schedule();
-                if let Some(app) = app {
-                    let _ = app.emit("auto-prime-changed", ());
-                }
             }
             // Held: `deferred_until` was just persisted above (= reset_at + 5'). Recompute the wake
             // so the Mac wakes right after the old window ends — next_wake_time folds it in.
@@ -1510,6 +1797,15 @@ impl ManagedState {
                 self.update_wake_schedule();
             }
             _ => {}
+        }
+        // Nudge the UI to re-pull only when something user-visible changed (new result), on success
+        // (quota just moved), or for a manual prime (the user is watching for the button's result).
+        // This avoids reloading + flashing controls every minute on a repeating SkipNoToken/Hold.
+        let should_emit = visible_change || job.manual || matches!(outcome, PrimeOutcome::Success { .. });
+        if should_emit {
+            if let Some(app) = app {
+                let _ = app.emit("auto-prime-changed", ());
+            }
         }
     }
 
@@ -2643,6 +2939,17 @@ fn now() -> String {
 /// Mechanism 2 prompts to extend when the 5h window has this many minutes (or fewer) left.
 const EXTEND_THRESHOLD_MIN: i64 = 30;
 
+/// Grace past a window's `reset_at` before an armed auto-extend actually primes. The provider's
+/// clock can lag ours by tens of seconds at the boundary, so priming exactly at `reset_at` risks
+/// reading the old window as still-live (→ HOLD → a wasted 5' retry). A small buffer makes the
+/// first attempt land in the new window almost every time.
+const EXTEND_RESET_GRACE_MIN: i64 = 2;
+
+/// Length of a subscription window, in minutes (the "5-hour window"). Used to decide whether the
+/// daily anchor falls inside the window an auto-extend would open — if it does, the schedule (not
+/// the drifting boundary) should set when the fresh window starts.
+const FIVE_HOUR_WINDOW_MIN: i64 = 5 * 60;
+
 /// One unit of work for the prime scheduler.
 struct PrimeJob {
     tool_id: ToolId,
@@ -2654,6 +2961,25 @@ struct PrimeJob {
     /// True when this job was triggered by an on-demand extend request (mechanism 2) rather than
     /// the scheduled time — used to clear the request on success.
     is_extend: bool,
+    /// True when this job came from the "Prime ngay" button. A manual FAILURE must NOT consume the
+    /// day's scheduled prime (the user retrying by hand shouldn't disable the automatic run); only a
+    /// manual SUCCESS does (a fresh window opened — the scheduled run would be redundant).
+    manual: bool,
+}
+
+/// Whether a pending `deferred_until` on this account is something the scheduler will actually act
+/// on — used so the wake calc + the caffeinate wait don't fire on a STALE defer. A defer is
+/// actionable when the account is prime-eligible AND either an extend is armed (`run_due_primes`
+/// fires `extend_requested` regardless of `enabled`) or daily auto-prime is enabled (a held
+/// scheduled prime will retry). A leftover `deferred_until` on a disabled account with no extend
+/// armed is stale and must NOT keep the Mac awake or schedule a wake.
+fn defer_is_actionable(
+    tool_id: &ToolId,
+    has_api_provider: bool,
+    setting: &crate::models::AutoPrimeSetting,
+) -> bool {
+    crate::prime::is_prime_eligible(tool_id, has_api_provider)
+        && (setting.extend_requested || setting.enabled)
 }
 
 /// True if the account exists and is prime-eligible (subscription Claude/Codex).
@@ -2702,6 +3028,92 @@ fn minutes_until(iso: &str) -> i64 {
     }
 }
 
+/// An RAII `caffeinate -i -w <pid>` hold that prevents idle system sleep until dropped. Kept alive
+/// for the duration of one scheduler tick that bridges the wait to a deferred prime, so the Mac
+/// can't idle-sleep in the gap between a pmset wake and the prime. Drop kills + reaps the child (no
+/// zombie); `-w <pid>` self-exits if the app dies before Drop runs (no orphan holding the Mac awake).
+struct CaffeinateHold(Option<std::process::Child>);
+
+impl CaffeinateHold {
+    fn active() -> Self {
+        let child = std::process::Command::new("caffeinate")
+            .args(["-i", "-w", &std::process::id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+        CaffeinateHold(child)
+    }
+}
+
+impl Drop for CaffeinateHold {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// `reset_at` shifted forward by `EXTEND_RESET_GRACE_MIN`, as an ISO 8601 string. Used to defer an
+/// armed auto-extend to just after the window boundary. Returns the input unchanged if unparseable.
+fn reset_at_plus_grace(reset_at: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(reset_at) {
+        Ok(t) => (t.with_timezone(&chrono::Utc)
+            + chrono::Duration::minutes(EXTEND_RESET_GRACE_MIN))
+        .to_rfc3339(),
+        Err(_) => reset_at.to_string(),
+    }
+}
+
+/// When an auto-extend is about to arm, the daily schedule — not the drifting "extend the moment
+/// the old window ends" timing — should govern when the next window opens, IF the anchor falls
+/// inside the window the extend would cover. The schedule is the time the user actually wants their
+/// fresh 5h to start (e.g. 11:00, after waking); auto-extend is only a fallback to keep sessions
+/// rolling. Deferring to the anchor leaves a deliberate gap (no active session between the old
+/// window ending and the anchor) — that's the point: the schedule, not 3am drift, sets the boundary.
+///
+/// Given the old window's `reset_at` (ISO) and the account's daily anchor `time` (`HH:MM`, local),
+/// returns the next occurrence of that anchor as an ISO instant IF it lands strictly after the old
+/// window ends AND within the next 5h (the span the extend's new window would otherwise cover).
+/// Returns `None` otherwise — the anchor already passed before the window ends, or it's more than a
+/// full window away — in which case the caller extends right at the boundary (the old behavior).
+fn scheduled_anchor_within_window(reset_at: &str, time: &str) -> Option<String> {
+    use chrono::TimeZone;
+    let reset = chrono::DateTime::parse_from_rfc3339(reset_at)
+        .ok()?
+        .with_timezone(&chrono::Local);
+    let (h, m) = parse_hhmm(time)?;
+    // First occurrence of HH:MM strictly after the window-ending. An anchor exactly at `reset`
+    // isn't "after" — there'd be no gap to wait out — so today's HH:MM is skipped in that case and
+    // tomorrow's is tried (which will then be >5h away → None → boundary fallback).
+    //
+    // Build each candidate from its CALENDAR date (not `+ Duration::days(1)` on a DateTime): adding
+    // a fixed 24h would drift the wall-clock anchor by ±1h across a DST transition, whereas
+    // re-resolving `date+1` at HH:MM in Local keeps the user's chosen clock time. A DST-ambiguous or
+    // nonexistent local hour (`.single()` → None) just isn't a candidate, so we fall through to None
+    // and the caller extends at the boundary — fine, since this app's target TZ has no DST anyway.
+    //
+    // The anchor of interest is always within 5h of `reset`, so checking today + tomorrow suffices.
+    let reset_date = reset.date_naive();
+    let anchor = [reset_date, reset_date.checked_add_days(chrono::Days::new(1))?]
+        .into_iter()
+        .filter_map(|date| {
+            chrono::Local
+                .from_local_datetime(&date.and_hms_opt(h, m, 0)?)
+                .single()
+        })
+        .find(|dt| *dt > reset)?;
+    // Only prefer the anchor if it's within the 5h the extend's window would cover; past that the
+    // anchor belongs to a later window and the user would sit too long with no session — extend now.
+    if anchor <= reset + chrono::Duration::minutes(FIVE_HOUR_WINDOW_MIN) {
+        Some(anchor.with_timezone(&chrono::Utc).to_rfc3339())
+    } else {
+        None
+    }
+}
+
 /// Render an ISO 8601 instant as local `HH:MM` for log lines. Falls back to the raw string.
 fn local_hhmm_from_iso(iso: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(iso)
@@ -2711,4 +3123,71 @@ fn local_hhmm_from_iso(iso: &str) -> String {
                 .to_string()
         })
         .unwrap_or_else(|_| iso.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, Local, TimeZone};
+
+    /// Build an ISO-8601 (RFC-3339) string for a local instant `offset` from a base, so the tests
+    /// are timezone-independent (the helper interprets the anchor in `Local`).
+    fn local_iso(base: chrono::DateTime<Local>) -> String {
+        base.with_timezone(&chrono::Utc).to_rfc3339()
+    }
+
+    /// The local `HH:MM` `mins` minutes after `base` — the anchor a test wants to target.
+    fn hhmm_after(base: chrono::DateTime<Local>, mins: i64) -> String {
+        (base + Duration::minutes(mins)).format("%H:%M").to_string()
+    }
+
+    /// A fixed, unambiguous local base instant (noon avoids DST midnight edge cases).
+    fn base() -> chrono::DateTime<Local> {
+        Local.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).single().unwrap()
+    }
+
+    #[test]
+    fn anchor_inside_window_is_preferred() {
+        // Window ends at base; anchor is 90 min later (well within 5h) → prefer the anchor.
+        let reset = local_iso(base());
+        let anchor_time = hhmm_after(base(), 90);
+        let got = scheduled_anchor_within_window(&reset, &anchor_time).expect("anchor within 5h");
+        // Fires at the anchor instant, i.e. 90 min after reset.
+        let expected = local_iso(base() + Duration::minutes(90));
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&got).unwrap(),
+            chrono::DateTime::parse_from_rfc3339(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn anchor_just_before_five_hours_is_preferred() {
+        // Anchor 4h59m after the window ends — still inside the 5h the extend would cover.
+        let reset = local_iso(base());
+        let anchor_time = hhmm_after(base(), 5 * 60 - 1);
+        assert!(scheduled_anchor_within_window(&reset, &anchor_time).is_some());
+    }
+
+    #[test]
+    fn anchor_beyond_five_hours_falls_back() {
+        // Anchor 5h01m out → belongs to a later window; don't make the user wait that long.
+        let reset = local_iso(base());
+        let anchor_time = hhmm_after(base(), 5 * 60 + 1);
+        assert!(scheduled_anchor_within_window(&reset, &anchor_time).is_none());
+    }
+
+    #[test]
+    fn anchor_equal_to_reset_rolls_to_next_day() {
+        // Anchor exactly at the window-ending: no gap to wait, so it rolls a full day forward and is
+        // therefore >5h away → None (extend at the boundary now).
+        let reset = local_iso(base());
+        let anchor_time = base().format("%H:%M").to_string();
+        assert!(scheduled_anchor_within_window(&reset, &anchor_time).is_none());
+    }
+
+    #[test]
+    fn invalid_inputs_return_none() {
+        assert!(scheduled_anchor_within_window("not-a-date", "11:00").is_none());
+        assert!(scheduled_anchor_within_window(&local_iso(base()), "99:99").is_none());
+    }
 }

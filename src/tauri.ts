@@ -11,6 +11,7 @@ import type {
   CreateVirtualApiAccountInput,
   AutoPrimeDayStat,
   ConfirmExtendInput,
+  PrimeNowInput,
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
   SetAutoExtendInput,
@@ -212,6 +213,9 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   await new Promise((resolve) => window.setTimeout(resolve, 120));
   if (command === "load_snapshot" || command === "refresh_tool" || command === "set_auto_prime" || command === "set_auto_prime_all" || command === "confirm_extend" || command === "set_auto_extend") {
     return structuredClone(demoSnapshot) as T;
+  }
+  if (command === "prime_now") {
+    return "Đã mở phiên mới — reset lúc 12:00" as T;
   }
   if (command === "get_auto_prime_log") {
     return "" as T;
@@ -471,6 +475,8 @@ export const api = {
     invoke<AppSnapshot>("set_auto_prime_all", { input }),
   confirmExtend: (input: ConfirmExtendInput) => invoke<AppSnapshot>("confirm_extend", { input }),
   setAutoExtend: (input: SetAutoExtendInput) => invoke<AppSnapshot>("set_auto_extend", { input }),
+  /** On-demand prime; resolves to a short status message (the snapshot refreshes via event). */
+  primeNow: (input: PrimeNowInput) => invoke<string>("prime_now", { input }),
   getAutoPrimeLog: () => invoke<string>("get_auto_prime_log"),
   getAutoPrimeStats: () => invoke<AutoPrimeDayStat[]>("get_auto_prime_stats"),
   openAutoPrimeLog: () => invoke<void>("open_auto_prime_log"),

@@ -2277,26 +2277,56 @@ button.danger:hover:not(:disabled) {
   margin-top: 8px;
 }
 
-.extendPrompt {
+/* "Phiên còn 20′ · Gia hạn" — a quiet inline status line with an embedded link, in the accent
+   colour so it reads as actionable but doesn't shout like the old orange banner. */
+.extendLine {
+  color: var(--accent);
+}
+
+.linkBtn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  padding: 0;
+  text-decoration: underline;
+}
+
+.linkBtn:hover:not(:disabled) {
+  opacity: 0.8;
+}
+
+.linkBtn:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+/* "Prime ngay" — on-demand new-window button, shown when the 5h window has ended. Subtle accent
+   outline so it invites a click without competing with the primary switch button. */
+.primeNowBtn {
+  align-items: center;
   background: var(--accent-soft);
-  border: 1px solid rgba(251, 106, 26, 0.3);
+  border: 1px solid rgba(251, 106, 26, 0.35);
   border-radius: var(--radius-sm);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  color: var(--accent);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 600;
+  gap: 6px;
   margin-top: 10px;
-  padding: 10px 12px;
+  padding: 6px 12px;
 }
 
-.extendPrompt > span {
-  color: var(--text);
-  font-size: 13px;
-  line-height: 1.5;
+.primeNowBtn:hover:not(:disabled) {
+  background: rgba(251, 106, 26, 0.18);
 }
 
-.extendActions {
-  display: flex;
-  gap: 8px;
+.primeNowBtn:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 /* ── pmset wake helper row (Auto Session) ─────────────────────────── */

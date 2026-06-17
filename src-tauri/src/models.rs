@@ -553,6 +553,13 @@ pub struct SetAutoExtendInput {
     pub enabled: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeNowInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DetectionSource {

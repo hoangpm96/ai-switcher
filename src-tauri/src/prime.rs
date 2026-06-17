@@ -56,13 +56,22 @@ pub fn is_prime_eligible(tool_id: &ToolId, has_api_provider: bool) -> bool {
 /// Run one full prime attempt for an account. Blocking — the caller runs it on a worker thread.
 /// `sleeper` is invoked for retry delays so tests can run without real waiting. `binary` is the
 /// account's resolved CLI path (claude/codex) — used to prime via the CLI (preferred) and to
-/// refresh Claude's token; None falls back to the HTTP path.
+/// refresh Claude's token; None falls back to the HTTP path. `send_attempts` caps D3's send tries:
+/// the scheduler passes `SEND_MAX_ATTEMPTS` (it has all day to retry), the on-demand "Prime ngay"
+/// passes 1 (fail fast, let the user tap again — no back-to-back retries hammering the provider).
 pub fn prime_account(
     tool_id: &ToolId,
     config_dir: &Path,
     binary: Option<&Path>,
+    send_attempts: u32,
     mut sleeper: impl FnMut(Duration),
 ) -> PrimeOutcome {
+    // Hold the Mac awake for the whole attempt. A pmset wake only buys a brief awake window before
+    // macOS idle-sleeps again; D3's retries (up to 5 × 5') and D4's confirm polls can outlast it,
+    // and a prime that started right after a pmset wake must not be cut off by a re-sleep. Dropped
+    // at function exit (any return path). No-op when caffeinate is missing (non-macOS / stripped).
+    let _awake = CaffeinateGuard::start();
+
     // D1 — token must be valid.
     if read_token(tool_id, config_dir, binary).is_none() {
         return PrimeOutcome::SkipNoToken;
@@ -79,10 +88,11 @@ pub fn prime_account(
         }
     }
 
-    // D3 — send "hi", retrying on failure.
+    // D3 — send "hi", retrying on failure up to `send_attempts` times.
+    let attempts = send_attempts.max(1);
     let mut last_reason = String::new();
     let mut sent = false;
-    for attempt in 1..=SEND_MAX_ATTEMPTS {
+    for attempt in 1..=attempts {
         match send_hi(tool_id, config_dir, binary) {
             Ok(()) => {
                 sent = true;
@@ -90,7 +100,7 @@ pub fn prime_account(
             }
             Err(reason) => {
                 last_reason = reason;
-                if attempt < SEND_MAX_ATTEMPTS {
+                if attempt < attempts {
                     sleeper(SEND_RETRY_DELAY);
                 }
             }
@@ -117,6 +127,36 @@ pub fn prime_account(
         }
     }
     PrimeOutcome::FailUnconfirmed
+}
+
+/// Keeps the Mac awake (no idle sleep) for as long as it is alive, by holding a child
+/// `caffeinate` process. Dropping it kills the child, letting the Mac sleep normally again.
+struct CaffeinateGuard(Option<std::process::Child>);
+
+impl CaffeinateGuard {
+    /// Spawn `caffeinate -i -w <our pid>` (prevent idle system sleep, and self-exit if we die).
+    /// The `-w` watch is belt-and-suspenders against an orphaned caffeinate holding the Mac awake
+    /// forever should the app crash before Drop runs. On any failure — including non-macOS where
+    /// the binary doesn't exist — returns an inert guard so callers stay unconditional.
+    fn start() -> Self {
+        let child = std::process::Command::new("caffeinate")
+            .args(["-i", "-w", &std::process::id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok();
+        CaffeinateGuard(child)
+    }
+}
+
+impl Drop for CaffeinateGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 fn read_token(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Option<String> {
@@ -203,7 +243,8 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
 
     let response = match tool_id {
         ToolId::Claude => {
-            // No binary here (HTTP fallback only runs when binary is None).
+            // No explicit binary here; claude_oauth_token_fresh resolves `claude` via command_path
+            // for the token refresh (a bare PATH lookup fails under a GUI .app's minimal PATH).
             let token = quota::claude_oauth_token_fresh(config_dir, None)
                 .ok_or_else(|| "token".to_string())?;
             let version = quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());
