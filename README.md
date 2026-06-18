@@ -20,7 +20,7 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 - **Per-tool auto-switch.** Configure separately for Claude and Codex — the bare command falls back to another account when the active one nears its quota.
 - **Usage & cost tab.** Token usage and estimated cost per tool, plus an aggregated **All** view across tools, charted over a selectable date range.
 - **Local API gateway.** Expose Claude/Codex subscription accounts through a local OpenAI/Anthropic-compatible server with API keys, model combos, fallback rotation, cooldown handling, and gateway usage tracking.
-- **Auto Session.** Anchor each Claude/Codex account's 5-hour reset to your work rhythm — the app primes a fresh window at a time you pick (optionally waking the Mac itself), and can open the next window the moment the current one ends so you keep coding without waiting.
+- **Auto Session.** Anchor each Claude/Codex account's 5-hour reset to your work rhythm — the app primes a fresh window at a time you pick (optionally waking the Mac itself), can open the next window the moment the current one ends so you keep coding without waiting, and gives you a **Prime ngay** button to open a new window on demand.
 
 ### Claude Code & Codex (CLI)
 
@@ -40,8 +40,10 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 
 - Give each Claude/Codex subscription account **one daily prime time**; the app sends a minimal "hi" then to open a fresh 5-hour window, so your reset clock lands when you actually start coding. Primes at most once per day per account.
 - Priming runs the account's own `claude` / `codex` CLI (so it refreshes its own token), with a direct HTTP fallback. Each attempt — success, hold, skip, fail, or late catch-up — is written to an activity log, with a per-day stats summary.
-- Optionally install a **one-time privileged helper** so the Mac wakes itself ~5 minutes before a prime via `pmset` and sleeps again; without it, priming runs whenever the machine is awake / the app is open (a missed time is caught up on next launch).
-- **On-demand extend:** when a window is about to end (≤30 min) the app prompts on the account to open the next one the instant the current ends; a per-account toggle can do this automatically without asking.
+- Optionally install a **one-time privileged helper** so the Mac wakes itself ~10 minutes before a prime via `pmset`, stays awake (`caffeinate`) through the prime, and sleeps again; without it, priming runs whenever the machine is awake / the app is open (a missed time is caught up on next launch).
+- **Prime ngay (on demand).** When an account's window has ended, a button on the card opens the next 5-hour window right away — no need to drop to a terminal. It reports back whether a new window opened, the current one is still running, or the token needs a re-login.
+- **On-demand extend:** when a window is about to end (≤30 min) the app prompts on the account to open the next one the instant the current ends; a per-account toggle can do this automatically without asking, deferring to your scheduled anchor time when that falls inside the upcoming window.
+- Quota for every account (including the machine default) is read live from the provider, so the displayed usage and reset time stay current and a refresh always reflects the real state.
 
 ### Antigravity IDE (GUI)
 
@@ -77,11 +79,11 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a version tag like `v0.3.0` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
+Pushing a version tag like `v0.5.5` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
 
 ```bash
-git tag v0.3.0
-git push origin main v0.3.0
+git tag v0.5.5
+git push origin main v0.5.5
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version history.
