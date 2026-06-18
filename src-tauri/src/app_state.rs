@@ -999,8 +999,12 @@ impl ManagedState {
             if time_changed {
                 entry.last_primed_date = None;
                 entry.last_primed_time = None;
-                // A pending hold-defer from the OLD time must not suppress the NEW time.
-                entry.deferred_until = None;
+                // A pending SCHEDULED hold-defer from the OLD time must not suppress the NEW time —
+                // but DON'T clear a defer that belongs to an armed auto-extend (it's tied to the
+                // running 5h window, not the daily anchor), or the extend would fire early.
+                if !entry.extend_requested {
+                    entry.deferred_until = None;
+                }
             }
             // Disabling clears a SCHEDULED hold-defer so it can't linger as stale state and suppress
             // due-collection if the same schedule is re-enabled later. An extend's defer is left
@@ -1038,7 +1042,10 @@ impl ManagedState {
                 if time_changed {
                     entry.last_primed_date = None;
                     entry.last_primed_time = None;
-                    entry.deferred_until = None;
+                    // Don't clear an armed auto-extend's defer (see set_auto_prime).
+                    if !entry.extend_requested {
+                        entry.deferred_until = None;
+                    }
                 }
                 // Same as set_auto_prime: disabling clears a stale scheduled hold-defer (but not an
                 // extend's defer).
@@ -1079,6 +1086,13 @@ impl ManagedState {
         let now = chrono::Local::now();
         let mut earliest: Option<chrono::DateTime<chrono::Local>> = None;
         let mut consider = |candidate: chrono::DateTime<chrono::Local>| {
+            // Ignore past candidates entirely. A wake we're already past (e.g. it's 10:55 and a
+            // prime at 11:00 gives a 10:50 lead instant) must NOT become `earliest` — that would let
+            // the final "in the future" filter discard a VALID future wake from another account,
+            // leaving the Mac with no wake at all. Each candidate is judged on its own.
+            if candidate <= now {
+                return;
+            }
             earliest = Some(match earliest {
                 Some(current) if current <= candidate => current,
                 _ => candidate,
@@ -1116,15 +1130,21 @@ impl ManagedState {
             let Some((h, m)) = parse_hhmm(&setting.time) else {
                 continue;
             };
-            // The next occurrence of HH:MM today, else tomorrow; minus the wake lead.
-            let mut target = now
+            // The next wake instant for this account = (prime time − lead). Roll the day over based
+            // on the WAKE instant, not the prime time: at 10:55 for an 11:00 prime with a 10-min
+            // lead, today's wake (10:50) is already past, so we must target TOMORROW's 10:50 — not
+            // keep today's, which would be a past candidate that `consider` then discards, leaving
+            // this account with no wake at all.
+            let lead = chrono::Duration::minutes(crate::wake::WAKE_LEAD_MIN);
+            let mut wake = now
                 .date_naive()
                 .and_hms_opt(h, m, 0)
-                .and_then(|naive| chrono::Local.from_local_datetime(&naive).single())?;
-            if target <= now {
-                target += chrono::Duration::days(1);
+                .and_then(|naive| chrono::Local.from_local_datetime(&naive).single())?
+                - lead;
+            if wake <= now {
+                wake += chrono::Duration::days(1);
             }
-            consider(target - chrono::Duration::minutes(crate::wake::WAKE_LEAD_MIN));
+            consider(wake);
         }
         // Never schedule a wake in the past.
         earliest.filter(|t| *t > now)
@@ -1543,6 +1563,10 @@ impl ManagedState {
                         // happens to have arrived (deferred extends can come due after `time`):
                         // log it as "gia hạn", not a scheduled prime.
                         is_extend: extend_due,
+                        // Whether the daily anchor actually triggered this run. Used to decide if a
+                        // terminal outcome should consume today's scheduled slot. If the daily time
+                        // genuinely arrived (even alongside an extend), it IS the scheduled run.
+                        scheduled: scheduled_due,
                         manual: false,
                     })
                 })
@@ -1604,6 +1628,7 @@ impl ManagedState {
                 binary,
                 // Manual prime is its own thing — not a scheduled run, not an extend acceptance.
                 is_extend: false,
+                scheduled: false,
                 manual: true,
             }
         };
@@ -1733,7 +1758,6 @@ impl ManagedState {
                 format!("{tool_label} · account \"{account_name}\" — FAIL: gửi OK nhưng không xác nhận được phiên mới sau 5 lần kiểm tra"),
             ),
         };
-        self.append_prime_log(&line);
 
         // Update the per-account schedule record. A "terminal" outcome (we opened a window or gave
         // up after the full retry budget) consumes today's scheduled attempt so the scheduler does
@@ -1755,11 +1779,13 @@ impl ManagedState {
                         | PrimeOutcome::FailUnconfirmed
                         | PrimeOutcome::FailSend { .. }
                 );
-                // A manual ("Prime ngay") FAILURE must not consume the day's scheduled attempt — the
-                // user retrying by hand shouldn't disable the automatic run. A manual SUCCESS still
-                // does (a fresh window is open; the scheduled run would be redundant). Scheduler jobs
-                // consume on any terminal outcome (it gave the full retry budget and is done for now).
-                let consume_scheduled = if job.manual { succeeded } else { terminal };
+                // "Consume" today's scheduled slot (set last_primed_date/time so the daily prime
+                // doesn't re-fire) ONLY for a job that the daily schedule actually triggered. A manual
+                // "Prime ngay" or a one-time extend is NOT the daily anchor — letting their success
+                // stamp last_primed would suppress a later daily prime (e.g. a 06:00 manual prime
+                // cancelling the 11:00 anchor). A scheduled job consumes on any terminal outcome (it
+                // used its full retry budget and is done for today).
+                let consume_scheduled = job.scheduled && terminal;
                 if consume_scheduled {
                     setting.last_primed_date = Some(local_today());
                     setting.last_primed_time = Some(setting.time.clone());
@@ -1802,6 +1828,19 @@ impl ManagedState {
                 }
             }
             let _ = self.store.save(&data);
+        }
+
+        // Append the activity-log line only when something changed (new result), it's a manual
+        // attempt, or it's a terminal outcome worth recording. A SkipNoToken/Hold that repeats
+        // unchanged every minute (e.g. an offline token that won't refresh) must NOT spam the log.
+        let terminal = matches!(
+            outcome,
+            PrimeOutcome::Success { .. }
+                | PrimeOutcome::FailUnconfirmed
+                | PrimeOutcome::FailSend { .. }
+        );
+        if visible_change || job.manual || terminal {
+            self.append_prime_log(&line);
         }
 
         match outcome {
@@ -2982,9 +3021,14 @@ struct PrimeJob {
     /// True when this job was triggered by an on-demand extend request (mechanism 2) rather than
     /// the scheduled time — used to clear the request on success.
     is_extend: bool,
-    /// True when this job came from the "Prime ngay" button. A manual FAILURE must NOT consume the
-    /// day's scheduled prime (the user retrying by hand shouldn't disable the automatic run); only a
-    /// manual SUCCESS does (a fresh window opened — the scheduled run would be redundant).
+    /// True when the daily scheduled time actually triggered this job (`scheduled_due`). Only a
+    /// scheduled job stamps `last_primed_date/time` on a terminal outcome — a manual or extend-only
+    /// job must NOT, or it would suppress a later daily prime that's a separate anchor.
+    scheduled: bool,
+    /// True when this job came from the "Prime ngay" button. A manual job NEVER consumes the day's
+    /// scheduled prime (only a `scheduled` job does) — manual is a separate, on-demand action, so a
+    /// later daily anchor still runs. `manual` instead gates extend-state resolution: a manual
+    /// FAILURE must not clear an armed auto-extend; a manual SUCCESS does (a fresh window opened).
     manual: bool,
 }
 

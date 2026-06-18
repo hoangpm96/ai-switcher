@@ -5,6 +5,24 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-06-18
+
+### Fixed
+
+- **Activity log no longer spams on an unrefreshable token.** A repeating skip/hold with an
+  unchanged result (e.g. an expired token that can't refresh while offline) was appended to
+  the log every minute. It now logs only on a change, a manual attempt, or a terminal outcome.
+- **A manual "Prime ngay" (or a one-time extend) no longer cancels the daily scheduled prime.**
+  Only a genuinely scheduled run now marks the day's slot consumed, so a manual prime at 06:00
+  doesn't suppress the 11:00 daily anchor.
+- **Changing an account's daily time no longer disarms an active auto-extend.** The pending
+  defer that belongs to an armed extend is preserved across a schedule-time change.
+- **The Mac wake is no longer dropped near a prime time.** A wake instant already in the past
+  (e.g. computed at 10:55 for an 11:00 prime with a 10-minute lead) is rolled to the next day
+  instead of erasing every account's wake for that recompute.
+- **"Prime ngay" shows a neutral (blue) info toast when the window is still running** — not a
+  green success toast — so a hold no longer looks like something was opened.
+
 ## [0.5.4] - 2026-06-18
 
 ### Fixed

@@ -9,6 +9,7 @@ import {
   ChevronDown,
   CircleHelp,
   Copy,
+  Info,
   KeyRound,
   Layers,
   Loader2,
@@ -108,10 +109,10 @@ export function App() {
   const [view, setView] = useState<"accounts" | "api" | "usage" | "auto" | "settings">("accounts");
   // One unified notification channel for the whole app: success + error both render as a
   // top-right toast (see the Toasts renderer). `notify` is the single entry point.
-  const [toasts, setToasts] = useState<{ id: number; kind: "success" | "error"; text: string }[]>(
-    [],
-  );
-  const notify = useCallback((text: string, kind: "success" | "error" = "success") => {
+  const [toasts, setToasts] = useState<
+    { id: number; kind: "success" | "error" | "info"; text: string }[]
+  >([]);
+  const notify = useCallback((text: string, kind: "success" | "error" | "info" = "success") => {
     if (!text) return;
     const id = nextToastId();
     setToasts((current) => [...current.slice(-3), { id, kind, text }]);
@@ -377,7 +378,13 @@ export function App() {
             role={item.kind === "error" ? "alert" : "status"}
             key={item.id}
           >
-            {item.kind === "error" ? <AlertTriangle /> : <Check />}
+            {item.kind === "error" ? (
+              <AlertTriangle />
+            ) : item.kind === "info" ? (
+              <Info />
+            ) : (
+              <Check />
+            )}
             <span>{item.text}</span>
             <button className="iconButton" onClick={() => dismissToast(item.id)} title="Dismiss">
               <X />
@@ -650,9 +657,9 @@ export function App() {
                           accountId: account.id,
                         });
                         // The backend emits auto-prime-changed → snapshot re-pulls itself; just toast.
-                        // "info" (window still running — a Hold) is NOT an error: show it neutrally,
-                        // not red. Only a real failure ("error") gets the error styling.
-                        notify(res.message, res.kind === "error" ? "error" : "success");
+                        // Pass the backend's kind straight through: "success" (new window), "info"
+                        // (window still running — a Hold, neutral, not an error), "error" (failure).
+                        notify(res.message, res.kind);
                       } catch (err) {
                         notify(errorMessage(err), "error");
                       } finally {
