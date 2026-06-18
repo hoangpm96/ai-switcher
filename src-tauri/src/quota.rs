@@ -158,9 +158,15 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path, binary: Option<&Path>)
         .and_then(serde_json::Value::as_i64);
     let now_ms = chrono::Utc::now().timestamp_millis();
     if expires_at.is_some_and(|expiry| expiry <= now_ms + 300_000) {
-        // Run `claude auth status` to trigger a token refresh, but never let it hang the caller
-        // (it may stall on network or an interactive prompt). Spawn detached output + kill on a
-        // hard deadline.
+        // Trigger a token refresh, but never let it hang the caller (it may stall on network or an
+        // interactive prompt). Spawn detached output + kill on a hard deadline.
+        //
+        // Use `claude -p hi --max-turns 1`, NOT `claude auth status`: `auth status` only REPORTS the
+        // login (it returns loggedIn:true without touching the token), so it left an expired token in
+        // place and the next usage call 401'd. A minimal `-p` query actually hits the API, which makes
+        // the CLI refresh its OAuth token and write the new one back to the keychain. (This is the
+        // same mechanism prime.rs relies on.) The one-token cost of the tiny query is the price of a
+        // refresh that actually works.
         //
         // Resolve the binary's full path: a GUI .app launched from Finder/Dock has a minimal PATH
         // (typically just /usr/bin:/bin), so a bare `Command::new("claude")` fails to spawn and the
@@ -172,7 +178,7 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path, binary: Option<&Path>)
             .unwrap_or_else(|| PathBuf::from("claude"));
         let mut command = Command::new(&resolved);
         command
-            .args(["auth", "status", "--json"])
+            .args(["-p", "hi", "--max-turns", "1"])
             .env("CLAUDE_CONFIG_DIR", config_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

@@ -5,6 +5,17 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-06-18
+
+### Fixed
+
+- **Expired Claude tokens now actually refresh — fixes recurring HTTP 401 on quota reads.**
+  When a Claude OAuth token was within 5 minutes of expiry, the app ran `claude auth status`
+  to refresh it — but that command only *reports* the login (it returns `loggedIn: true`
+  without touching the token), so the expired token stayed in place and the next usage call
+  returned 401. The app now runs a minimal `claude -p hi --max-turns 1`, which hits the API
+  and makes the CLI refresh its OAuth token and write the new one back to the keychain.
+
 ## [0.5.2] - 2026-06-18
 
 ### Fixed
