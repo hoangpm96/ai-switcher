@@ -789,16 +789,20 @@ impl ManagedState {
                     .iter_mut()
                     .find(|a| a.tool_id == tool_id && a.id == account_id)
                 {
+                    let was_exhausted = account.state == AccountState::Exhausted;
                     account.quota = Some(quota);
                     account.updated_at = timestamp.clone();
                     account.state = if is_exhausted(account) {
                         AccountState::Exhausted
-                    } else if account.state == AccountState::Exhausted {
+                    } else if was_exhausted {
                         AccountState::Idle
                     } else {
                         account.state.clone()
                     };
-                    if account.state == AccountState::Exhausted {
+                    // Notify only on the TRANSITION into exhausted, not on every refresh while it
+                    // stays exhausted — otherwise the 5-minute poller fires the same notification
+                    // over and over until the window resets.
+                    if account.state == AccountState::Exhausted && !was_exhausted {
                         exhausted.push(account.clone());
                     }
                 }
@@ -870,16 +874,19 @@ impl ManagedState {
                 .iter_mut()
                 .find(|a| a.tool_id == *tool_id && a.id == account_id)
             {
+                let was_exhausted = account.state == AccountState::Exhausted;
                 account.quota = Some(quota);
                 account.updated_at = now();
                 account.state = if is_exhausted(account) {
                     AccountState::Exhausted
-                } else if account.state == AccountState::Exhausted {
+                } else if was_exhausted {
                     AccountState::Idle
                 } else {
                     account.state.clone()
                 };
-                if account.state == AccountState::Exhausted {
+                // Notify only on the transition INTO exhausted (see refresh_tool) — not on every
+                // single-account refresh while it stays exhausted.
+                if account.state == AccountState::Exhausted && !was_exhausted {
                     result = Some(account.clone());
                 }
             }

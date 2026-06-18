@@ -5,6 +5,15 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-06-18
+
+### Fixed
+
+- **"Out of quota" notification no longer repeats every few minutes.** It fired on every
+  quota refresh while an account stayed exhausted, so the 5-minute poller re-notified for
+  the same window over and over. It now fires only once — on the transition into exhausted —
+  and again only if the account recovers and is exhausted anew.
+
 ## [0.5.3] - 2026-06-18
 
 ### Fixed
