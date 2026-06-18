@@ -2932,6 +2932,8 @@ fn notify_exhausted(app: &AppHandle, account: &Account) {
                 .clone()
                 .or_else(|| quota.weekly.reset_at.clone())
         })
+        // Show a readable local time with the UTC-offset label, not the raw ISO/UTC string.
+        .map(|iso| local_time_label_from_iso(&iso))
         .unwrap_or_else(|| "unknown".to_string());
     let _ = app
         .notification()
@@ -3137,6 +3139,30 @@ fn local_hhmm_from_iso(iso: &str) -> String {
         .unwrap_or_else(|_| iso.to_string())
 }
 
+/// Render an ISO 8601 instant as a human-friendly LOCAL time with an explicit UTC-offset label,
+/// e.g. `16:32 (UTC+7)`. For user-facing notifications — a raw `…T11:20:00+00:00` reads as "11:20"
+/// and gets mistaken for a local morning time when it's actually 18:20 in a +7 zone. Falls back to
+/// the raw string if unparseable.
+fn local_time_label_from_iso(iso: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(iso) {
+        Ok(t) => {
+            let local = t.with_timezone(&chrono::Local);
+            // Offset in whole hours (e.g. +7); show minutes too only when the zone isn't on the hour.
+            let secs = local.offset().local_minus_utc();
+            let sign = if secs < 0 { '-' } else { '+' };
+            let abs = secs.abs();
+            let (h, m) = (abs / 3600, (abs % 3600) / 60);
+            let off = if m == 0 {
+                format!("UTC{sign}{h}")
+            } else {
+                format!("UTC{sign}{h}:{m:02}")
+            };
+            format!("{} ({off})", local.format("%H:%M"))
+        }
+        Err(_) => iso.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3201,5 +3227,27 @@ mod tests {
     fn invalid_inputs_return_none() {
         assert!(scheduled_anchor_within_window("not-a-date", "11:00").is_none());
         assert!(scheduled_anchor_within_window(&local_iso(base()), "99:99").is_none());
+    }
+
+    #[test]
+    fn local_time_label_shows_local_hhmm_with_offset() {
+        // A UTC instant renders as the LOCAL time plus a "(UTC±N)" label — never the raw UTC HH:MM,
+        // which is what made "11:20+00:00" read as a morning time when it was 18:20 in a +7 zone.
+        let got = local_time_label_from_iso("2026-06-18T11:20:00+00:00");
+        let expected_local = chrono::DateTime::parse_from_rfc3339("2026-06-18T11:20:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert!(
+            got.starts_with(&expected_local),
+            "expected label to start with local time {expected_local}, got {got}"
+        );
+        assert!(got.contains("(UTC"), "expected a UTC-offset label, got {got}");
+    }
+
+    #[test]
+    fn local_time_label_passes_through_unparseable() {
+        assert_eq!(local_time_label_from_iso("nope"), "nope");
     }
 }

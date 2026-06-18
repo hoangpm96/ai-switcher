@@ -5,6 +5,16 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-06-18
+
+### Fixed
+
+- **Notifications show a readable local time, not a raw UTC string.** The "Out of quota"
+  notification printed the reset as `…T11:20:00+00:00`, which reads as 11:20 and gets
+  mistaken for a morning time when it is actually 18:20 in a +7 zone. It now shows the
+  local time with an explicit offset label, e.g. `resets at 18:20 (UTC+7)`. (This was not
+  a wrong-timestamp bug — the instant was always correct, just displayed in UTC.)
+
 ## [0.5.1] - 2026-06-18
 
 ### Fixed
