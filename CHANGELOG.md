@@ -5,6 +5,20 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-06-18
+
+### Fixed
+
+- **Codex quota now reads the live number for every account, including "Default (máy)".**
+  The default account read its 5-hour usage from the local Codex rollout file, which only
+  updates when the CLI runs — so it could show a months-old percentage that Refresh never
+  changed, while a profile account on the same login showed the live number. All accounts
+  now read the per-account usage endpoint first (live, correct per token); the rollout file
+  is only a fallback if the endpoint is unreachable.
+- **"Prime ngay" no longer shows a red error when the window is simply still running.**
+  A hold (the current window hasn't ended yet, e.g. because another account on the same
+  login just refreshed it) is reported as a neutral info toast, not a failure.
+
 ## [0.5.0] - 2026-06-18
 
 ### Added

@@ -560,6 +560,16 @@ pub struct PrimeNowInput {
     pub account_id: String,
 }
 
+/// Result of an on-demand "Prime ngay": a short message plus a kind the UI maps to a toast colour.
+/// `success` = a new window opened; `info` = nothing wrong but no new window (the old one is still
+/// running — a Hold); `error` = an actual failure (no token / send failed / unconfirmed).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeNowResult {
+    pub kind: String,
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DetectionSource {

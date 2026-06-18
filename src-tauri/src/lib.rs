@@ -210,7 +210,10 @@ fn set_auto_extend(
 /// On-demand "Prime ngay": open a fresh 5h window for one account right now. Runs on a blocking
 /// worker (the prime can take tens of seconds) and returns a short status message for a UI toast.
 #[tauri::command]
-async fn prime_now(app: tauri::AppHandle, input: PrimeNowInput) -> Result<String, String> {
+async fn prime_now(
+    app: tauri::AppHandle,
+    input: PrimeNowInput,
+) -> Result<models::PrimeNowResult, String> {
     let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         app2.state::<ManagedState>()

@@ -12,6 +12,7 @@ import type {
   AutoPrimeDayStat,
   ConfirmExtendInput,
   PrimeNowInput,
+  PrimeNowResult,
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
   SetAutoExtendInput,
@@ -215,7 +216,7 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
     return structuredClone(demoSnapshot) as T;
   }
   if (command === "prime_now") {
-    return "Đã mở phiên mới — reset lúc 12:00" as T;
+    return { kind: "success", message: "Đã mở phiên mới — reset lúc 12:00" } as T;
   }
   if (command === "get_auto_prime_log") {
     return "" as T;
@@ -476,7 +477,7 @@ export const api = {
   confirmExtend: (input: ConfirmExtendInput) => invoke<AppSnapshot>("confirm_extend", { input }),
   setAutoExtend: (input: SetAutoExtendInput) => invoke<AppSnapshot>("set_auto_extend", { input }),
   /** On-demand prime; resolves to a short status message (the snapshot refreshes via event). */
-  primeNow: (input: PrimeNowInput) => invoke<string>("prime_now", { input }),
+  primeNow: (input: PrimeNowInput) => invoke<PrimeNowResult>("prime_now", { input }),
   getAutoPrimeLog: () => invoke<string>("get_auto_prime_log"),
   getAutoPrimeStats: () => invoke<AutoPrimeDayStat[]>("get_auto_prime_stats"),
   openAutoPrimeLog: () => invoke<void>("open_auto_prime_log"),

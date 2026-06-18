@@ -515,18 +515,29 @@ fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo>
 // ---------------------------------------------------------------------------
 
 fn read_codex_quota(config_dir: &Path) -> Result<QuotaInfo> {
-    // Rollout files live in ~/.codex/sessions. Profile accounts symlink their sessions/
-    // back to ~/.codex/sessions, so all accounts share the same rollout files. Reading
-    // rollout for a profile account returns the last active account's limits, not this
-    // account's. Only use rollout for the default account (~/.codex); go straight to the
-    // per-account usage endpoint for all others.
-    let is_default = config_dir == home_dir().join(".codex");
-    if is_default {
-        if let Ok(quota) = read_codex_rollout_quota() {
-            return Ok(quota);
+    // Prefer the per-account usage endpoint — it reads THIS account's live 5h window straight from
+    // the provider (via the token in config_dir/auth.json), so it's current and correct no matter
+    // which account last ran the CLI.
+    //
+    // The rollout file (~/.codex/sessions/.../rollout-*.jsonl) is only a FALLBACK now: it's shared
+    // by every account (profile accounts symlink their sessions/ back to ~/.codex/sessions), so it
+    // reflects whichever account last ran the CLI — not necessarily this one — and it's only updated
+    // when the CLI runs, so it goes stale (it can be months old if you haven't used the CLI). Using
+    // it as the primary source for the default account made "Default (máy)" show a frozen percentage
+    // that Refresh never updated, while a profile account on the same login showed the live number.
+    match read_codex_usage_endpoint(config_dir) {
+        Ok(quota) => Ok(quota),
+        Err(endpoint_err) => {
+            // Endpoint failed (offline, token issue): for the default account, a (possibly stale)
+            // rollout reading still beats showing nothing.
+            if config_dir == home_dir().join(".codex") {
+                if let Ok(quota) = read_codex_rollout_quota() {
+                    return Ok(quota);
+                }
+            }
+            Err(endpoint_err)
         }
     }
-    read_codex_usage_endpoint(config_dir)
 }
 
 fn read_codex_rollout_quota() -> Result<QuotaInfo> {

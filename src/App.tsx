@@ -645,12 +645,14 @@ export function App() {
                       setBusy(`prime:${account.id}`);
                       setError(null);
                       try {
-                        const msg = await api.primeNow({
+                        const res = await api.primeNow({
                           toolId: currentTool.id,
                           accountId: account.id,
                         });
                         // The backend emits auto-prime-changed → snapshot re-pulls itself; just toast.
-                        notify(msg, msg.startsWith("Đã mở phiên mới") ? "success" : "error");
+                        // "info" (window still running — a Hold) is NOT an error: show it neutrally,
+                        // not red. Only a real failure ("error") gets the error styling.
+                        notify(res.message, res.kind === "error" ? "error" : "success");
                       } catch (err) {
                         notify(errorMessage(err), "error");
                       } finally {

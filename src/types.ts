@@ -316,6 +316,12 @@ export interface PrimeNowInput {
   accountId: string;
 }
 
+export interface PrimeNowResult {
+  /** "success" = new window opened; "info" = nothing wrong, no new window yet; "error" = failure. */
+  kind: "success" | "info" | "error";
+  message: string;
+}
+
 export interface StartApiGatewayInput {
   bindHost: string;
   port: number;

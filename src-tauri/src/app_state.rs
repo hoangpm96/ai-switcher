@@ -1568,7 +1568,7 @@ impl ManagedState {
         tool_id: ToolId,
         account_id: String,
         app: Option<&AppHandle>,
-    ) -> Result<String> {
+    ) -> Result<crate::models::PrimeNowResult> {
         use crate::prime::PrimeOutcome;
         use std::sync::atomic::Ordering;
 
@@ -1633,21 +1633,33 @@ impl ManagedState {
         );
         self.record_prime_outcome(&job, &outcome, false, app);
 
-        Ok(match &outcome {
-            PrimeOutcome::Success { new_reset_at } => {
-                format!("Đã mở phiên mới — reset lúc {}", local_hhmm_from_iso(new_reset_at))
-            }
-            PrimeOutcome::Hold { reset_at } => format!(
-                "Phiên hiện tại chưa hết (còn tới {}). Phiên mới chỉ mở được sau khi phiên cũ kết thúc.",
-                local_hhmm_from_iso(reset_at)
+        let (kind, message) = match &outcome {
+            PrimeOutcome::Success { new_reset_at } => (
+                "success",
+                format!("Đã mở phiên mới — reset lúc {}", local_hhmm_from_iso(new_reset_at)),
             ),
-            PrimeOutcome::SkipNoToken => {
-                "Token đã hết hạn — cần đăng nhập lại tài khoản này.".to_string()
-            }
-            PrimeOutcome::FailSend { reason } => format!("Gửi không thành công: {reason}"),
-            PrimeOutcome::FailUnconfirmed => {
-                "Đã gửi nhưng chưa xác nhận được phiên mới. Thử lại sau giây lát.".to_string()
-            }
+            // Not an error: the window is simply still running (or was just refreshed by another
+            // account that shares this ChatGPT/Claude login), so a new one can't open yet.
+            PrimeOutcome::Hold { reset_at } => (
+                "info",
+                format!(
+                    "Phiên hiện tại vẫn còn (đến {}). Phiên mới chỉ mở được sau khi phiên này kết thúc.",
+                    local_hhmm_from_iso(reset_at)
+                ),
+            ),
+            PrimeOutcome::SkipNoToken => (
+                "error",
+                "Token đã hết hạn — cần đăng nhập lại tài khoản này.".to_string(),
+            ),
+            PrimeOutcome::FailSend { reason } => ("error", format!("Gửi không thành công: {reason}")),
+            PrimeOutcome::FailUnconfirmed => (
+                "error",
+                "Đã gửi nhưng chưa xác nhận được phiên mới. Thử lại sau giây lát.".to_string(),
+            ),
+        };
+        Ok(crate::models::PrimeNowResult {
+            kind: kind.to_string(),
+            message,
         })
     }
 
