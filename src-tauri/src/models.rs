@@ -498,6 +498,12 @@ pub struct AutoPrimeSetting {
     /// button and the poller doesn't re-prompt for that same window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extend_dismissed_reset: Option<String>,
+    /// Local date (`YYYY-MM-DD`) this schedule first becomes eligible. Set to TOMORROW when the user
+    /// creates/edits the time (or enables) AFTER today's anchor already passed beyond the catch-up
+    /// window, so the first prime is the NEXT occurrence — not an immediate same-day catch-up. `None`
+    /// = eligible today (the anchor is still upcoming or within catch-up when the schedule was set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_from: Option<String>,
 }
 
 impl Default for AutoPrimeSetting {
@@ -514,6 +520,7 @@ impl Default for AutoPrimeSetting {
             auto_extend: false,
             deferred_until: None,
             extend_dismissed_reset: None,
+            active_from: None,
         }
     }
 }

@@ -5,6 +5,28 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-06-20
+
+### Fixed
+
+- **Auto Session no longer logs "HOÃN" through the night or misses the morning anchor.** A held
+  scheduled prime (the old 5h window was still live) used to re-attempt on every wake, re-logging
+  "HOÃN", and planted a defer at the old window's end (~midnight) that stole the next morning's
+  wake — so the 06:30 anchor never fired. A scheduled Hold now consumes the day's slot (one-shot,
+  like a success) and does NOT arm a defer; only an armed extend defers-and-retries.
+- **A daily anchor is only "due" within a bounded catch-up window.** The due test was a string
+  compare (`now >= time`) that treated every minute after the anchor until midnight as due, so a
+  06:30 anchor stayed due all evening and a late-waking machine fired a pointless prime into the
+  live window. It now primes only within 60 minutes past the anchor, otherwise waits for tomorrow.
+- **Setting a time in the evening schedules the next morning, not an immediate catch-up.** A new
+  `activeFrom` date defers a freshly created/edited (or just-enabled) schedule to its next
+  occurrence when today's anchor already passed beyond the catch-up window.
+- **"Prime ngay" now shows correctly for Codex and ended Claude windows.** The button never
+  appeared for Codex (its `/wham/usage` reset_at rolls forward until a request anchors the window)
+  and stayed hidden for ended Claude windows (a null reset_at was read as "unknown → hide"). The
+  backend now classifies the window and emits a provider-aware `primeAvailable` flag the UI reads,
+  failing closed on a genuinely unknown state.
+
 ## [0.5.5] - 2026-06-18
 
 ### Fixed

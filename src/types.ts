@@ -186,6 +186,9 @@ export interface AutoPrimeSetting {
   deferredUntil?: string | null;
   /** reset_at the user dismissed the "extend?" prompt for (UI hides the button). */
   extendDismissedReset?: string | null;
+  /** Local date "YYYY-MM-DD" this schedule first runs; undefined = eligible today. Set to tomorrow
+   *  when the time is set/enabled after today's anchor already passed, so the first prime is next. */
+  activeFrom?: string;
 }
 
 export interface AutoPrimeDayStat {
