@@ -5,6 +5,24 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7] - 2026-06-20
+
+### Added
+
+- **Auto Session can now send due prime requests after a sleeping Mac wakes.** The pmset helper still
+  schedules the wake, and a separate user-scoped LaunchDaemon runs the app in `--prime-headless`
+  mode once per minute while awake. It runs under the current macOS user/profile, sets `HOME`/`USER`
+  explicitly, and uses the app's own per-account config instead of root's `/var/root` state.
+
+### Fixed
+
+- **Headless and GUI priming are serialized across processes.** A file lock plus per-slot claim
+  markers prevent the GUI scheduler and the headless daemon from sending the same scheduled/extend
+  prime twice, even if one process still has stale in-memory state.
+- **Locked Keychain is treated as retryable.** If Claude/Codex tokens cannot be read while the Mac
+  is locked, the prime claim is released so later ticks can try again after the user unlocks. The UI
+  now says it sends a prime request instead of guaranteeing a new session opened.
+
 ## [0.5.6] - 2026-06-20
 
 ### Fixed

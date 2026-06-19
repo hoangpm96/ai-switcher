@@ -4,19 +4,89 @@
 //! across schedule changes. So we install a small **root LaunchDaemon** ONCE (one admin prompt):
 //! it `WatchPaths` the app's wake-request file and, whenever the app rewrites it, runs
 //! `pmset schedule wake "<time>"`. After install the app just writes the request file (no more
-//! admin prompts) and the Mac wakes itself ~5 min before the earliest upcoming prime.
-//!
-//! The app being awake is still required to actually send "hi"; pmset only wakes the Mac so the
-//! in-app scheduler (lib.rs) can run. If wake fails, milestone-1's "primed muộn" path still covers it.
+//! admin prompts) and the Mac wakes itself before the earliest upcoming prime. An optional second
+//! daemon runs the app in headless mode after wake, so priming does not depend on the GUI process
+//! being scheduled during DarkWake.
 
 use crate::store::Store;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Label + paths for the privileged helper. The plist lives in the system LaunchDaemons dir; the
 /// script + request file live in the app data dir (world-readable; only the request file matters).
-pub const HELPER_LABEL: &str = "dev.hoangphan.ai-account-switcher.wake-helper";
-const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.hoangphan.ai-account-switcher.wake-helper.plist";
+const HELPER_LABEL_BASE: &str = "dev.hoangphan.ai-account-switcher.wake-helper";
+const LEGACY_HELPER_PLIST_PATH: &str =
+    "/Library/LaunchDaemons/dev.hoangphan.ai-account-switcher.wake-helper.plist";
+const LEGACY_HELPER_SCRIPT_PATH: &str =
+    "/usr/local/libexec/dev.hoangphan.ai-account-switcher-wake-helper.sh";
+const LEGACY_HELPER_LAST_PATH: &str =
+    "/usr/local/libexec/dev.hoangphan.ai-account-switcher-wake-last.txt";
+
+/// Label + plist path for the PRIME daemon: a second LaunchDaemon that runs the app headless
+/// (`--prime-headless`) once per minute while the Mac is awake. Unlike the wake-helper (which only
+/// schedules a pmset wake), this one sends due prime requests — so the GUI app does not need to be
+/// scheduled during DarkWake.
+const PRIME_DAEMON_LABEL_BASE: &str = "dev.hoangphan.ai-account-switcher.prime-daemon";
+
+struct UserIdentity {
+    username: String,
+    uid: String,
+    home: PathBuf,
+}
+
+fn current_user_identity() -> Result<UserIdentity> {
+    fn id_value(flag: &str) -> Option<String> {
+        std::process::Command::new("/usr/bin/id")
+            .arg(flag)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+    let username = std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .or_else(|| id_value("-un"))
+        .context("couldn't determine the login user")?;
+    let uid = id_value("-u").context("couldn't determine the login user id")?;
+    Ok(UserIdentity {
+        username,
+        uid,
+        home: crate::tools::home_dir(),
+    })
+}
+
+fn helper_label(uid: &str) -> String {
+    format!("{HELPER_LABEL_BASE}.{uid}")
+}
+
+fn prime_daemon_label(uid: &str) -> String {
+    format!("{PRIME_DAEMON_LABEL_BASE}.{uid}")
+}
+
+fn helper_plist_path(uid: &str) -> PathBuf {
+    PathBuf::from(format!("/Library/LaunchDaemons/{}.plist", helper_label(uid)))
+}
+
+fn prime_plist_path(uid: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "/Library/LaunchDaemons/{}.plist",
+        prime_daemon_label(uid)
+    ))
+}
+
+fn helper_script_path(uid: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "/usr/local/libexec/dev.hoangphan.ai-account-switcher-wake-helper-{uid}.sh"
+    ))
+}
+
+fn helper_last_path(uid: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "/usr/local/libexec/dev.hoangphan.ai-account-switcher-wake-last-{uid}.txt"
+    ))
+}
 
 /// Wake the Mac this many minutes before the prime time. The brainstorm specified 5 min, but a
 /// pmset wake leaves only a short awake window before macOS idle-sleeps again — too tight when the
@@ -66,7 +136,7 @@ fi
 }
 
 /// The LaunchDaemon plist: runs the helper script whenever the request file changes.
-fn helper_plist(script_path: &Path, request_path: &Path) -> String {
+fn helper_plist(label: &str, script_path: &Path, request_path: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -88,25 +158,99 @@ fn helper_plist(script_path: &Path, request_path: &Path) -> String {
 </dict>
 </plist>
 "#,
-        label = xml_escape(HELPER_LABEL),
+        label = xml_escape(label),
         script = xml_escape(&script_path.to_string_lossy()),
         req = xml_escape(&request_path.to_string_lossy()),
     )
 }
 
-/// Root-owned location the helper script + its bookkeeping live in (NOT user-writable).
-const HELPER_SCRIPT_PATH: &str = "/usr/local/libexec/dev.hoangphan.ai-account-switcher-wake-helper.sh";
-const HELPER_LAST_PATH: &str = "/usr/local/libexec/dev.hoangphan.ai-account-switcher-wake-last.txt";
+/// The PRIME daemon plist: once per minute while the Mac is awake, run the app binary with
+/// `--prime-headless`, wrapped in `caffeinate -i`. The pmset helper is responsible for waking the
+/// Mac; the fixed interval means changing account schedules never requires rewriting a privileged
+/// plist. The headless due-check is cheap when nothing is due.
+///
+/// `app_binary` is the absolute path to the running app's executable (from `current_exe`). It's
+/// inside the user's /Applications bundle (not attacker-controlled here) but still XML-escaped.
+///
+/// CRITICAL: the daemon runs as `username` (the logged-in user), NOT root. A root daemon would get
+/// `$HOME=/var/root`, so `ProjectDirs`/`Store` would read an empty `/var/root/...` state and the
+/// headless prime would find no accounts. Running as the user gives the right `$HOME`, app-data dir,
+/// and CLI config/token. A LaunchDaemon with a `UserName` still runs while the Mac sleeps and before
+/// the user unlocks (unlike a per-user LaunchAgent), which is exactly what overnight priming needs.
+/// `log_path` must be user-writable (in the app data dir), since a user-context daemon can't write
+/// the root-owned /usr/local/libexec dir.
+fn prime_daemon_plist(
+    app_binary: &Path,
+    label: &str,
+    username: &str,
+    home_dir: &Path,
+    log_path: &Path,
+) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>UserName</key>
+    <string>{user}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{home}</string>
+        <key>USER</key>
+        <string>{user}</string>
+    </dict>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>{bin}</string>
+        <string>--prime-headless</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#,
+        label = xml_escape(label),
+        user = xml_escape(username),
+        home = xml_escape(&home_dir.to_string_lossy()),
+        bin = xml_escape(&app_binary.to_string_lossy()),
+        log = xml_escape(&log_path.to_string_lossy()),
+    )
+}
 
 /// True if the LaunchDaemon plist is installed.
 pub fn helper_installed() -> bool {
-    Path::new(PLIST_PATH).exists()
+    current_user_identity()
+        .map(|identity| helper_plist_path(&identity.uid).exists())
+        .unwrap_or(false)
+}
+
+/// True if the prime daemon is installed (auto-prime runs even while the Mac sleeps).
+pub fn prime_daemon_installed() -> bool {
+    current_user_identity()
+        .map(|identity| prime_plist_path(&identity.uid).exists())
+        .unwrap_or(false)
 }
 
 /// Install the root LaunchDaemon (one admin prompt). Idempotent: re-running refreshes the script
 /// and plist and reloads the daemon. The privileged step installs the script to a root-owned dir
 /// and chowns it root:wheel so only root can modify what root executes.
 pub fn install_helper(store: &Store) -> Result<()> {
+    let identity = current_user_identity()?;
+    let label = helper_label(&identity.uid);
+    let plist_path = helper_plist_path(&identity.uid);
+    let script_path = helper_script_path(&identity.uid);
+    let last_path = helper_last_path(&identity.uid);
     let request = store.wake_request_path();
     if !request.exists() {
         std::fs::write(&request, "").context("creating wake request file")?;
@@ -118,12 +262,12 @@ pub fn install_helper(store: &Store) -> Result<()> {
     let staged_plist = store.root_dir().join("wake-helper.staged.plist");
     std::fs::write(
         &staged_script,
-        helper_script(&request, Path::new(HELPER_LAST_PATH)),
+        helper_script(&request, &last_path),
     )
     .context("writing wake helper script")?;
     std::fs::write(
         &staged_plist,
-        helper_plist(Path::new(HELPER_SCRIPT_PATH), &request),
+        helper_plist(&label, &script_path, &request),
     )
     .context("writing wake helper plist")?;
 
@@ -134,19 +278,49 @@ pub fn install_helper(store: &Store) -> Result<()> {
         &format!(
             "/bin/cp {} {}",
             sh_single_quote(&staged_script.to_string_lossy()),
-            sh_single_quote(HELPER_SCRIPT_PATH)
+            sh_single_quote(&script_path.to_string_lossy())
         ),
-        &format!("/usr/sbin/chown root:wheel {}", sh_single_quote(HELPER_SCRIPT_PATH)),
-        &format!("/bin/chmod 755 {}", sh_single_quote(HELPER_SCRIPT_PATH)),
+        &format!(
+            "/usr/sbin/chown root:wheel {}",
+            sh_single_quote(&script_path.to_string_lossy())
+        ),
+        &format!(
+            "/bin/chmod 755 {}",
+            sh_single_quote(&script_path.to_string_lossy())
+        ),
         &format!(
             "/bin/cp {} {}",
             sh_single_quote(&staged_plist.to_string_lossy()),
-            sh_single_quote(PLIST_PATH)
+            sh_single_quote(&plist_path.to_string_lossy())
         ),
-        &format!("/usr/sbin/chown root:wheel {}", sh_single_quote(PLIST_PATH)),
-        &format!("/bin/chmod 644 {}", sh_single_quote(PLIST_PATH)),
-        &format!("/bin/launchctl bootout system {} 2>/dev/null", sh_single_quote(PLIST_PATH)),
-        &format!("/bin/launchctl bootstrap system {}", sh_single_quote(PLIST_PATH)),
+        &format!(
+            "/usr/sbin/chown root:wheel {}",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+        &format!(
+            "/bin/chmod 644 {}",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+        &format!(
+            "/bin/launchctl bootout system {} 2>/dev/null",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+        // Migrate away from the pre-0.5.7 global helper label/path so it can't run beside the
+        // per-user helper for this same app-data request file.
+        &format!(
+            "/bin/launchctl bootout system {} 2>/dev/null",
+            sh_single_quote(LEGACY_HELPER_PLIST_PATH)
+        ),
+        &format!(
+            "/bin/rm -f {} {} {}",
+            sh_single_quote(LEGACY_HELPER_PLIST_PATH),
+            sh_single_quote(LEGACY_HELPER_SCRIPT_PATH),
+            sh_single_quote(LEGACY_HELPER_LAST_PATH)
+        ),
+        &format!(
+            "/bin/launchctl bootstrap system {}",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
     ]
     .join("; ");
     let result = run_as_admin(
@@ -157,6 +331,85 @@ pub fn install_helper(store: &Store) -> Result<()> {
     let _ = std::fs::remove_file(&staged_script);
     let _ = std::fs::remove_file(&staged_plist);
     result
+}
+
+/// Install (or refresh) the user-context prime daemon. The daemon checks due schedules every minute;
+/// the pmset helper wakes the Mac at the actual anchor. Schedule changes therefore need no admin
+/// prompt and cannot leave a stale calendar plist behind.
+pub fn install_prime_daemon(store: &Store, app_binary: &Path) -> Result<()> {
+    let identity = current_user_identity()?;
+    let label = prime_daemon_label(&identity.uid);
+    let plist_path = prime_plist_path(&identity.uid);
+    let log_path = store.root_dir().join("prime-daemon.log");
+    let staged_plist = store.root_dir().join("prime-daemon.staged.plist");
+    std::fs::write(
+        &staged_plist,
+        prime_daemon_plist(
+            app_binary,
+            &label,
+            &identity.username,
+            &identity.home,
+            &log_path,
+        ),
+    )
+    .context("writing prime daemon plist")?;
+
+    let shell = [
+        "/bin/mkdir -p /usr/local/libexec".to_string(),
+        format!(
+            "/bin/cp {} {}",
+            sh_single_quote(&staged_plist.to_string_lossy()),
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+        format!(
+            "/usr/sbin/chown root:wheel {}",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+        format!(
+            "/bin/chmod 644 {}",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+        // Reload: bootout the old definition (ignore error if absent), then bootstrap the new one.
+        format!(
+            "/bin/launchctl bootout system {} 2>/dev/null",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+        format!(
+            "/bin/launchctl bootstrap system {}",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+    ]
+    .join("; ");
+    let result = run_as_admin(
+        &shell,
+        "AI Account Switcher cần quyền admin để cài lịch tự prime khi máy ngủ",
+    );
+    let _ = std::fs::remove_file(&staged_plist);
+    result
+}
+
+/// Remove the prime daemon (one admin prompt) — auto-prime then runs only while the app is awake.
+pub fn uninstall_prime_daemon() -> Result<()> {
+    let identity = current_user_identity()?;
+    let plist_path = prime_plist_path(&identity.uid);
+    if !plist_path.exists() {
+        return Ok(()); // nothing to remove — don't show an admin prompt for a no-op
+    }
+    let shell = [
+        format!(
+            "/bin/launchctl bootout system {} 2>/dev/null",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+        format!(
+            "/bin/rm -f {}",
+            sh_single_quote(&plist_path.to_string_lossy())
+        ),
+    ]
+    .join("; ");
+    run_as_admin(
+        &shell,
+        "AI Account Switcher cần quyền admin để tắt lịch tự prime khi máy ngủ",
+    )
 }
 
 /// Single-quote a string for safe embedding in a `/bin/sh` command (wrap in '...' and escape any
@@ -174,27 +427,75 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Remove the LaunchDaemon (one admin prompt) + the root-owned script/bookkeeping, and cancel any
-/// wake the helper had pending.
+/// Remove BOTH daemons (one admin prompt) + the root-owned script/bookkeeping, and cancel any wake
+/// the helper had pending. The prime daemon is torn down here too so "remove wake helper" leaves no
+/// orphan that would still try to prime.
 pub fn uninstall_helper() -> Result<()> {
+    let identity = current_user_identity()?;
+    let helper_plist = helper_plist_path(&identity.uid);
+    let prime_plist = prime_plist_path(&identity.uid);
+    let script_path = helper_script_path(&identity.uid);
+    let last_path = helper_last_path(&identity.uid);
     let shell = [
         // Cancel the wake we set, if any, before removing the bookkeeping file.
-        &format!(
+        format!(
             "if [ -s {last} ]; then OLD=\"$(/bin/cat {last})\"; [ -n \"$OLD\" ] && /usr/bin/pmset schedule cancel wake \"$OLD\" 2>/dev/null; fi",
-            last = sh_single_quote(HELPER_LAST_PATH)
-        ) as &str,
-        &format!("/bin/launchctl bootout system {} 2>/dev/null", sh_single_quote(PLIST_PATH)),
-        &format!("/bin/rm -f {}", sh_single_quote(PLIST_PATH)),
-        &format!("/bin/rm -f {}", sh_single_quote(HELPER_SCRIPT_PATH)),
-        &format!("/bin/rm -f {}", sh_single_quote(HELPER_LAST_PATH)),
+            last = sh_single_quote(&last_path.to_string_lossy())
+        ),
+        format!(
+            "/bin/launchctl bootout system {} 2>/dev/null",
+            sh_single_quote(&helper_plist.to_string_lossy())
+        ),
+        format!(
+            "/bin/rm -f {}",
+            sh_single_quote(&helper_plist.to_string_lossy())
+        ),
+        format!(
+            "/bin/rm -f {}",
+            sh_single_quote(&script_path.to_string_lossy())
+        ),
+        format!(
+            "/bin/rm -f {}",
+            sh_single_quote(&last_path.to_string_lossy())
+        ),
+        // Also tear down the prime daemon (no-op if it was never installed).
+        format!(
+            "/bin/launchctl bootout system {} 2>/dev/null",
+            sh_single_quote(&prime_plist.to_string_lossy())
+        ),
+        format!(
+            "/bin/rm -f {}",
+            sh_single_quote(&prime_plist.to_string_lossy())
+        ),
+        // Also remove the legacy pre-0.5.7 helper if present.
+        format!(
+            "if [ -s {last} ]; then OLD=\"$(/bin/cat {last})\"; [ -n \"$OLD\" ] && /usr/bin/pmset schedule cancel wake \"$OLD\" 2>/dev/null; fi",
+            last = sh_single_quote(LEGACY_HELPER_LAST_PATH)
+        ),
+        format!(
+            "/bin/launchctl bootout system {} 2>/dev/null",
+            sh_single_quote(LEGACY_HELPER_PLIST_PATH)
+        ),
+        format!(
+            "/bin/rm -f {} {} {}",
+            sh_single_quote(LEGACY_HELPER_PLIST_PATH),
+            sh_single_quote(LEGACY_HELPER_SCRIPT_PATH),
+            sh_single_quote(LEGACY_HELPER_LAST_PATH)
+        ),
     ]
     .join("; ");
-    run_as_admin(&shell, "AI Account Switcher cần quyền admin để gỡ trợ giúp đánh thức máy")
+    run_as_admin(
+        &shell,
+        "AI Account Switcher cần quyền admin để gỡ trợ giúp đánh thức máy",
+    )
 }
 
 /// Write the desired wake time into the request file (touching it triggers the daemon). `None`
 /// clears the wake (writes an empty file). Times are formatted in local time for `pmset`.
-pub fn write_wake_request(store: &Store, wake_local: Option<chrono::DateTime<chrono::Local>>) -> Result<()> {
+pub fn write_wake_request(
+    store: &Store,
+    wake_local: Option<chrono::DateTime<chrono::Local>>,
+) -> Result<()> {
     let content = match wake_local {
         Some(t) => t.format("%m/%d/%y %H:%M:%S").to_string(),
         None => String::new(),
@@ -224,4 +525,82 @@ fn run_as_admin(shell_command: &str, prompt: &str) -> Result<()> {
         anyhow::bail!("Không cài được helper: {}", err.trim());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prime_daemon_plist_is_valid() {
+        let bin =
+            Path::new("/Applications/AI Account Switcher.app/Contents/MacOS/ai-account-switcher");
+        let log =
+            Path::new("/Users/x/Library/Application Support/AI Account Switcher/prime-daemon.log");
+        let home = Path::new("/Users/alice");
+        let plist = prime_daemon_plist(
+            bin,
+            "dev.hoangphan.ai-account-switcher.prime-daemon.501",
+            "alice",
+            home,
+            log,
+        );
+        // The structural pieces launchd needs.
+        assert!(plist.contains("<string>--prime-headless</string>"));
+        assert!(plist.contains("/usr/bin/caffeinate"));
+        assert!(plist.contains("<key>StartInterval</key>\n    <integer>60</integer>"));
+        assert!(plist.contains("<key>ProcessType</key>"));
+        // Runs as the login user, NOT root (else $HOME=/var/root → empty state).
+        assert!(plist.contains("<key>UserName</key>\n    <string>alice</string>"));
+        assert!(plist.contains("<key>HOME</key>\n        <string>/Users/alice</string>"));
+
+        // Validate the actual generated XML with plutil (macOS only — skip elsewhere).
+        #[cfg(target_os = "macos")]
+        {
+            use std::io::Write;
+            let mut f = tempfile_in_tmp("prime-plist-test.plist");
+            f.0.write_all(plist.as_bytes()).unwrap();
+            f.0.flush().unwrap();
+            let out = std::process::Command::new("plutil")
+                .args(["-lint", &f.1])
+                .output()
+                .expect("run plutil");
+            assert!(
+                out.status.success(),
+                "plutil rejected the generated plist: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
+    /// The binary path is XML-escaped so a bundle name with `&`/quotes can't break the plist.
+    #[test]
+    fn prime_daemon_plist_escapes_binary_path() {
+        let bin = Path::new("/Apps/A & B \"X\".app/Contents/MacOS/app");
+        let log = Path::new("/tmp/log");
+        let plist = prime_daemon_plist(
+            bin,
+            "dev.hoangphan.ai-account-switcher.prime-daemon.501",
+            "alice",
+            Path::new("/Users/alice"),
+            log,
+        );
+        assert!(plist.contains("A &amp; B &quot;X&quot;.app"));
+        assert!(!plist.contains("A & B \"X\""));
+    }
+
+    #[test]
+    fn daemon_paths_are_isolated_per_macos_user() {
+        assert_ne!(helper_label("501"), helper_label("502"));
+        assert_ne!(helper_plist_path("501"), helper_plist_path("502"));
+        assert_ne!(prime_plist_path("501"), prime_plist_path("502"));
+        assert_ne!(helper_script_path("501"), helper_script_path("502"));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn tempfile_in_tmp(name: &str) -> (std::fs::File, String) {
+        let path = std::env::temp_dir().join(format!("{}-{}", std::process::id(), name));
+        let f = std::fs::File::create(&path).unwrap();
+        (f, path.to_string_lossy().into_owned())
+    }
 }

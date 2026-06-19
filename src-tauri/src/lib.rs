@@ -255,6 +255,19 @@ fn uninstall_wake_helper() -> Result<bool, String> {
     Ok(false)
 }
 
+/// Whether "prime while the Mac is asleep" is on (the prime LaunchDaemon is installed).
+#[tauri::command]
+fn prime_daemon_status() -> bool {
+    wake::prime_daemon_installed()
+}
+
+/// Toggle "prime while the Mac is asleep". Installing/removing the prime daemon is privileged (one
+/// admin prompt). Returns the resulting installed state so the UI reflects what actually happened.
+#[tauri::command]
+fn set_prime_while_asleep(state: State<'_, ManagedState>, enabled: bool) -> Result<bool, String> {
+    state.set_prime_while_asleep(enabled).map_err(display_error)
+}
+
 #[tauri::command]
 fn open_auto_prime_log(app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -407,6 +420,19 @@ fn create_virtual_api_account(
 }
 
 pub fn run() {
+    // Headless prime mode: invoked by the user-scoped prime LaunchDaemon after a pmset wake.
+    // macOS can suspend the GUI app during DarkWake, so the
+    // in-app scheduler can't run then — this path is a plain process the daemon launches: load state,
+    // prime everything due (late=true so a just-woken anchor counts), then exit. NO Tauri window,
+    // tray, or background loop. A cross-process lock serializes this with the GUI scheduler.
+    if std::env::args().any(|a| a == "--prime-headless") {
+        match ManagedState::new_headless() {
+            Ok(state) => state.run_due_primes(None, true),
+            Err(e) => eprintln!("[prime-headless] state init failed: {e}"),
+        }
+        return;
+    }
+
     let state = ManagedState::new().expect("failed to initialize app state");
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -447,6 +473,8 @@ pub fn run() {
             wake_helper_status,
             install_wake_helper,
             uninstall_wake_helper,
+            prime_daemon_status,
+            set_prime_while_asleep,
             detect_tool_setup,
             validate_tool_setup,
             set_tool_setup,

@@ -233,6 +233,12 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   if (command === "install_wake_helper") {
     return true as T;
   }
+  if (command === "prime_daemon_status") {
+    return false as T;
+  }
+  if (command === "set_prime_while_asleep") {
+    return ((args as { enabled?: boolean } | undefined)?.enabled ?? false) as T;
+  }
   if (command === "get_usage") {
     return structuredClone(demoUsage) as T;
   }
@@ -485,4 +491,7 @@ export const api = {
   wakeHelperStatus: () => invoke<boolean>("wake_helper_status"),
   installWakeHelper: () => invoke<boolean>("install_wake_helper"),
   uninstallWakeHelper: () => invoke<boolean>("uninstall_wake_helper"),
+  primeDaemonStatus: () => invoke<boolean>("prime_daemon_status"),
+  setPrimeWhileAsleep: (enabled: boolean) =>
+    invoke<boolean>("set_prime_while_asleep", { enabled }),
 };

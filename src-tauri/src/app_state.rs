@@ -28,6 +28,9 @@ pub struct ManagedState {
     pub store: Store,
     pub data: Mutex<StoredState>,
     pub api_server: Mutex<crate::api_gateway::ApiServerHandle>,
+    /// Headless daemon instances avoid GUI-only cleanup and merge prime outcomes into the latest
+    /// on-disk state before saving, because the GUI may remain alive while macOS launches them.
+    headless: bool,
     /// True while a prime batch is running, so the per-minute scheduler tick doesn't start a
     /// second overlapping batch (a single attempt can block for minutes on send retries).
     pub priming: std::sync::atomic::AtomicBool,
@@ -35,19 +38,33 @@ pub struct ManagedState {
 
 impl ManagedState {
     pub fn new() -> Result<Self> {
+        Self::new_with_mode(false)
+    }
+
+    pub fn new_headless() -> Result<Self> {
+        Self::new_with_mode(true)
+    }
+
+    fn new_with_mode(headless: bool) -> Result<Self> {
         let store = Store::new()?;
         let mut data = store.load()?;
-        migrate_defaults(&mut data.accounts);
-        migrate_auto_switch_settings(&mut data);
-        autodetect_missing_tool_setups(&store, &mut data);
-        store.save(&data)?;
+        if !headless {
+            migrate_defaults(&mut data.accounts);
+            migrate_auto_switch_settings(&mut data);
+            autodetect_missing_tool_setups(&store, &mut data);
+            store.save(&data)?;
+        }
         let server = crate::api_gateway::ApiServerHandle::stopped(&data.api_gateway);
         let managed = Self {
             store,
             data: Mutex::new(data),
             api_server: Mutex::new(server),
+            headless,
             priming: std::sync::atomic::AtomicBool::new(false),
         };
+        if headless {
+            return Ok(managed);
+        }
         // Clean up orphan active files: pointing to a deleted profile → clear + reinstall the hook.
         managed.heal_active_profiles();
         // The API server never auto-starts. Recover from a crash/forced quit that may have left
@@ -251,7 +268,12 @@ impl ManagedState {
             };
             // Bind to the requested model if given — a combo name OR any model the gateway can
             // serve directly. Else fall back to the first enabled combo.
-            let model = match input.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            let model = match input
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            {
                 Some(requested) => {
                     if !crate::api_gateway::model_is_servable(&data, requested) {
                         anyhow::bail!(
@@ -266,7 +288,9 @@ impl ManagedState {
                     .iter()
                     .find(|combo| combo.enabled)
                     .map(|combo| combo.name.clone())
-                    .context("Create at least one combo or pick a model before adding the account")?,
+                    .context(
+                        "Create at least one combo or pick a model before adding the account",
+                    )?,
             };
             let base_url = crate::api_gateway::base_url(&data.api_gateway);
             let default_dir = configured_default_config_dir(&data, &input.tool_id)
@@ -573,21 +597,15 @@ impl ManagedState {
 
     /// Toggle whether a subscription account participates in gateway rotation. Upserts the
     /// participation entry (missing = enabled by default).
-    pub fn set_api_gateway_account(
-        &self,
-        input: SetApiGatewayAccountInput,
-    ) -> Result<AppSnapshot> {
+    pub fn set_api_gateway_account(&self, input: SetApiGatewayAccountInput) -> Result<AppSnapshot> {
         {
             let mut data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            match data
-                .api_gateway
-                .accounts
-                .iter_mut()
-                .find(|entry| entry.tool_id == input.tool_id && entry.account_id == input.account_id)
-            {
+            match data.api_gateway.accounts.iter_mut().find(|entry| {
+                entry.tool_id == input.tool_id && entry.account_id == input.account_id
+            }) {
                 Some(entry) => entry.enabled = input.enabled,
                 None => data.api_gateway.accounts.push(ApiGatewayAccount {
                     tool_id: input.tool_id,
@@ -1075,6 +1093,37 @@ impl ManagedState {
         self.snapshot()
     }
 
+    fn has_enabled_prime_schedule(&self) -> bool {
+        let data = match self.data.lock() {
+            Ok(data) => data,
+            Err(_) => return false,
+        };
+        data.accounts
+            .iter()
+            .filter(|a| crate::prime::is_prime_eligible(&a.tool_id, a.api_provider.is_some()))
+            .filter_map(|a| data.auto_prime.get(&a.id))
+            .any(|s| s.enabled && parse_hhmm(&s.time).is_some())
+    }
+
+    /// Turn "prime while the Mac is asleep" on/off. The pmset wake helper is required: it wakes the
+    /// Mac, while this user-context daemon executes a headless due-check once per minute after wake.
+    pub fn set_prime_while_asleep(&self, enabled: bool) -> Result<bool> {
+        if enabled {
+            if !crate::wake::helper_installed() {
+                anyhow::bail!("Hãy bật “Đánh thức máy để prime (pmset)” trước.");
+            }
+            let app_binary = std::env::current_exe()
+                .map_err(|e| anyhow::anyhow!("không tìm được đường dẫn app: {e}"))?;
+            if !self.has_enabled_prime_schedule() {
+                anyhow::bail!("Chưa có tài khoản nào bật auto-prime — bật lịch cho ít nhất 1 tài khoản trước.");
+            }
+            crate::wake::install_prime_daemon(&self.store, &app_binary)?;
+        } else {
+            crate::wake::uninstall_prime_daemon()?;
+        }
+        Ok(crate::wake::prime_daemon_installed())
+    }
+
     /// Read the human-readable auto-prime activity log (newest content at the bottom).
     pub fn auto_prime_log(&self) -> String {
         std::fs::read_to_string(self.store.auto_prime_log_path()).unwrap_or_default()
@@ -1242,10 +1291,12 @@ impl ManagedState {
             else {
                 continue;
             };
-            let entry = by_day.entry(date.to_string()).or_insert_with(|| AutoPrimeDayStat {
-                date: date.to_string(),
-                ..Default::default()
-            });
+            let entry = by_day
+                .entry(date.to_string())
+                .or_insert_with(|| AutoPrimeDayStat {
+                    date: date.to_string(),
+                    ..Default::default()
+                });
             // Classify by the marker the wording uses (see brainstorm Mục 7.3).
             if line.contains("— SUCCESS") {
                 entry.success += 1;
@@ -1469,6 +1520,7 @@ impl ManagedState {
     /// thread (every minute) and once at startup (to catch a missed time → "primed muộn"). `late`
     /// marks the startup catch-up so the log says so.
     pub fn run_due_primes(&self, app: Option<&AppHandle>, late: bool) {
+        use fs2::FileExt;
         use std::sync::atomic::Ordering;
         // Skip if a previous batch is still running (send retries can take minutes). The flag is
         // cleared at the end of this call; `_guard` ensures that even on an early return.
@@ -1486,6 +1538,28 @@ impl ManagedState {
             }
         }
         let _guard = ClearOnDrop(&self.priming);
+
+        // The GUI scheduler and the LaunchDaemon are separate processes. Serialize complete prime
+        // batches so both cannot observe the same due slot and send twice. After acquiring the lock,
+        // reload state so a GUI instance that was alive before a headless run sees the daemon's
+        // persisted last_primed_date before deciding what is due.
+        let lock_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(self.store.prime_lock_path())
+        {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        if lock_file.try_lock_exclusive().is_err() {
+            return;
+        }
+        if let Ok(latest) = self.store.load() {
+            if let Ok(mut data) = self.data.lock() {
+                *data = latest;
+            }
+        }
 
         // Hold the Mac awake for the WHOLE tick — created up front and unconditionally, so it also
         // covers a defer that the first prime pass itself creates (a Hold sets `deferred_until`
@@ -1551,7 +1625,10 @@ impl ManagedState {
                 .iter()
                 .filter_map(|account| {
                     let setting = data.auto_prime.get(&account.id)?;
-                    if !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some()) {
+                    if !crate::prime::is_prime_eligible(
+                        &account.tool_id,
+                        account.api_provider.is_some(),
+                    ) {
                         return None;
                     }
                     // Held earlier (old window still active): wait until the defer instant before
@@ -1579,6 +1656,25 @@ impl ManagedState {
                     if !scheduled_due && !extend_due {
                         return None;
                     }
+                    let mut claim_keys = Vec::new();
+                    if scheduled_due {
+                        claim_keys.push(format!(
+                            "scheduled|{}|{}|{}",
+                            account.id, today, setting.time
+                        ));
+                    }
+                    if extend_due {
+                        claim_keys.push(format!(
+                            "extend|{}|{}",
+                            account.id,
+                            setting
+                                .deferred_until
+                                .as_deref()
+                                .or(setting.extend_reminded_reset.as_deref())
+                                .unwrap_or("pending")
+                        ));
+                    }
+                    let claim_paths = claim_prime_keys(&self.store, &claim_keys)?;
                     let default_dir = resolved_default_config_dir(&data, &account.tool_id);
                     let config_dir =
                         account_config_dir_with_default(&self.store, account, &default_dir);
@@ -1598,6 +1694,7 @@ impl ManagedState {
                         // genuinely arrived (even alongside an extend), it IS the scheduled run.
                         scheduled: scheduled_due,
                         manual: false,
+                        claim_paths,
                     })
                 })
                 .collect()
@@ -1645,7 +1742,9 @@ impl ManagedState {
                 .find(|a| a.id == account_id && a.tool_id == tool_id)
                 .ok_or_else(|| anyhow::anyhow!("Không tìm thấy tài khoản"))?;
             if !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some()) {
-                anyhow::bail!("Tài khoản này không hỗ trợ prime (chỉ Claude/Codex đăng nhập subscription)");
+                anyhow::bail!(
+                    "Tài khoản này không hỗ trợ prime (chỉ Claude/Codex đăng nhập subscription)"
+                );
             }
             let default_dir = resolved_default_config_dir(&data, &account.tool_id);
             let config_dir = account_config_dir_with_default(&self.store, account, &default_dir);
@@ -1660,6 +1759,7 @@ impl ManagedState {
                 is_extend: false,
                 scheduled: false,
                 manual: true,
+                claim_paths: Vec::new(),
             }
         };
 
@@ -1807,6 +1907,14 @@ impl ManagedState {
             ),
         };
 
+        // A missing token is retryable and does not consume the schedule/extend. Release its
+        // cross-process claims so a later tick can try again after login or Keychain unlock.
+        if matches!(outcome, PrimeOutcome::SkipNoToken) {
+            for path in &job.claim_paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
         // Update the per-account schedule record. A "terminal" outcome (we opened a window or gave
         // up after the full retry budget) consumes today's scheduled attempt so the scheduler does
         // NOT restart a fresh retry batch every minute. HOLD/SKIP are not terminal: HOLD defers,
@@ -1816,6 +1924,11 @@ impl ManagedState {
         // reload (and a flash of disabled controls) each time.
         let mut visible_change = false;
         if let Ok(mut data) = self.data.lock() {
+            if self.headless {
+                if let Ok(latest) = self.store.load() {
+                    *data = latest;
+                }
+            }
             if let Some(setting) = data.auto_prime.get_mut(account_id) {
                 visible_change = setting.last_result.as_deref() != Some(result);
                 setting.last_result = Some(result.to_string());
@@ -1906,7 +2019,11 @@ impl ManagedState {
         match outcome {
             // On success, refresh the displayed quota right away + recompute the next wake.
             PrimeOutcome::Success { .. } => {
-                let _ = self.refresh_single_account(tool_id, account_id, app);
+                // The GUI refreshes immediately for display. A headless process avoids a second
+                // long network/write phase; the regular quota poller refreshes it after wake.
+                if !self.headless {
+                    let _ = self.refresh_single_account(tool_id, account_id, app);
+                }
                 self.update_wake_schedule();
             }
             // Held: an EXTEND just armed a defer (= reset_at + grace) — recompute the wake so the Mac
@@ -1920,7 +2037,8 @@ impl ManagedState {
         // Nudge the UI to re-pull only when something user-visible changed (new result), on success
         // (quota just moved), or for a manual prime (the user is watching for the button's result).
         // This avoids reloading + flashing controls every minute on a repeating SkipNoToken/Hold.
-        let should_emit = visible_change || job.manual || matches!(outcome, PrimeOutcome::Success { .. });
+        let should_emit =
+            visible_change || job.manual || matches!(outcome, PrimeOutcome::Success { .. });
         if should_emit {
             if let Some(app) = app {
                 let _ = app.emit("auto-prime-changed", ());
@@ -3099,6 +3217,40 @@ struct PrimeJob {
     /// later daily anchor still runs. `manual` instead gates extend-state resolution: a manual
     /// FAILURE must not clear an armed auto-extend; a manual SUCCESS does (a fresh window opened).
     manual: bool,
+    /// Atomic cross-process claim for scheduled/extend work. It remains for consumed outcomes so a
+    /// stale GUI state cannot run the same slot again; retryable token skips remove it.
+    claim_paths: Vec<std::path::PathBuf>,
+}
+
+/// Atomically claim scheduled/extend work across the GUI and headless daemon processes. Consumed
+/// claims intentionally remain on disk: if a stale GUI process later overwrites `state.json`, the
+/// marker still prevents a duplicate prime for the same scheduled/extend key. Retryable token skips
+/// remove their claims explicitly in `record_prime_outcome`.
+fn claim_prime_keys(store: &Store, keys: &[String]) -> Option<Vec<std::path::PathBuf>> {
+    let mut claimed = Vec::new();
+    for key in keys {
+        let path = store.prime_claim_path(key);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => claimed.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                for claimed_path in claimed {
+                    let _ = std::fs::remove_file(claimed_path);
+                }
+                return None;
+            }
+            Err(_) => {
+                for claimed_path in claimed {
+                    let _ = std::fs::remove_file(claimed_path);
+                }
+                return None;
+            }
+        }
+    }
+    Some(claimed)
 }
 
 /// Whether a pending `deferred_until` on this account is something the scheduler will actually act
@@ -3268,14 +3420,17 @@ fn scheduled_anchor_within_window(reset_at: &str, time: &str) -> Option<String> 
     //
     // The anchor of interest is always within 5h of `reset`, so checking today + tomorrow suffices.
     let reset_date = reset.date_naive();
-    let anchor = [reset_date, reset_date.checked_add_days(chrono::Days::new(1))?]
-        .into_iter()
-        .filter_map(|date| {
-            chrono::Local
-                .from_local_datetime(&date.and_hms_opt(h, m, 0)?)
-                .single()
-        })
-        .find(|dt| *dt > reset)?;
+    let anchor = [
+        reset_date,
+        reset_date.checked_add_days(chrono::Days::new(1))?,
+    ]
+    .into_iter()
+    .filter_map(|date| {
+        chrono::Local
+            .from_local_datetime(&date.and_hms_opt(h, m, 0)?)
+            .single()
+    })
+    .find(|dt| *dt > reset)?;
     // Only prefer the anchor if it's within the 5h the extend's window would cover; past that the
     // anchor belongs to a later window and the user would sit too long with no session — extend now.
     if anchor <= reset + chrono::Duration::minutes(FIVE_HOUR_WINDOW_MIN) {
@@ -3288,11 +3443,7 @@ fn scheduled_anchor_within_window(reset_at: &str, time: &str) -> Option<String> 
 /// Render an ISO 8601 instant as local `HH:MM` for log lines. Falls back to the raw string.
 fn local_hhmm_from_iso(iso: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(iso)
-        .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%H:%M")
-                .to_string()
-        })
+        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
         .unwrap_or_else(|_| iso.to_string())
 }
 
@@ -3338,7 +3489,10 @@ mod tests {
 
     /// A fixed, unambiguous local base instant (noon avoids DST midnight edge cases).
     fn base() -> chrono::DateTime<Local> {
-        Local.with_ymd_and_hms(2026, 6, 18, 12, 0, 0).single().unwrap()
+        Local
+            .with_ymd_and_hms(2026, 6, 18, 12, 0, 0)
+            .single()
+            .unwrap()
     }
 
     #[test]
@@ -3400,7 +3554,10 @@ mod tests {
             got.starts_with(&expected_local),
             "expected label to start with local time {expected_local}, got {got}"
         );
-        assert!(got.contains("(UTC"), "expected a UTC-offset label, got {got}");
+        assert!(
+            got.contains("(UTC"),
+            "expected a UTC-offset label, got {got}"
+        );
     }
 
     #[test]
@@ -3464,5 +3621,26 @@ mod tests {
             .format("%Y-%m-%d")
             .to_string();
         assert_eq!(next_eligible_date(&long_passed), Some(tomorrow));
+    }
+
+    #[test]
+    fn prime_claim_is_atomic_across_processes() {
+        let root =
+            std::env::temp_dir().join(format!("ai-switcher-prime-claim-{}", uuid::Uuid::new_v4()));
+        let store = Store::for_test(root.clone()).unwrap();
+        let keys = vec!["scheduled|account|2026-06-20|06:30".to_string()];
+        let first = claim_prime_keys(&store, &keys).expect("first process claims the slot");
+        assert!(
+            claim_prime_keys(&store, &keys).is_none(),
+            "second process must not claim the same slot"
+        );
+        for path in first {
+            std::fs::remove_file(path).unwrap();
+        }
+        assert!(
+            claim_prime_keys(&store, &keys).is_some(),
+            "retryable outcome can release and reclaim the slot"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

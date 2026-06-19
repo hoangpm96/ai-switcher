@@ -41,7 +41,7 @@ pub enum PrimeOutcome {
     Hold { reset_at: String },
     /// Account has no valid token (expired / logged out).
     SkipNoToken,
-    /// Couldn't establish the current window state (read error / unparseable / inconclusive probe),
+    /// Couldn't establish the current window state (read error / unparseable / inconclusive data),
     /// so we did NOT send — failing closed rather than priming into an unknown window. Transient;
     /// the next scheduled tick retries.
     SkipUnknownState,

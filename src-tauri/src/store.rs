@@ -65,6 +65,7 @@ impl Store {
         let root = dirs.data_local_dir().to_path_buf();
         fs::create_dir_all(root.join("accounts"))?;
         fs::create_dir_all(root.join("backups"))?;
+        fs::create_dir_all(root.join("prime-claims"))?;
         Ok(Self { root })
     }
 
@@ -91,6 +92,19 @@ impl Store {
     /// Human-readable activity log for auto session priming (one line per event).
     pub fn auto_prime_log_path(&self) -> PathBuf {
         self.root.join("auto-prime.log")
+    }
+
+    /// Advisory cross-process lock used to serialize GUI and headless prime batches.
+    pub fn prime_lock_path(&self) -> PathBuf {
+        self.root.join("prime.lock")
+    }
+
+    pub fn prime_claim_path(&self, key: &str) -> PathBuf {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_bytes());
+        self.root
+            .join("prime-claims")
+            .join(format!("{digest:x}.claim"))
     }
 
     /// The root data dir (used to place the pmset wake helper's request/script files).
@@ -143,6 +157,7 @@ impl Store {
     pub fn for_test(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(root.join("accounts"))?;
         fs::create_dir_all(root.join("backups"))?;
+        fs::create_dir_all(root.join("prime-claims"))?;
         Ok(Self { root })
     }
 }

@@ -48,11 +48,14 @@ export function AutoSessionView({
   const [loadingLog, setLoadingLog] = useState(false);
   const [wakeHelper, setWakeHelper] = useState<boolean | null>(null);
   const [wakeBusy, setWakeBusy] = useState(false);
+  const [primeAsleep, setPrimeAsleep] = useState<boolean | null>(null);
+  const [primeAsleepBusy, setPrimeAsleepBusy] = useState(false);
   const [stats, setStats] = useState<AutoPrimeDayStat[] | null>(null);
   const [loadingStats, setLoadingStats] = useState(false);
 
   useEffect(() => {
     void api.wakeHelperStatus().then(setWakeHelper).catch(() => setWakeHelper(false));
+    void api.primeDaemonStatus().then(setPrimeAsleep).catch(() => setPrimeAsleep(false));
   }, []);
 
   async function viewStats() {
@@ -86,6 +89,7 @@ export function AutoSessionView({
         ? await api.uninstallWakeHelper()
         : await api.installWakeHelper();
       setWakeHelper(installed);
+      if (!installed) setPrimeAsleep(false);
       notify(
         installed
           ? "Đã cài trợ giúp đánh thức máy — Mac sẽ tự thức để prime đúng giờ"
@@ -95,6 +99,23 @@ export function AutoSessionView({
       notify(String(e), "error");
     } finally {
       setWakeBusy(false);
+    }
+  }
+
+  async function togglePrimeAsleep() {
+    setPrimeAsleepBusy(true);
+    try {
+      const installed = await api.setPrimeWhileAsleep(!primeAsleep);
+      setPrimeAsleep(installed);
+      notify(
+        installed
+          ? "Đã bật tự prime khi máy ngủ — Mac sẽ tự thức và gửi yêu cầu prime đúng giờ; nếu Keychain còn khóa thì sẽ thử lại sau khi mở khóa"
+          : "Đã tắt tự prime khi máy ngủ",
+      );
+    } catch (e) {
+      notify(String(e), "error");
+    } finally {
+      setPrimeAsleepBusy(false);
     }
   }
 
@@ -210,6 +231,35 @@ export function AutoSessionView({
             disabled={wakeBusy || wakeHelper === null}
             onClick={() => void toggleWakeHelper()}
             aria-label="Đánh thức máy để prime"
+          >
+            <span className="switchThumb" />
+          </button>
+        </div>
+      </div>
+
+      <div className="wakeRow">
+        <div className="wakeText">
+          <strong>
+            <AlarmClock size={15} /> Tự prime cả khi máy ngủ
+          </strong>
+          <span className="muted">
+            {primeAsleep === null
+              ? "Đang kiểm tra…"
+              : primeAsleep
+                ? "Một tiến trình nền chạy dưới đúng macOS profile để gửi yêu cầu prime đúng giờ; nếu chưa đọc được token do Keychain khóa, lần tick sau sẽ thử lại."
+                : "Chạy dưới đúng macOS profile và cấu hình từng account; không lưu mật khẩu máy. Claude sẽ thử lại sau khi mở khóa nếu Keychain đang bị khóa (cần quyền admin 1 lần)."}
+          </span>
+        </div>
+        <div className="wakeToggle">
+          {primeAsleepBusy ? <Loader2 className="spin" size={15} /> : null}
+          <button
+            type="button"
+            role="switch"
+            aria-checked={!!primeAsleep}
+            className={`switchTrack ${primeAsleep ? "on" : ""}`}
+            disabled={primeAsleepBusy || primeAsleep === null}
+            onClick={() => void togglePrimeAsleep()}
+            aria-label="Tự prime cả khi máy ngủ"
           >
             <span className="switchThumb" />
           </button>

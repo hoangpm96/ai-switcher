@@ -49,8 +49,9 @@ pub(crate) enum WindowState {
     /// A real window is running → a prime would land inside it (D2 must HOLD).
     Anchored,
     /// Codex only: future reset ≈ now + 5h. Could be ROLLING (unanchored, primeable) OR freshly
-    /// anchored (a real window). A single snapshot can't tell — the prime path must run the
-    /// two-snapshot probe (`codex_window_is_rolling`) to decide.
+    /// anchored (a real window). A single snapshot can't tell, so callers choose their failure
+    /// mode: the scheduled prime may send a cheap request, while UI labels must avoid guaranteeing
+    /// that a new window opened until confirmation.
     Ambiguous,
     /// We don't actually know (read error, unparseable/missing reset with non-zero or unknown
     /// usage). Callers must fail CLOSED: hide the button, and D2 must NOT send.
@@ -113,8 +114,9 @@ fn reset_is_near_full_window(reset: i64, now: i64) -> bool {
 }
 
 /// Whether the user can open a fresh 5h window right now. See `QuotaInfo::prime_available`.
-/// Single-snapshot UI heuristic: `Ambiguous` is shown as available (the button click is gated by
-/// the prime path's two-snapshot probe, so a brief over-show for a fresh anchor is harmless).
+/// Single-snapshot UI heuristic: `Ambiguous` is shown as available, but the click result still comes
+/// from the prime path's post-send confirmation, so the UI must phrase it as a request unless the
+/// backend returns confirmed success.
 fn prime_available_for(tool_id: &ToolId, quota: &QuotaInfo) -> Option<bool> {
     match classify_window(tool_id, quota) {
         WindowState::Primeable | WindowState::Ambiguous => Some(true),
