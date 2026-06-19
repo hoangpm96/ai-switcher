@@ -490,8 +490,10 @@ pub struct AutoPrimeSetting {
     /// to ASK). A convenience for days the user doesn't want to confirm each time.
     #[serde(default)]
     pub auto_extend: bool,
-    /// When a prime is held (old window still active), the scheduler skips this account until this
-    /// ISO instant (= reset_at + 5min), so it doesn't re-attempt + re-log "HOÃN" every minute.
+    /// Set only by an armed EXTEND: the scheduler skips this account until this ISO instant (just
+    /// past the old window's reset_at), then opens the fresh window the moment the old one ends. A
+    /// plain scheduled prime that's held does NOT set this (it consumes the day's slot instead) — so
+    /// a held daily anchor never plants a defer that would steal the next morning's anchor wake.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred_until: Option<String>,
     /// The reset_at the user explicitly dismissed the "extend?" prompt for, so the UI hides the

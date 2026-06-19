@@ -995,14 +995,18 @@ impl ManagedState {
             let just_enabled = enabled && !entry.enabled;
             entry.enabled = enabled;
             entry.time = time;
-            // Changing the time (or turning the schedule on) starts a fresh schedule: clear the
-            // "already primed today" guard, and set `active_from` so the FIRST prime is the next
-            // occurrence of the anchor — not an immediate catch-up if the user sets it after today's
-            // anchor already passed (e.g. set 06:30 at 22:00 → first prime is tomorrow 06:30, not now).
+            // Changing the time OR enabling sets `active_from` so the FIRST prime is the next
+            // occurrence of the anchor — not an immediate catch-up if the schedule is (re)armed after
+            // today's anchor already passed (e.g. set 06:30 at 22:00 → first prime is tomorrow 06:30).
             if time_changed || just_enabled {
+                entry.active_from = next_eligible_date(&entry.time);
+            }
+            // ONLY a real time change clears the "already primed today" guard (the new time is a fresh
+            // schedule that may run again today). Re-ENABLING the SAME time must NOT clear it, or
+            // toggling off→on within the catch-up window would prime a second time the same day.
+            if time_changed {
                 entry.last_primed_date = None;
                 entry.last_primed_time = None;
-                entry.active_from = next_eligible_date(&entry.time);
                 // A pending SCHEDULED hold-defer from the OLD time must not suppress the NEW time —
                 // but DON'T clear a defer that belongs to an armed auto-extend (it's tied to the
                 // running 5h window, not the daily anchor), or the extend would fire early.
@@ -1044,12 +1048,16 @@ impl ManagedState {
                 let just_enabled = enabled && !entry.enabled;
                 entry.enabled = enabled;
                 entry.time = time.clone();
+                // First prime = next occurrence of the anchor, not an evening catch-up (see
+                // set_auto_prime).
                 if time_changed || just_enabled {
+                    entry.active_from = next_eligible_date(&entry.time);
+                }
+                // Only a real time change clears the "already primed today" guard — re-enabling the
+                // same time must not (see set_auto_prime, double-prime guard).
+                if time_changed {
                     entry.last_primed_date = None;
                     entry.last_primed_time = None;
-                    // First prime = next occurrence of the anchor, not an evening catch-up (see
-                    // set_auto_prime).
-                    entry.active_from = next_eligible_date(&entry.time);
                     // Don't clear an armed auto-extend's defer (see set_auto_prime).
                     if !entry.extend_requested {
                         entry.deferred_until = None;
@@ -1289,8 +1297,12 @@ impl ManagedState {
                 entry.deferred_until = current_reset.as_deref().map(reset_at_plus_grace);
             } else {
                 // Dismiss: remember it for THIS window so the UI hides the button and the poller
-                // doesn't prompt again for the same window-ending.
+                // doesn't prompt again for the same window-ending. Also clear any defer this extend
+                // request had armed — after A3 a non-extend defer is invisible to the wake calc, but
+                // collect_and_prime_due would still skip the account while the (now orphaned) defer is
+                // in the future, suppressing its daily prime until the old window ends.
                 entry.extend_dismissed_reset = current_reset;
+                entry.deferred_until = None;
             }
             self.store.save(&data)?;
         }
@@ -1809,11 +1821,15 @@ impl ManagedState {
                 setting.last_result = Some(result.to_string());
                 setting.last_attempt_at = Some(now());
                 let succeeded = matches!(outcome, PrimeOutcome::Success { .. });
+                // SkipUnknownState is terminal for the day: we couldn't read the window state, and
+                // re-probing every tick for the whole catch-up window would just spam the read + log.
+                // The next day's anchor retries; if the user wants it sooner they tap "Prime ngay".
                 let terminal = matches!(
                     outcome,
                     PrimeOutcome::Success { .. }
                         | PrimeOutcome::FailUnconfirmed
                         | PrimeOutcome::FailSend { .. }
+                        | PrimeOutcome::SkipUnknownState
                 );
                 // "Consume" today's scheduled slot (set last_primed_date/time so the daily prime
                 // doesn't re-fire) ONLY for a job that the daily schedule actually triggered. A manual
@@ -1852,14 +1868,10 @@ impl ManagedState {
                 match outcome {
                     // Held on an EXTEND: defer the re-attempt to just after the old window ends, so
                     // the armed extend opens the fresh window the moment the current one closes. Only
-                    // an extend defers-and-retries — it's a commitment to roll the session over.
+                    // an extend defers-and-retries — it's a commitment to roll the session over. Uses
+                    // the same grace past reset_at as the other extend defers (clock-skew buffer).
                     PrimeOutcome::Hold { reset_at } if !job.manual && job.is_extend => {
-                        setting.deferred_until = chrono::DateTime::parse_from_rfc3339(reset_at)
-                            .ok()
-                            .map(|t| {
-                                (t.with_timezone(&chrono::Utc) + chrono::Duration::minutes(5))
-                                    .to_rfc3339()
-                            });
+                        setting.deferred_until = Some(reset_at_plus_grace(reset_at));
                     }
                     // Held on a plain SCHEDULED prime: do NOT arm a defer. The slot was just consumed
                     // (above), so today is done — there's no point retrying when the old window ends,
@@ -1897,8 +1909,9 @@ impl ManagedState {
                 let _ = self.refresh_single_account(tool_id, account_id, app);
                 self.update_wake_schedule();
             }
-            // Held: `deferred_until` was just persisted above (= reset_at + 5'). Recompute the wake
-            // so the Mac wakes right after the old window ends — next_wake_time folds it in.
+            // Held: an EXTEND just armed a defer (= reset_at + grace) — recompute the wake so the Mac
+            // wakes right after the old window ends. A plain scheduled Hold cleared its defer above
+            // (it consumed the day's slot), so the recompute simply drops back to the daily anchor.
             PrimeOutcome::Hold { .. } => {
                 self.update_wake_schedule();
             }
@@ -3130,13 +3143,26 @@ fn local_today() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// Minutes from a daily anchor `time` (`HH:MM`, local) to `now_hhmm` (`HH:MM`, local), same day.
+/// Minutes from a daily anchor `time` (`HH:MM`, local) to `now_hhmm` (`HH:MM`, local).
 /// Positive = the anchor already passed this many minutes ago; negative = still upcoming today.
+/// Wraps across midnight (a 23:50 anchor at 00:10 reads as 20 min past, not −1420).
 /// Returns `None` if either string is malformed (caller treats that as "not due").
+///
+/// Edge note: for an anchor within `CATCH_UP_MIN` of midnight, a catch-up that runs just after
+/// midnight stamps `last_primed_date = today` (the new date), which then suppresses tonight's same
+/// anchor. That only bites anchors set in the last hour before midnight; daily anchors are normally
+/// set to a work-start time, so this is left as a known limitation rather than threading the logical
+/// anchor date through `PrimeJob`.
 fn anchor_age_minutes(time: &str, now_hhmm: &str) -> Option<i64> {
     let (sh, sm) = parse_hhmm(time)?;
     let (nh, nm) = parse_hhmm(now_hhmm)?;
-    Some((nh as i64 * 60 + nm as i64) - (sh as i64 * 60 + sm as i64))
+    let mut diff = (nh as i64 * 60 + nm as i64) - (sh as i64 * 60 + sm as i64);
+    // Handle the midnight wrap: a 23:50 anchor checked at 00:10 is 20 min past, not −1420. Anything
+    // more than half a day "behind" is really the same anchor seen just after midnight — add a day.
+    if diff < -720 {
+        diff += 1440;
+    }
+    Some(diff)
 }
 
 /// When the user creates or edits a schedule, decide the first local date the anchor is eligible.
@@ -3396,6 +3422,20 @@ mod tests {
     fn anchor_age_rejects_malformed() {
         assert_eq!(anchor_age_minutes("99:99", "08:00"), None);
         assert_eq!(anchor_age_minutes("07:30", "nope"), None);
+    }
+
+    #[test]
+    fn anchor_age_handles_midnight_wrap() {
+        // The only wrap we correct: a late-night anchor seen just AFTER midnight. 23:50 anchor at
+        // 00:10 = 20 min past (a valid catch-up), not −1420 (which would skip it).
+        assert_eq!(anchor_age_minutes("23:50", "00:10"), Some(20));
+        // 23:00 anchor at 00:30 = 90 min past (just outside the 60' catch-up, but correctly positive).
+        assert_eq!(anchor_age_minutes("23:00", "00:30"), Some(90));
+        // A genuinely-upcoming morning anchor stays negative (not wrapped).
+        assert_eq!(anchor_age_minutes("07:30", "07:00"), Some(-30));
+        // Anchor far in the past today (00:05 anchor, now 23:55) reads as a large positive age —
+        // long past the catch-up window, so "not due" — which is the intended behavior.
+        assert_eq!(anchor_age_minutes("00:05", "23:55"), Some(1430));
     }
 
     #[test]
