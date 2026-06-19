@@ -19,12 +19,117 @@ pub fn read_quota(tool_id: &ToolId, config_dir: &Path) -> QuotaInfo {
         ToolId::Antigravity => read_antigravity_quota(),
     };
 
-    result.unwrap_or_else(|e| match tool_id {
+    let mut quota = result.unwrap_or_else(|e| match tool_id {
         // Antigravity only exposes quota while the IDE is open (language server runs locally).
         ToolId::Antigravity => QuotaInfo::with_message("Open Antigravity IDE to read quota"),
         _ => QuotaInfo::with_message(format!("Couldn't read quota: {e:#}")),
-    })
+    });
+    // Tell the UI whether "Prime ngay" should be offered for this account. Computed centrally
+    // here (one place, one clock read) rather than in each endpoint parser.
+    quota.prime_available = prime_available_for(tool_id, &quota);
+    quota
 }
+
+/// Codex's 5h windows are exactly `CODEX_FIVE_HOUR_SECONDS` long. We classify a `reset_at`
+/// as "rolling" (no real window anchored yet) when it sits within `ROLLING_TOLERANCE_SECONDS`
+/// of `now + CODEX_FIVE_HOUR_SECONDS` — the endpoint returns that moving value until a real
+/// request anchors the window. Tolerance is wide (not a few seconds) to absorb network
+/// latency, clock skew, and server-side processing.
+const CODEX_FIVE_HOUR_SECONDS: i64 = 18_000;
+const ROLLING_TOLERANCE_SECONDS: i64 = 90;
+
+/// Single-snapshot classification of an account's 5h window. The two prime paths (D2 Hold, the UI
+/// button) and the prime-availability flag all derive from this one function, so the rules live in
+/// ONE place and fail the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowState {
+    /// No real window running → priming opens a fresh one. (Window ended, or Codex reset is so far
+    /// in the past it can't be a live window.)
+    Primeable,
+    /// A real window is running → a prime would land inside it (D2 must HOLD).
+    Anchored,
+    /// Codex only: future reset ≈ now + 5h. Could be ROLLING (unanchored, primeable) OR freshly
+    /// anchored (a real window). A single snapshot can't tell — the prime path must run the
+    /// two-snapshot probe (`codex_window_is_rolling`) to decide.
+    Ambiguous,
+    /// We don't actually know (read error, unparseable/missing reset with non-zero or unknown
+    /// usage). Callers must fail CLOSED: hide the button, and D2 must NOT send.
+    Unknown,
+}
+
+/// Classify the 5h window from a full quota snapshot. A read error → `Unknown`. See `WindowState`.
+pub(crate) fn classify_window(tool_id: &ToolId, quota: &QuotaInfo) -> WindowState {
+    if quota.error.is_some() {
+        return WindowState::Unknown;
+    }
+    classify_five_hour(tool_id, &quota.five_hour)
+}
+
+/// Classify just the 5h `QuotaWindow` (used by the prime path, which reads only the live window).
+/// Callers that have a full `QuotaInfo` should use `classify_window` so a read error maps to
+/// `Unknown` first.
+pub(crate) fn classify_five_hour(tool_id: &ToolId, window: &QuotaWindow) -> WindowState {
+    if matches!(tool_id, ToolId::Antigravity) {
+        return WindowState::Unknown; // can't prime
+    }
+    let now = chrono::Utc::now().timestamp();
+    match window.reset_at.as_deref() {
+        // No reset_at: "fully ended" (Primeable) only when the endpoint actually reported an empty
+        // window (used% 0). A missing/None percent means the field wasn't reported → Unknown.
+        None => match window.percent_used {
+            Some(p) if p <= 0.0 => WindowState::Primeable,
+            _ => WindowState::Unknown,
+        },
+        Some(reset_at) => {
+            // An UNPARSEABLE timestamp is Unknown, never "ended".
+            let Some(reset) = parse_rfc3339_epoch(reset_at) else {
+                return WindowState::Unknown;
+            };
+            if reset <= now {
+                return WindowState::Primeable; // ended
+            }
+            match tool_id {
+                // Claude's future reset_at is always a real anchored window.
+                ToolId::Claude => WindowState::Anchored,
+                // Codex future reset near now+5h is ambiguous (rolling vs fresh anchor); farther
+                // from now+5h is a clearly-anchored real window.
+                ToolId::Codex => {
+                    if reset_is_near_full_window(reset, now) {
+                        WindowState::Ambiguous
+                    } else {
+                        WindowState::Anchored
+                    }
+                }
+                ToolId::Antigravity => WindowState::Unknown,
+            }
+        }
+    }
+}
+
+/// Whether a Codex reset sits within tolerance of `now + 5h` — the single-snapshot signature shared
+/// by both a rolling (unanchored) window and one anchored only seconds ago.
+fn reset_is_near_full_window(reset: i64, now: i64) -> bool {
+    (reset - now - CODEX_FIVE_HOUR_SECONDS).abs() <= ROLLING_TOLERANCE_SECONDS
+}
+
+/// Whether the user can open a fresh 5h window right now. See `QuotaInfo::prime_available`.
+/// Single-snapshot UI heuristic: `Ambiguous` is shown as available (the button click is gated by
+/// the prime path's two-snapshot probe, so a brief over-show for a fresh anchor is harmless).
+fn prime_available_for(tool_id: &ToolId, quota: &QuotaInfo) -> Option<bool> {
+    match classify_window(tool_id, quota) {
+        WindowState::Primeable | WindowState::Ambiguous => Some(true),
+        WindowState::Anchored => Some(false),
+        WindowState::Unknown => None,
+    }
+}
+
+/// `reset_at` (ISO 8601) parsed to a unix timestamp, or None if unparseable.
+fn parse_rfc3339_epoch(reset_at: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(reset_at)
+        .ok()
+        .map(|t| t.timestamp())
+}
+
 
 // ---------------------------------------------------------------------------
 // Claude Code — calls the OAuth usage endpoint (same source the /usage command uses).
@@ -106,6 +211,8 @@ fn quota_from_claude_usage(value: &serde_json::Value) -> Result<QuotaInfo> {
         weekly,
         models: None,
         plan: claude_plan(value),
+        // Overwritten centrally by `read_quota` via `prime_available_for`.
+        prime_available: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -503,6 +610,8 @@ fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo>
         },
         models: Some(models),
         plan,
+        // Antigravity can't prime; `prime_available_for` returns None for it anyway.
+        prime_available: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -720,6 +829,8 @@ fn quota_from_codex_endpoint(value: &serde_json::Value) -> Result<QuotaInfo> {
             .get("plan_type")
             .and_then(serde_json::Value::as_str)
             .and_then(pretty_plan),
+        // Overwritten centrally by `read_quota` via `prime_available_for`.
+        prime_available: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -856,6 +967,8 @@ fn quota_from_codex_rate_limits(limits: &serde_json::Value) -> Result<QuotaInfo>
             .get("plan_type")
             .and_then(serde_json::Value::as_str)
             .and_then(pretty_plan),
+        // Overwritten centrally by `read_quota` via `prime_available_for`.
+        prime_available: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -908,6 +1021,167 @@ mod tests {
         let line =
             r#"{"payload":{"rate_limits":{"limit_id":"codex","primary":null,"secondary":null}}}"#;
         assert!(last_rate_limits_in(line).is_none());
+    }
+
+    fn window_with_reset(secs_from_now: i64) -> QuotaWindow {
+        let reset = chrono::Utc::now() + chrono::Duration::seconds(secs_from_now);
+        QuotaWindow {
+            label: "5-hour limit".to_string(),
+            percent_used: Some(1.0),
+            reset_at: Some(reset.to_rfc3339()),
+        }
+    }
+
+    #[test]
+    fn codex_reset_near_full_window_is_ambiguous() {
+        // reset ≈ now + 5h = could be rolling OR freshly anchored → single snapshot can't tell.
+        let near = window_with_reset(CODEX_FIVE_HOUR_SECONDS - 5);
+        assert_eq!(
+            classify_five_hour(&ToolId::Codex, &near),
+            WindowState::Ambiguous
+        );
+    }
+
+    #[test]
+    fn codex_reset_far_from_full_window_is_anchored() {
+        // reset well under now + 5h (a real request anchored it earlier) → real window → Anchored.
+        let anchored = window_with_reset(CODEX_FIVE_HOUR_SECONDS - 1_000);
+        assert_eq!(
+            classify_five_hour(&ToolId::Codex, &anchored),
+            WindowState::Anchored
+        );
+    }
+
+    #[test]
+    fn codex_ended_window_is_primeable() {
+        let ended = window_with_reset(-60);
+        assert_eq!(
+            classify_five_hour(&ToolId::Codex, &ended),
+            WindowState::Primeable
+        );
+    }
+
+    #[test]
+    fn claude_future_is_anchored_past_is_primeable() {
+        assert_eq!(
+            classify_five_hour(&ToolId::Claude, &window_with_reset(3_600)),
+            WindowState::Anchored
+        );
+        assert_eq!(
+            classify_five_hour(&ToolId::Claude, &window_with_reset(-60)),
+            WindowState::Primeable
+        );
+    }
+
+    fn quota_with(five_hour: QuotaWindow, error: Option<&str>) -> QuotaInfo {
+        QuotaInfo {
+            five_hour,
+            weekly: QuotaWindow {
+                label: "Weekly limit".to_string(),
+                percent_used: None,
+                reset_at: None,
+            },
+            models: None,
+            plan: None,
+            prime_available: None,
+            updated_at: None,
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn empty_window() -> QuotaWindow {
+        QuotaWindow {
+            label: "5-hour limit".to_string(),
+            percent_used: Some(0.0),
+            reset_at: None,
+        }
+    }
+
+    #[test]
+    fn prime_available_claude_null_window_is_ended_not_unknown() {
+        // resetAt None + no error = fully ended → offer prime (the xbirds bug).
+        let quota = quota_with(empty_window(), None);
+        assert_eq!(prime_available_for(&ToolId::Claude, &quota), Some(true));
+    }
+
+    #[test]
+    fn prime_available_none_on_read_error() {
+        let quota = quota_with(empty_window(), Some("Couldn't read quota"));
+        assert_eq!(prime_available_for(&ToolId::Claude, &quota), None);
+        assert_eq!(prime_available_for(&ToolId::Codex, &quota), None);
+    }
+
+    #[test]
+    fn prime_available_codex_rolling_is_true() {
+        let quota = quota_with(window_with_reset(CODEX_FIVE_HOUR_SECONDS - 5), None);
+        assert_eq!(prime_available_for(&ToolId::Codex, &quota), Some(true));
+    }
+
+    #[test]
+    fn prime_available_codex_anchored_is_false() {
+        let quota = quota_with(window_with_reset(CODEX_FIVE_HOUR_SECONDS - 1_000), None);
+        assert_eq!(prime_available_for(&ToolId::Codex, &quota), Some(false));
+    }
+
+    #[test]
+    fn prime_available_antigravity_is_none() {
+        let quota = quota_with(window_with_reset(3_600), None);
+        assert_eq!(prime_available_for(&ToolId::Antigravity, &quota), None);
+    }
+
+    #[test]
+    fn prime_available_unparseable_timestamp_is_none_not_ended() {
+        // Regression guard (Codex review #2): a malformed reset_at must be unknown, not "ended".
+        let bad = QuotaWindow {
+            label: "5-hour limit".to_string(),
+            percent_used: Some(50.0),
+            reset_at: Some("not-a-timestamp".to_string()),
+        };
+        let quota = quota_with(bad, None);
+        assert_eq!(prime_available_for(&ToolId::Claude, &quota), None);
+        let bad2 = QuotaWindow {
+            label: "5-hour limit".to_string(),
+            percent_used: Some(50.0),
+            reset_at: Some("not-a-timestamp".to_string()),
+        };
+        let quota2 = quota_with(bad2, None);
+        assert_eq!(prime_available_for(&ToolId::Codex, &quota2), None);
+    }
+
+    #[test]
+    fn prime_available_null_reset_without_zero_used_is_none() {
+        // reset_at None but percent unknown = field wasn't reported (e.g. only weekly present) →
+        // unknown, NOT "fully ended". Must not offer prime.
+        let missing = QuotaWindow {
+            label: "5-hour limit".to_string(),
+            percent_used: None,
+            reset_at: None,
+        };
+        let quota = quota_with(missing, None);
+        assert_eq!(prime_available_for(&ToolId::Claude, &quota), None);
+        let missing2 = QuotaWindow {
+            label: "5-hour limit".to_string(),
+            percent_used: None,
+            reset_at: None,
+        };
+        let quota2 = quota_with(missing2, None);
+        assert_eq!(prime_available_for(&ToolId::Codex, &quota2), None);
+    }
+
+    #[test]
+    fn reset_near_full_window_within_and_outside_tolerance() {
+        let now = 1_000_000;
+        assert!(reset_is_near_full_window(now + CODEX_FIVE_HOUR_SECONDS, now));
+        // 80s short of now + 5h (freshly anchored 80s ago) = still within 90s tolerance.
+        assert!(reset_is_near_full_window(
+            now + CODEX_FIVE_HOUR_SECONDS - 80,
+            now
+        ));
+        // 1000s short = clearly an anchored window = outside tolerance.
+        assert!(!reset_is_near_full_window(
+            now + CODEX_FIVE_HOUR_SECONDS - 1_000,
+            now
+        ));
     }
 
     #[test]

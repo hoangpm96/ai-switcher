@@ -1653,9 +1653,9 @@ impl ManagedState {
         let _awake = CaffeinateHold::active();
 
         // On-demand prime fails fast: a SINGLE send attempt (no 5×5' backoff that the scheduler
-        // uses), so a button press returns in seconds and the user can just tap again. D4's short
-        // confirm polls (5 × 30s) still run with real sleeps — they're needed to see the new window,
-        // and prime_account's per-attempt CLI timeout bounds the rest.
+        // uses), so a button press returns in seconds and the user can just tap again. For Codex,
+        // D4 returns right after a 2xx send (a "hi" anchors the window only with a backend delay, so
+        // there's nothing to confirm-poll for); Claude still confirm-polls to see the moved reset.
         let outcome = crate::prime::prime_account(
             &job.tool_id,
             &job.config_dir,
@@ -1666,6 +1666,16 @@ impl ManagedState {
         self.record_prime_outcome(&job, &outcome, false, app);
 
         let (kind, message) = match &outcome {
+            // Codex anchors the 5h window with a delay: right after the send the endpoint still
+            // reports a rolling reset_at, so the "Prime ngay" button can linger for a few minutes
+            // until the backend freezes it. Tell the user so the still-visible button isn't confusing.
+            PrimeOutcome::Success { new_reset_at } if matches!(job.tool_id, ToolId::Codex) => (
+                "success",
+                format!(
+                    "Đã gửi mở phiên mới. Codex cần vài phút để chốt mốc 5h — nút có thể còn hiện trong lúc đó rồi tự ẩn (dự kiến reset ~{}).",
+                    local_hhmm_from_iso(new_reset_at)
+                ),
+            ),
             PrimeOutcome::Success { new_reset_at } => (
                 "success",
                 format!("Đã mở phiên mới — reset lúc {}", local_hhmm_from_iso(new_reset_at)),
@@ -1682,6 +1692,10 @@ impl ManagedState {
             PrimeOutcome::SkipNoToken => (
                 "error",
                 "Token đã hết hạn — cần đăng nhập lại tài khoản này.".to_string(),
+            ),
+            PrimeOutcome::SkipUnknownState => (
+                "error",
+                "Chưa đọc được trạng thái phiên hiện tại. Thử lại sau giây lát.".to_string(),
             ),
             PrimeOutcome::FailSend { reason } => ("error", format!("Gửi không thành công: {reason}")),
             PrimeOutcome::FailUnconfirmed => (
@@ -1744,6 +1758,10 @@ impl ManagedState {
             PrimeOutcome::SkipNoToken => (
                 "skip",
                 format!("{tool_label} · account \"{account_name}\" — SKIP: token hết hạn, cần đăng nhập lại"),
+            ),
+            PrimeOutcome::SkipUnknownState => (
+                "skip",
+                format!("{tool_label} · account \"{account_name}\" — SKIP: chưa đọc được trạng thái phiên, thử lại sau"),
             ),
             PrimeOutcome::FailSend { reason } => (
                 "failed",

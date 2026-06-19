@@ -317,6 +317,18 @@ pub struct QuotaInfo {
     /// None when the API doesn't report one. Shown as a small badge next to the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Whether the user can open a fresh 5h window right now ("Prime ngay").
+    ///
+    /// Provider-aware because the two endpoints report `reset_at` differently:
+    /// - Claude returns a fixed `reset_at` for a live window, and null once the window
+    ///   has fully ended (`used% 0`, no error). So `Some(true)` = ended-or-no-window.
+    /// - Codex's `/wham/usage` returns a ROLLING `reset_at` (≈ now + 5h) until a real
+    ///   request anchors the window; while rolling, the window isn't real, so priming
+    ///   is available even though `reset_at` looks like it's in the future.
+    ///
+    /// `None` = unknown (read error / quota not loaded) → frontend hides the button.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prime_available: Option<bool>,
     pub updated_at: Option<String>,
     pub error: Option<String>,
 }
@@ -337,6 +349,7 @@ impl QuotaInfo {
             },
             models: None,
             plan: None,
+            prime_available: None,
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             error: Some(message.into()),
         }

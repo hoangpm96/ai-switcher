@@ -16,6 +16,12 @@ export interface QuotaInfo {
   models?: QuotaWindow[] | null;
   /** Subscription plan label (e.g. "Plus", "Pro", "Max"). Absent when the API omits it. */
   plan?: string | null;
+  /**
+   * Whether "Prime ngay" should be offered: true = can open a fresh 5h window now (window ended,
+   * or — for Codex — the reset is rolling/unanchored). Absent/undefined = unknown (read error /
+   * not loaded) → hide the button. Computed by the backend (provider-aware), not the UI.
+   */
+  primeAvailable?: boolean;
   updatedAt: string | null;
   error: string | null;
 }

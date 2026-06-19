@@ -41,6 +41,10 @@ pub enum PrimeOutcome {
     Hold { reset_at: String },
     /// Account has no valid token (expired / logged out).
     SkipNoToken,
+    /// Couldn't establish the current window state (read error / unparseable / inconclusive probe),
+    /// so we did NOT send — failing closed rather than priming into an unknown window. Transient;
+    /// the next scheduled tick retries.
+    SkipUnknownState,
     /// The send kept failing after `SEND_MAX_ATTEMPTS`. Carries a short reason.
     FailSend { reason: String },
     /// Send was OK but the window never moved after `CONFIRM_MAX_TRIES`.
@@ -77,15 +81,33 @@ pub fn prime_account(
         return PrimeOutcome::SkipNoToken;
     }
 
-    // D2 — if the current 5h window is still in the future, the prime would land inside it.
+    // D2 — if a REAL 5h window is still running, the prime would land inside it → HOLD.
+    // Single-snapshot classification (no probe): sending "hi" is as cheap and harmless as typing it
+    // in the terminal, so we only HOLD when the window is DEFINITELY a real anchored one. Codex's
+    // `Ambiguous` (reset ≈ now + 5h — rolling for a low-usage account, which never anchors from a
+    // bare "hi") falls through to send, matching the terminal's behaviour.
     let before = quota::read_live_five_hour(tool_id, config_dir);
     let before_reset = before.as_ref().and_then(|w| w.reset_at.clone());
-    if let Some(reset_at) = &before_reset {
-        if is_future(reset_at) {
-            return PrimeOutcome::Hold {
-                reset_at: reset_at.clone(),
-            };
-        }
+    let state = before
+        .as_ref()
+        .map(|w| quota::classify_five_hour(tool_id, w))
+        .unwrap_or(quota::WindowState::Unknown);
+    match state {
+        // A real anchored window is running → don't pile a prime into it. `Anchored` is only
+        // produced from a parseable future reset, so `before_reset` is present.
+        quota::WindowState::Anchored => match &before_reset {
+            Some(reset_at) => {
+                return PrimeOutcome::Hold {
+                    reset_at: reset_at.clone(),
+                }
+            }
+            None => return PrimeOutcome::SkipUnknownState,
+        },
+        // We can't establish the window state → fail CLOSED: do NOT send blindly. The next
+        // scheduled tick retries once the read recovers.
+        quota::WindowState::Unknown => return PrimeOutcome::SkipUnknownState,
+        // Primeable (ended/no window) or Ambiguous (Codex rolling) → send.
+        quota::WindowState::Primeable | quota::WindowState::Ambiguous => {}
     }
 
     // D3 — send "hi", retrying on failure up to `send_attempts` times.
@@ -112,8 +134,26 @@ pub fn prime_account(
         };
     }
 
-    // D4 — confirm the window moved. The provider may take a few seconds to refresh, so
-    // re-read the LIVE window a few times before giving up.
+    // D4 — confirm the prime took.
+    //
+    // Provider-aware:
+    //   - Codex: a bare "hi" does NOT reliably anchor the 5h window on a low-usage account — the
+    //     endpoint keeps reporting a ROLLING `reset_at` (≈ now + 5h) regardless. Waiting for an
+    //     "anchored" reset would hang for minutes and then fail. So, like running `codex exec "hi"`
+    //     in a terminal, a 2xx send IS the success: report it immediately, reading the current
+    //     reset_at just for display (best-effort).
+    //   - Claude: `reset_at` is a stable anchor, so we can (and should) confirm the window actually
+    //     moved to a new future reset before claiming success. Poll a few times — the provider may
+    //     take a few seconds to refresh.
+    if matches!(tool_id, ToolId::Codex) {
+        let new_reset = quota::read_live_five_hour(tool_id, config_dir)
+            .and_then(|w| w.reset_at)
+            .or(before_reset)
+            .unwrap_or_default();
+        return PrimeOutcome::Success {
+            new_reset_at: new_reset,
+        };
+    }
     for _ in 0..CONFIRM_MAX_TRIES {
         sleeper(CONFIRM_RETRY_DELAY);
         if let Some(window) = quota::read_live_five_hour(tool_id, config_dir) {

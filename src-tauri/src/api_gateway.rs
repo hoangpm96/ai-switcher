@@ -2630,6 +2630,7 @@ mod tests {
             },
             models: None,
             plan: None,
+            prime_available: None,
             updated_at: None,
             error: None,
         }

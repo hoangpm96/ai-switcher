@@ -1832,16 +1832,19 @@ function AccountCard({
     if (autoPrime?.lastResult === "success") return `Auto ${autoPrime.time} · đã prime`;
     return `Auto ${autoPrime?.time}`;
   })();
-  // "Prime ngay": let the user open a new 5h window on demand — for exactly the case where the old
-  // window has KNOWN to have ended and they don't want to drop to a terminal to send a message.
-  // Hidden while a window is still live (priming then only HOLDs), once an extend is already armed
-  // (it'll open the window itself), or when reset state is unknown (quota not loaded / read error —
-  // `resetAt === null`). Compare the raw timestamp (not the rounded `minsToReset`, which rounds a
-  // window with up to 29s left down to 0) so the button only appears once the window has genuinely
-  // passed — the backend's D2 is still the real guard, this just avoids a premature button.
-  const windowEnded = resetAt !== null && Date.parse(resetAt) <= Date.now();
+  // "Prime ngay": let the user open a new 5h window on demand, for the case where there's no live
+  // window and they don't want to drop to a terminal to send a message. The backend decides this
+  // (provider-aware `primeAvailable`) — the UI must NOT recompute from `resetAt`: a Codex reset_at
+  // can be in the future yet rolling/unanchored (no real window), and a Claude `resetAt === null`
+  // can mean "fully ended" (offer) rather than "unknown" (hide). `primeAvailable === true` means
+  // ended-or-unanchored; undefined means unknown/read-error → hide. Still hidden when login is
+  // needed or an extend is already armed (that opens the window itself). The backend's D2 stays
+  // the real guard; this just shows the button at the right time.
   const showPrimeNow =
-    canPrime && windowEnded && !needsLogin && !autoPrime?.extendRequested;
+    canPrime &&
+    account.quota?.primeAvailable === true &&
+    !needsLogin &&
+    !autoPrime?.extendRequested;
   const primingNow = busy === `prime:${account.id}`;
 
   return (
