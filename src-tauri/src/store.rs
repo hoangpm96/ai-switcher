@@ -1,5 +1,6 @@
 use crate::models::{
-    Account, AccountState, ApiGatewayConfig, AutoPrimeSetting, AutoSwitchSetting, ToolId, ToolSetup,
+    Account, AccountState, ApiGatewayConfig, AutoPrimeSetting, AutoSwitchSetting,
+    PrimeRuntimeState, ToolId, ToolSetup,
 };
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -94,6 +95,10 @@ impl Store {
         self.root.join("auto-prime.log")
     }
 
+    pub fn prime_runtime_path(&self) -> PathBuf {
+        self.root.join("prime-runtime.json")
+    }
+
     /// Advisory cross-process lock used to serialize GUI and headless prime batches.
     pub fn prime_lock_path(&self) -> PathBuf {
         self.root.join("prime.lock")
@@ -105,6 +110,36 @@ impl Store {
         self.root
             .join("prime-claims")
             .join(format!("{digest:x}.claim"))
+    }
+
+    /// Remove old, unreferenced claim markers. Claims intentionally survive terminal attempts to
+    /// protect against stale cross-process state, but they need not accumulate forever.
+    pub fn gc_prime_claims(&self, runtime: &PrimeRuntimeState) {
+        let referenced: std::collections::BTreeSet<PathBuf> = runtime
+            .attempts
+            .values()
+            .filter_map(|attempt| attempt.claim_key.as_deref())
+            .map(|key| self.prime_claim_path(key))
+            .collect();
+        let Ok(entries) = fs::read_dir(self.root.join("prime-claims")) else {
+            return;
+        };
+        let max_age = std::time::Duration::from_secs(48 * 60 * 60);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if referenced.contains(&path) {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > max_age);
+            if old {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 
     /// The root data dir (used to place the pmset wake helper's request/script files).
@@ -153,6 +188,23 @@ impl Store {
         Ok(())
     }
 
+    pub fn load_prime_runtime(&self) -> Result<PrimeRuntimeState> {
+        let path = self.prime_runtime_path();
+        if !path.exists() {
+            return Ok(PrimeRuntimeState::default());
+        }
+        let text = fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    pub fn save_prime_runtime(&self, runtime: &PrimeRuntimeState) -> Result<()> {
+        let path = self.prime_runtime_path();
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec_pretty(runtime)?)?;
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn for_test(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(root.join("accounts"))?;
@@ -179,5 +231,56 @@ pub fn normalize_account_states(
         } else {
             account.state.clone()
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{PendingPrimeAttempt, PrimeAttemptPhase, PrimeRuntimeState};
+
+    #[test]
+    fn prime_runtime_round_trips_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-switcher-prime-runtime-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::for_test(root.clone()).unwrap();
+        let mut runtime = PrimeRuntimeState::default();
+        runtime.attempts.insert(
+            "account-1".to_string(),
+            PendingPrimeAttempt {
+                version: 1,
+                account_id: "account-1".to_string(),
+                tool_id: ToolId::Codex,
+                consumes_scheduled_slot: true,
+                resolves_extend: false,
+                manual: false,
+                scheduled_date: Some("2026-06-20".to_string()),
+                scheduled_time: Some("07:00".to_string()),
+                anchor_at: "2026-06-20T00:00:00Z".to_string(),
+                deadline_at: "2026-06-20T00:45:00Z".to_string(),
+                phase: PrimeAttemptPhase::WaitingRetry,
+                next_action_at: "2026-06-20T00:05:00Z".to_string(),
+                send_attempts: 1,
+                last_send_at: Some("2026-06-20T00:00:00Z".to_string()),
+                baseline_reset_at: None,
+                last_observation: None,
+                last_error: Some("rolling".to_string()),
+                claim_key: Some("scheduled|account-1|2026-06-20|07:00".to_string()),
+            },
+        );
+        store.save_prime_runtime(&runtime).unwrap();
+        let loaded = store.load_prime_runtime().unwrap();
+        assert_eq!(loaded.attempts.len(), 1);
+        assert_eq!(
+            loaded.attempts["account-1"].phase,
+            PrimeAttemptPhase::WaitingRetry
+        );
+        assert!(!store
+            .prime_runtime_path()
+            .with_extension("json.tmp")
+            .exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

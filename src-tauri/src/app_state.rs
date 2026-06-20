@@ -1000,6 +1000,7 @@ impl ManagedState {
     ) -> Result<AppSnapshot> {
         let time = normalize_hhmm(&time)
             .ok_or_else(|| anyhow::anyhow!("Giờ không hợp lệ (cần dạng HH:MM 24h)"))?;
+        let cancel_attempt;
         {
             let mut data = self
                 .data
@@ -1008,7 +1009,7 @@ impl ManagedState {
             if !prime_eligible_in_state(&data, &tool_id, &account_id) {
                 anyhow::bail!("Tài khoản này không hỗ trợ auto prime (chỉ Claude/Codex đăng nhập subscription)");
             }
-            let entry = data.auto_prime.entry(account_id).or_default();
+            let entry = data.auto_prime.entry(account_id.clone()).or_default();
             let time_changed = entry.time != time;
             let just_enabled = enabled && !entry.enabled;
             entry.enabled = enabled;
@@ -1038,8 +1039,12 @@ impl ManagedState {
             if !enabled && !entry.extend_requested {
                 entry.deferred_until = None;
             }
+            cancel_attempt = time_changed || !enabled;
             let _ = tool_id;
             self.store.save(&data)?;
+        }
+        if cancel_attempt {
+            self.cancel_runtime_attempt(&account_id, true, false);
         }
         self.update_wake_schedule();
         self.snapshot()
@@ -1049,6 +1054,7 @@ impl ManagedState {
     pub fn set_auto_prime_all(&self, time: String, enabled: bool) -> Result<AppSnapshot> {
         let time = normalize_hhmm(&time)
             .ok_or_else(|| anyhow::anyhow!("Giờ không hợp lệ (cần dạng HH:MM 24h)"))?;
+        let mut cancel_attempts = Vec::new();
         {
             let mut data = self
                 .data
@@ -1061,7 +1067,7 @@ impl ManagedState {
                 .map(|a| a.id.clone())
                 .collect();
             for account_id in eligible {
-                let entry = data.auto_prime.entry(account_id).or_default();
+                let entry = data.auto_prime.entry(account_id.clone()).or_default();
                 let time_changed = entry.time != time;
                 let just_enabled = enabled && !entry.enabled;
                 entry.enabled = enabled;
@@ -1086,8 +1092,14 @@ impl ManagedState {
                 if !enabled && !entry.extend_requested {
                     entry.deferred_until = None;
                 }
+                if time_changed || !enabled {
+                    cancel_attempts.push(account_id);
+                }
             }
             self.store.save(&data)?;
+        }
+        for account_id in cancel_attempts {
+            self.cancel_runtime_attempt(&account_id, true, false);
         }
         self.update_wake_schedule();
         self.snapshot()
@@ -1103,6 +1115,37 @@ impl ManagedState {
             .filter(|a| crate::prime::is_prime_eligible(&a.tool_id, a.api_provider.is_some()))
             .filter_map(|a| data.auto_prime.get(&a.id))
             .any(|s| s.enabled && parse_hhmm(&s.time).is_some())
+    }
+
+    /// Cancel an in-flight attempt after the user disables/changes its owning mechanism. Runtime
+    /// and claim are updated under the same cross-process lock used by scheduler ticks.
+    fn cancel_runtime_attempt(&self, account_id: &str, scheduled: bool, extend: bool) {
+        use fs2::FileExt;
+        let Ok(lock_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(self.store.prime_lock_path())
+        else {
+            return;
+        };
+        if lock_file.try_lock_exclusive().is_err() {
+            return;
+        }
+        let Ok(mut runtime) = self.store.load_prime_runtime() else {
+            return;
+        };
+        let should_remove = runtime.attempts.get(account_id).is_some_and(|attempt| {
+            (scheduled && attempt.consumes_scheduled_slot) || (extend && attempt.resolves_extend)
+        });
+        if should_remove {
+            if let Some(attempt) = runtime.attempts.remove(account_id) {
+                if let Some(key) = attempt.claim_key {
+                    let _ = std::fs::remove_file(self.store.prime_claim_path(&key));
+                }
+            }
+            let _ = self.store.save_prime_runtime(&runtime);
+        }
     }
 
     /// Turn "prime while the Mac is asleep" on/off. The pmset wake helper is required: it wakes the
@@ -1147,6 +1190,7 @@ impl ManagedState {
     /// held until the old window ends). Returns None if nothing is scheduled.
     fn next_wake_time(&self) -> Option<chrono::DateTime<chrono::Local>> {
         use chrono::TimeZone;
+        let runtime = self.store.load_prime_runtime().unwrap_or_default();
         let data = self.data.lock().ok()?;
         let now = chrono::Local::now();
         let mut earliest: Option<chrono::DateTime<chrono::Local>> = None;
@@ -1211,6 +1255,21 @@ impl ManagedState {
             }
             consider(wake);
         }
+        // An in-flight retry is independent of the daily anchor. Re-arm pmset for its next action
+        // so a failed send/confirmation can resume after the Mac sleeps or the GUI quits.
+        for attempt in runtime.attempts.values() {
+            if let Ok(next) = chrono::DateTime::parse_from_rfc3339(&attempt.next_action_at) {
+                let wake = next.with_timezone(&chrono::Local)
+                    - chrono::Duration::minutes(crate::wake::WAKE_LEAD_MIN);
+                if wake > now {
+                    consider(wake);
+                } else if next.with_timezone(&chrono::Local) > now {
+                    // We are already inside the wake-lead window. Scheduling the action itself is
+                    // safer than dropping the candidate entirely.
+                    consider(next.with_timezone(&chrono::Local));
+                }
+            }
+        }
         // Never schedule a wake in the past.
         earliest.filter(|t| *t > now)
     }
@@ -1257,7 +1316,7 @@ impl ManagedState {
             if !prime_eligible_in_state(&data, &tool_id, &account_id) {
                 anyhow::bail!("Tài khoản này không hỗ trợ auto prime");
             }
-            let entry = data.auto_prime.entry(account_id).or_default();
+            let entry = data.auto_prime.entry(account_id.clone()).or_default();
             entry.auto_extend = enabled;
             // Turning auto-extend OFF must also cancel any extend this toggle already armed for the
             // current window-ending (check_extend_reminders sets extend_requested + deferred_until).
@@ -1268,6 +1327,9 @@ impl ManagedState {
                 entry.extend_reminded_reset = None;
             }
             self.store.save(&data)?;
+        }
+        if !enabled {
+            self.cancel_runtime_attempt(&account_id, false, true);
         }
         // The cancelled defer may have been the soonest wake — recompute so the Mac doesn't wake for
         // a prime that's no longer scheduled.
@@ -1337,7 +1399,7 @@ impl ManagedState {
                 .find(|a| a.id == account_id && a.tool_id == tool_id)
                 .and_then(|a| a.quota.as_ref())
                 .and_then(|q| q.five_hour.reset_at.clone());
-            let entry = data.auto_prime.entry(account_id).or_default();
+            let entry = data.auto_prime.entry(account_id.clone()).or_default();
             entry.extend_requested = accept;
             if accept {
                 entry.extend_dismissed_reset = None;
@@ -1357,6 +1419,9 @@ impl ManagedState {
             }
             self.store.save(&data)?;
         }
+        if !accept {
+            self.cancel_runtime_attempt(&account_id, false, true);
+        }
         // Accepting may have set a defer that's now the soonest wake; recompute so the Mac wakes for it.
         self.update_wake_schedule();
         self.snapshot()
@@ -1367,9 +1432,9 @@ impl ManagedState {
     /// notification + flags the account so the UI shows an "extend?" button.
     pub fn check_extend_reminders(&self, app: Option<&AppHandle>) {
         let mut to_remind: Vec<(String, String)> = Vec::new(); // (tool_label, account_name)
-        // (tool_label, account_name, deferred_until ISO): accepted automatically. The defer instant
-        // is the reset boundary OR the daily anchor (when the schedule governs the next window) —
-        // carried so the log can say which it is.
+                                                               // (tool_label, account_name, deferred_until ISO): accepted automatically. The defer instant
+                                                               // is the reset boundary OR the daily anchor (when the schedule governs the next window) —
+                                                               // carried so the log can say which it is.
         let mut auto_extended: Vec<(String, String, String)> = Vec::new();
         let mut no_response: Vec<String> = Vec::new(); // log lines
         let mut changed = false;
@@ -1560,6 +1625,9 @@ impl ManagedState {
                 *data = latest;
             }
         }
+        if let Ok(runtime) = self.store.load_prime_runtime() {
+            self.store.gc_prime_claims(&runtime);
+        }
 
         // Hold the Mac awake for the WHOLE tick — created up front and unconditionally, so it also
         // covers a defer that the first prime pass itself creates (a Hold sets `deferred_until`
@@ -1614,8 +1682,13 @@ impl ManagedState {
     /// "Due" = a scheduled prime whose time has arrived (once/day, enabled) OR an armed extend; an
     /// account whose `deferred_until` is still in the future is skipped (it isn't due yet).
     fn collect_and_prime_due(&self, late: bool, app: Option<&AppHandle>) {
+        use crate::models::{PendingPrimeAttempt, PrimeAttemptPhase};
         let today = local_today();
         let now_hhmm = local_now_hhmm();
+        let mut runtime = self.store.load_prime_runtime().unwrap_or_default();
+        let mut started: Vec<String> = Vec::new();
+        let mut started_account_ids = std::collections::BTreeSet::new();
+        let mut runtime_changed = false;
         let due: Vec<PrimeJob> = {
             let data = match self.data.lock() {
                 Ok(data) => data,
@@ -1630,6 +1703,87 @@ impl ManagedState {
                         account.api_provider.is_some(),
                     ) {
                         return None;
+                    }
+                    if let Some(mut attempt) = runtime.attempts.get(&account.id).cloned() {
+                        let scheduled_still_valid = setting.enabled
+                            && attempt
+                                .scheduled_time
+                                .as_deref()
+                                .is_none_or(|scheduled| scheduled == setting.time);
+                        if attempt.consumes_scheduled_slot && !scheduled_still_valid {
+                            attempt.consumes_scheduled_slot = false;
+                            attempt.scheduled_date = None;
+                            attempt.scheduled_time = None;
+                            runtime_changed = true;
+                        }
+                        if attempt.resolves_extend && !setting.extend_requested {
+                            attempt.resolves_extend = false;
+                            runtime_changed = true;
+                        }
+                        if !attempt.manual
+                            && !attempt.consumes_scheduled_slot
+                            && !attempt.resolves_extend
+                        {
+                            runtime.attempts.remove(&account.id);
+                            if let Some(key) = attempt.claim_key {
+                                let _ = std::fs::remove_file(self.store.prime_claim_path(&key));
+                            }
+                            runtime_changed = true;
+                            return None;
+                        }
+                        // A daily anchor or extend can become due while the account already has a
+                        // retrying attempt. Coalesce those obligations into the one durable attempt
+                        // instead of silently dropping the later trigger.
+                        if !attempt.manual {
+                            let anchor_age =
+                                anchor_age_minutes(&setting.time, &now_hhmm).unwrap_or(-1);
+                            let active = setting
+                                .active_from
+                                .as_deref()
+                                .is_none_or(|from| today.as_str() >= from);
+                            let scheduled_due = setting.enabled
+                                && active
+                                && (0..=CATCH_UP_MIN).contains(&anchor_age)
+                                && !(setting.last_primed_date.as_deref() == Some(today.as_str())
+                                    && setting.last_primed_time.as_deref()
+                                        == Some(setting.time.as_str()));
+                            if scheduled_due && !attempt.consumes_scheduled_slot {
+                                attempt.consumes_scheduled_slot = true;
+                                attempt.scheduled_date = Some(today.clone());
+                                attempt.scheduled_time = Some(setting.time.clone());
+                                runtime_changed = true;
+                            }
+                            if setting.extend_requested && !attempt.resolves_extend {
+                                attempt.resolves_extend = true;
+                                runtime_changed = true;
+                            }
+                            if runtime_changed {
+                                runtime.attempts.insert(account.id.clone(), attempt.clone());
+                            }
+                        }
+                        if seconds_until(&attempt.next_action_at) > 0 {
+                            return None;
+                        }
+                        let default_dir = resolved_default_config_dir(&data, &account.tool_id);
+                        let config_dir =
+                            account_config_dir_with_default(&self.store, account, &default_dir);
+                        let binary = configured_binary_path(&data, &account.tool_id);
+                        let claim_paths = attempt
+                            .claim_key
+                            .as_deref()
+                            .map(|key| vec![self.store.prime_claim_path(key)])
+                            .unwrap_or_default();
+                        return Some(PrimeJob {
+                            tool_id: account.tool_id.clone(),
+                            account_id: account.id.clone(),
+                            account_name: account.name.clone(),
+                            config_dir,
+                            binary,
+                            is_extend: attempt.resolves_extend,
+                            scheduled: attempt.consumes_scheduled_slot,
+                            manual: attempt.manual,
+                            claim_paths,
+                        });
                     }
                     // Held earlier (old window still active): wait until the defer instant before
                     // re-attempting, so we don't read quota + log HOÃN every single minute.
@@ -1656,15 +1810,10 @@ impl ManagedState {
                     if !scheduled_due && !extend_due {
                         return None;
                     }
-                    let mut claim_keys = Vec::new();
-                    if scheduled_due {
-                        claim_keys.push(format!(
-                            "scheduled|{}|{}|{}",
-                            account.id, today, setting.time
-                        ));
-                    }
-                    if extend_due {
-                        claim_keys.push(format!(
+                    let claim_key = if scheduled_due {
+                        format!("scheduled|{}|{}|{}", account.id, today, setting.time)
+                    } else {
+                        format!(
                             "extend|{}|{}",
                             account.id,
                             setting
@@ -1672,9 +1821,56 @@ impl ManagedState {
                                 .as_deref()
                                 .or(setting.extend_reminded_reset.as_deref())
                                 .unwrap_or("pending")
-                        ));
-                    }
-                    let claim_paths = claim_prime_keys(&self.store, &claim_keys)?;
+                        )
+                    };
+                    let claim_paths =
+                        claim_prime_keys(&self.store, std::slice::from_ref(&claim_key))?;
+                    let anchor_at = if scheduled_due {
+                        scheduled_anchor_iso(&setting.time)?
+                    } else {
+                        setting.deferred_until.clone().unwrap_or_else(now)
+                    };
+                    let deadline_at = add_minutes_iso(&anchor_at, PRIME_RETRY_DEADLINE_MIN);
+                    let attempt = PendingPrimeAttempt {
+                        version: 1,
+                        account_id: account.id.clone(),
+                        tool_id: account.tool_id.clone(),
+                        consumes_scheduled_slot: scheduled_due,
+                        resolves_extend: extend_due,
+                        manual: false,
+                        scheduled_date: scheduled_due.then(|| today.clone()),
+                        scheduled_time: scheduled_due.then(|| setting.time.clone()),
+                        anchor_at: anchor_at.clone(),
+                        deadline_at,
+                        phase: PrimeAttemptPhase::Precheck,
+                        next_action_at: now(),
+                        send_attempts: 0,
+                        last_send_at: None,
+                        baseline_reset_at: None,
+                        last_observation: None,
+                        last_error: None,
+                        claim_key: Some(claim_key),
+                    };
+                    runtime.attempts.insert(account.id.clone(), attempt);
+                    runtime_changed = true;
+                    started_account_ids.insert(account.id.clone());
+                    started.push(format!(
+                        "{} · account \"{}\" — START: {}, deadline = {}",
+                        account.tool_id.prime_label(),
+                        account.name,
+                        if extend_due {
+                            "gia hạn session"
+                        } else {
+                            "scheduled prime"
+                        },
+                        local_hhmm_from_iso(
+                            &runtime
+                                .attempts
+                                .get(&account.id)
+                                .expect("inserted")
+                                .deadline_at
+                        )
+                    ));
                     let default_dir = resolved_default_config_dir(&data, &account.tool_id);
                     let config_dir =
                         account_config_dir_with_default(&self.store, account, &default_dir);
@@ -1699,19 +1895,127 @@ impl ManagedState {
                 })
                 .collect()
         };
+        if runtime_changed {
+            if self.store.save_prime_runtime(&runtime).is_err() {
+                for job in due
+                    .iter()
+                    .filter(|job| started_account_ids.contains(&job.account_id))
+                {
+                    for path in &job.claim_paths {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+                return;
+            }
+        }
+        for line in started {
+            self.append_prime_log(&line);
+        }
 
         for (index, job) in due.iter().enumerate() {
             if index > 0 {
                 std::thread::sleep(std::time::Duration::from_secs(10)); // gap between accounts
             }
-            let outcome = crate::prime::prime_account(
-                &job.tool_id,
-                &job.config_dir,
-                job.binary.as_deref(),
-                crate::prime::SEND_MAX_ATTEMPTS,
-                std::thread::sleep,
-            );
-            self.record_prime_outcome(job, &outcome, late, app);
+            let Some(mut attempt) = runtime.attempts.get(&job.account_id).cloned() else {
+                continue;
+            };
+            if seconds_until(&attempt.deadline_at) <= 0 {
+                runtime.attempts.remove(&job.account_id);
+                let _ = self.store.save_prime_runtime(&runtime);
+                self.record_prime_outcome(job, &deadline_failure_from(&attempt), late, app);
+                continue;
+            }
+            let resume_confirmation =
+                attempt.phase == PrimeAttemptPhase::Confirming && attempt.last_send_at.is_some();
+            if !resume_confirmation
+                && seconds_until(&attempt.deadline_at) <= PRIME_PROOF_BUDGET_SECONDS
+            {
+                runtime.attempts.remove(&job.account_id);
+                let _ = self.store.save_prime_runtime(&runtime);
+                self.record_prime_outcome(job, &deadline_failure_from(&attempt), late, app);
+                continue;
+            }
+
+            let outcome = if resume_confirmation {
+                crate::prime::confirm_active_session(
+                    &job.tool_id,
+                    &job.config_dir,
+                    attempt.baseline_reset_at.as_deref(),
+                    std::thread::sleep,
+                )
+            } else {
+                crate::prime::prime_account_with_hook(
+                    &job.tool_id,
+                    &job.config_dir,
+                    job.binary.as_deref(),
+                    1,
+                    std::thread::sleep,
+                    |baseline| {
+                        attempt.phase = PrimeAttemptPhase::Confirming;
+                        attempt.last_send_at = Some(now());
+                        attempt.send_attempts += 1;
+                        attempt.baseline_reset_at = baseline.map(ToString::to_string);
+                        runtime
+                            .attempts
+                            .insert(job.account_id.clone(), attempt.clone());
+                        self.store
+                            .save_prime_runtime(&runtime)
+                            .map_err(|error| format!("persisting prime marker: {error}"))
+                    },
+                )
+            };
+            match outcome {
+                crate::prime::PrimeOutcome::Success { .. }
+                | crate::prime::PrimeOutcome::Hold { .. } => {
+                    runtime.attempts.remove(&job.account_id);
+                    let _ = self.store.save_prime_runtime(&runtime);
+                    self.record_prime_outcome(job, &outcome, late, app);
+                }
+                retryable => {
+                    if seconds_until(&attempt.deadline_at) <= 0 {
+                        runtime.attempts.remove(&job.account_id);
+                        let _ = self.store.save_prime_runtime(&runtime);
+                        self.record_prime_outcome(
+                            job,
+                            &terminal_failure_from(&retryable),
+                            late,
+                            app,
+                        );
+                    } else {
+                        attempt.phase = PrimeAttemptPhase::WaitingRetry;
+                        attempt.next_action_at = earlier_iso(
+                            &add_minutes_iso(&now(), PRIME_RETRY_INTERVAL_MIN),
+                            &attempt.deadline_at,
+                        );
+                        attempt.last_error = Some(retry_reason(&retryable));
+                        runtime
+                            .attempts
+                            .insert(job.account_id.clone(), attempt.clone());
+                        let _ = self.store.save_prime_runtime(&runtime);
+                        if attempt.send_attempts == 1 {
+                            self.append_prime_log(&format!(
+                                "{} · account \"{}\" — PENDING: {}, thử lại lúc {} (deadline {})",
+                                job.tool_id.prime_label(),
+                                job.account_name,
+                                retry_reason(&retryable),
+                                local_hhmm_from_iso(&attempt.next_action_at),
+                                local_hhmm_from_iso(&attempt.deadline_at)
+                            ));
+                        }
+                        if let Ok(mut data) = self.data.lock() {
+                            if let Some(setting) = data.auto_prime.get_mut(&job.account_id) {
+                                setting.last_result = Some("retrying".to_string());
+                                setting.last_attempt_at = Some(now());
+                            }
+                            let _ = self.store.save(&data);
+                        }
+                        self.update_wake_schedule();
+                        if let Some(app) = app {
+                            let _ = app.emit("auto-prime-changed", ());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1727,7 +2031,9 @@ impl ManagedState {
         account_id: String,
         app: Option<&AppHandle>,
     ) -> Result<crate::models::PrimeNowResult> {
+        use crate::models::{PendingPrimeAttempt, PrimeAttemptPhase};
         use crate::prime::PrimeOutcome;
+        use fs2::FileExt;
         use std::sync::atomic::Ordering;
 
         // Build the job under a brief lock; reject early if the account isn't prime-eligible.
@@ -1778,6 +2084,49 @@ impl ManagedState {
             }
         }
         let _guard = ClearOnDrop(&self.priming);
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(self.store.prime_lock_path())?;
+        lock_file.try_lock_exclusive().map_err(|_| {
+            anyhow::anyhow!("Đang có một lượt prime khác chạy — thử lại sau giây lát.")
+        })?;
+        let mut runtime = self.store.load_prime_runtime().unwrap_or_default();
+        if let Some(existing) = runtime.attempts.get(&job.account_id) {
+            return Ok(crate::models::PrimeNowResult {
+                kind: "info".to_string(),
+                message: format!(
+                    "Tài khoản đang được tự động mở session; app sẽ thử tới {}.",
+                    local_hhmm_from_iso(&existing.deadline_at)
+                ),
+            });
+        }
+        let anchor_at = now();
+        let mut manual_attempt = PendingPrimeAttempt {
+            version: 1,
+            account_id: job.account_id.clone(),
+            tool_id: job.tool_id.clone(),
+            consumes_scheduled_slot: false,
+            resolves_extend: false,
+            manual: true,
+            scheduled_date: None,
+            scheduled_time: None,
+            anchor_at: anchor_at.clone(),
+            deadline_at: add_minutes_iso(&anchor_at, MANUAL_PRIME_DEADLINE_MIN),
+            phase: PrimeAttemptPhase::Precheck,
+            next_action_at: anchor_at.clone(),
+            send_attempts: 0,
+            last_send_at: None,
+            baseline_reset_at: None,
+            last_observation: None,
+            last_error: None,
+            claim_key: None,
+        };
+        runtime
+            .attempts
+            .insert(job.account_id.clone(), manual_attempt.clone());
+        self.store.save_prime_runtime(&runtime)?;
         // Keep the Mac awake for the duration (the prime itself also holds caffeinate; this covers
         // the whole on-demand op for symmetry).
         let _awake = CaffeinateHold::active();
@@ -1786,23 +2135,61 @@ impl ManagedState {
         // uses), so a button press returns in seconds and the user can just tap again. For Codex,
         // D4 returns right after a 2xx send (a "hi" anchors the window only with a backend delay, so
         // there's nothing to confirm-poll for); Claude still confirm-polls to see the moved reset.
-        let outcome = crate::prime::prime_account(
+        let outcome = crate::prime::prime_account_with_hook(
             &job.tool_id,
             &job.config_dir,
             job.binary.as_deref(),
             1,
             std::thread::sleep,
+            |baseline| {
+                manual_attempt.phase = PrimeAttemptPhase::Confirming;
+                manual_attempt.last_send_at = Some(now());
+                manual_attempt.send_attempts += 1;
+                manual_attempt.baseline_reset_at = baseline.map(ToString::to_string);
+                runtime
+                    .attempts
+                    .insert(job.account_id.clone(), manual_attempt.clone());
+                self.store
+                    .save_prime_runtime(&runtime)
+                    .map_err(|error| format!("persisting manual prime marker: {error}"))
+            },
         );
-        self.record_prime_outcome(&job, &outcome, false, app);
+        let retryable = !matches!(
+            outcome,
+            PrimeOutcome::Success { .. } | PrimeOutcome::Hold { .. }
+        );
+        if retryable {
+            manual_attempt.phase = PrimeAttemptPhase::WaitingRetry;
+            manual_attempt.next_action_at = earlier_iso(
+                &add_minutes_iso(&now(), MANUAL_PRIME_RETRY_INTERVAL_MIN),
+                &manual_attempt.deadline_at,
+            );
+            manual_attempt.last_error = Some(retry_reason(&outcome));
+            runtime
+                .attempts
+                .insert(job.account_id.clone(), manual_attempt);
+            self.store.save_prime_runtime(&runtime)?;
+            if let Ok(mut data) = self.data.lock() {
+                let setting = data.auto_prime.entry(job.account_id.clone()).or_default();
+                setting.last_result = Some("retrying".to_string());
+                setting.last_attempt_at = Some(now());
+                let _ = self.store.save(&data);
+            }
+            self.update_wake_schedule();
+            if let Some(app) = app {
+                let _ = app.emit("auto-prime-changed", ());
+            }
+        } else {
+            runtime.attempts.remove(&job.account_id);
+            self.store.save_prime_runtime(&runtime)?;
+            self.record_prime_outcome(&job, &outcome, false, app);
+        }
 
         let (kind, message) = match &outcome {
-            // Codex anchors the 5h window with a delay: right after the send the endpoint still
-            // reports a rolling reset_at, so the "Prime ngay" button can linger for a few minutes
-            // until the backend freezes it. Tell the user so the still-visible button isn't confusing.
             PrimeOutcome::Success { new_reset_at } if matches!(job.tool_id, ToolId::Codex) => (
                 "success",
                 format!(
-                    "Đã gửi mở phiên mới. Codex cần vài phút để chốt mốc 5h — nút có thể còn hiện trong lúc đó rồi tự ẩn (dự kiến reset ~{}).",
+                    "Session Codex đã được xác nhận — reset lúc {}.",
                     local_hhmm_from_iso(new_reset_at)
                 ),
             ),
@@ -1819,18 +2206,15 @@ impl ManagedState {
                     local_hhmm_from_iso(reset_at)
                 ),
             ),
-            PrimeOutcome::SkipNoToken => (
-                "error",
-                "Token đã hết hạn — cần đăng nhập lại tài khoản này.".to_string(),
-            ),
-            PrimeOutcome::SkipUnknownState => (
-                "error",
-                "Chưa đọc được trạng thái phiên hiện tại. Thử lại sau giây lát.".to_string(),
-            ),
-            PrimeOutcome::FailSend { reason } => ("error", format!("Gửi không thành công: {reason}")),
-            PrimeOutcome::FailUnconfirmed => (
-                "error",
-                "Đã gửi nhưng chưa xác nhận được phiên mới. Thử lại sau giây lát.".to_string(),
+            PrimeOutcome::SkipNoToken
+            | PrimeOutcome::SkipUnknownState
+            | PrimeOutcome::FailSend { .. }
+            | PrimeOutcome::FailUnconfirmed => (
+                "info",
+                format!(
+                    "Chưa xác nhận được session; app sẽ tự thử lại trong 5 phút tới ({})",
+                    retry_reason(&outcome)
+                ),
             ),
         };
         Ok(crate::models::PrimeNowResult {
@@ -1862,19 +2246,19 @@ impl ManagedState {
                     (
                         "success",
                         format!(
-                            "{tool_label} · account \"{account_name}\" — SUCCESS: primed muộn lúc {now} do máy không thức đúng giờ, reset mới = {reset}",
+                            "{tool_label} · account \"{account_name}\" — SUCCESS: session xác nhận muộn lúc {now} do máy không thức đúng giờ, reset = {reset}",
                             now = local_now_hhmm()
                         ),
                     )
                 } else if is_extend {
                     (
                         "success",
-                        format!("{tool_label} · account \"{account_name}\" — SUCCESS: gia hạn, phiên mới bắt đầu, reset mới = {reset}"),
+                        format!("{tool_label} · account \"{account_name}\" — SUCCESS: gia hạn, session đã xác nhận, reset = {reset}"),
                     )
                 } else {
                     (
                         "success",
-                        format!("{tool_label} · account \"{account_name}\" — SUCCESS: primed, reset mới = {reset}"),
+                        format!("{tool_label} · account \"{account_name}\" — SUCCESS: session đã xác nhận, reset = {reset}"),
                     )
                 }
             }
@@ -1898,12 +2282,12 @@ impl ManagedState {
                 if is_manual {
                     format!("{tool_label} · account \"{account_name}\" — FAIL: prime tay gửi lỗi ({reason})")
                 } else {
-                    format!("{tool_label} · account \"{account_name}\" — FAIL: gửi lỗi sau 5 lần thử ({reason})")
+                    format!("{tool_label} · account \"{account_name}\" — FAIL: gửi lỗi tới hết deadline ({reason})")
                 },
             ),
             PrimeOutcome::FailUnconfirmed => (
                 "failed",
-                format!("{tool_label} · account \"{account_name}\" — FAIL: gửi OK nhưng không xác nhận được phiên mới sau 5 lần kiểm tra"),
+                format!("{tool_label} · account \"{account_name}\" — FAIL: không xác nhận được session trong deadline"),
             ),
         };
 
@@ -1967,7 +2351,11 @@ impl ManagedState {
                 // job set is_extend=false and isn't the extend, so clearing here would silently
                 // disarm an extend the user is still waiting on. (`resolve_pending` mirrors
                 // `consume_scheduled`'s manual-fail carve-out, for the extend flags this time.)
-                let resolve_pending = if job.manual { succeeded } else { terminal };
+                let resolve_pending = if job.manual {
+                    succeeded
+                } else {
+                    job.is_extend && terminal
+                };
                 if resolve_pending {
                     // The extend request is resolved (opened, or exhausted retries) — clear it so it
                     // doesn't re-fire next tick. Also clear the "reminded for this window" marker:
@@ -2876,6 +3264,24 @@ fn build_snapshot(
         auto_switch_threshold: data.auto_switch_threshold,
         auto_switch_settings: data.auto_switch_settings.clone(),
         auto_prime: data.auto_prime.clone(),
+        prime_attempts: store
+            .load_prime_runtime()
+            .unwrap_or_default()
+            .attempts
+            .into_iter()
+            .map(|(account_id, attempt)| {
+                (
+                    account_id,
+                    crate::models::PrimeAttemptStatus {
+                        phase: attempt.phase,
+                        deadline_at: attempt.deadline_at,
+                        next_action_at: attempt.next_action_at,
+                        attempts: attempt.send_attempts,
+                        last_error: attempt.last_error,
+                    },
+                )
+            })
+            .collect(),
         tool_setups: data.tool_setups.clone(),
         api_gateway: ApiGatewaySnapshot {
             config: redacted_api_gateway_config(data),
@@ -3185,6 +3591,11 @@ const EXTEND_THRESHOLD_MIN: i64 = 30;
 /// many minutes means: prime if we're within the window past the anchor, otherwise treat today as
 /// missed and wait for tomorrow's anchor. 60' absorbs a late wake without reaching hours later.
 const CATCH_UP_MIN: i64 = 60;
+const PRIME_RETRY_DEADLINE_MIN: i64 = 45;
+const PRIME_RETRY_INTERVAL_MIN: i64 = 5;
+const MANUAL_PRIME_DEADLINE_MIN: i64 = 5;
+const MANUAL_PRIME_RETRY_INTERVAL_MIN: i64 = 2;
+const PRIME_PROOF_BUDGET_SECONDS: i64 = 150;
 
 /// Grace past a window's `reset_at` before an armed auto-extend actually primes. The provider's
 /// clock can lag ours by tens of seconds at the boundary, so priming exactly at `reset_at` risks
@@ -3220,6 +3631,77 @@ struct PrimeJob {
     /// Atomic cross-process claim for scheduled/extend work. It remains for consumed outcomes so a
     /// stale GUI state cannot run the same slot again; retryable token skips remove it.
     claim_paths: Vec<std::path::PathBuf>,
+}
+
+fn retry_reason(outcome: &crate::prime::PrimeOutcome) -> String {
+    use crate::prime::PrimeOutcome;
+    match outcome {
+        PrimeOutcome::SkipNoToken => "token chưa sẵn sàng".to_string(),
+        PrimeOutcome::SkipUnknownState => "chưa đọc được trạng thái session".to_string(),
+        PrimeOutcome::FailSend { reason } => format!("gửi lỗi: {reason}"),
+        PrimeOutcome::FailUnconfirmed => {
+            "session chưa được xác nhận (reset vẫn rolling hoặc chưa cập nhật)".to_string()
+        }
+        PrimeOutcome::Success { .. } | PrimeOutcome::Hold { .. } => "đã hoàn tất".to_string(),
+    }
+}
+
+fn terminal_failure_from(outcome: &crate::prime::PrimeOutcome) -> crate::prime::PrimeOutcome {
+    match outcome {
+        crate::prime::PrimeOutcome::FailSend { reason } => crate::prime::PrimeOutcome::FailSend {
+            reason: format!("{reason}; hết deadline 45 phút"),
+        },
+        _ => crate::prime::PrimeOutcome::FailUnconfirmed,
+    }
+}
+
+fn deadline_failure_from(
+    attempt: &crate::models::PendingPrimeAttempt,
+) -> crate::prime::PrimeOutcome {
+    match attempt.last_error.as_deref() {
+        Some(reason) if reason.starts_with("gửi lỗi:") => {
+            crate::prime::PrimeOutcome::FailSend {
+                reason: format!("{reason}; hết deadline"),
+            }
+        }
+        _ => crate::prime::PrimeOutcome::FailUnconfirmed,
+    }
+}
+
+fn add_minutes_iso(iso: &str, minutes: i64) -> String {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|t| (t.with_timezone(&chrono::Utc) + chrono::Duration::minutes(minutes)).to_rfc3339())
+        .unwrap_or_else(|_| (chrono::Utc::now() + chrono::Duration::minutes(minutes)).to_rfc3339())
+}
+
+fn earlier_iso(first: &str, second: &str) -> String {
+    let first_time = chrono::DateTime::parse_from_rfc3339(first);
+    let second_time = chrono::DateTime::parse_from_rfc3339(second);
+    match (first_time, second_time) {
+        (Ok(a), Ok(b)) if a <= b => first.to_string(),
+        (Ok(_), Ok(_)) => second.to_string(),
+        _ => first.to_string(),
+    }
+}
+
+/// Resolve today's logical scheduled anchor. For the midnight catch-up case, an anchor that is in
+/// the future by wall clock but whose wrapped age is non-negative belongs to yesterday.
+fn scheduled_anchor_iso(time: &str) -> Option<String> {
+    use chrono::TimeZone;
+    let now = chrono::Local::now();
+    let (hour, minute) = parse_hhmm(time)?;
+    let mut date = now.date_naive();
+    let age = anchor_age_minutes(time, &local_now_hhmm())?;
+    let mut anchor = chrono::Local
+        .from_local_datetime(&date.and_hms_opt(hour, minute, 0)?)
+        .single()?;
+    if age >= 0 && anchor > now {
+        date = date.checked_sub_days(chrono::Days::new(1))?;
+        anchor = chrono::Local
+            .from_local_datetime(&date.and_hms_opt(hour, minute, 0)?)
+            .single()?;
+    }
+    Some(anchor.with_timezone(&chrono::Utc).to_rfc3339())
 }
 
 /// Atomically claim scheduled/extend work across the GUI and headless daemon processes. Consumed
@@ -3347,6 +3829,13 @@ fn local_log_timestamp() -> String {
 fn minutes_until(iso: &str) -> i64 {
     match chrono::DateTime::parse_from_rfc3339(iso) {
         Ok(t) => (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_minutes(),
+        Err(_) => i64::MAX,
+    }
+}
+
+fn seconds_until(iso: &str) -> i64 {
+    match chrono::DateTime::parse_from_rfc3339(iso) {
+        Ok(t) => (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds(),
         Err(_) => i64::MAX,
     }
 }
@@ -3605,6 +4094,14 @@ mod tests {
         assert!(!due(61)); // just past → missed today
         assert!(!due(-1)); // upcoming, not yet due
         assert!(!due(16 * 60 + 12)); // 22:42 vs a 06:30 anchor → NOT due (was the bug)
+    }
+
+    #[test]
+    fn earlier_iso_caps_retry_at_deadline() {
+        let retry = "2026-06-20T00:10:00Z";
+        let deadline = "2026-06-20T00:08:00Z";
+        assert_eq!(earlier_iso(retry, deadline), deadline);
+        assert_eq!(earlier_iso(deadline, retry), deadline);
     }
 
     #[test]

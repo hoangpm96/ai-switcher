@@ -431,10 +431,89 @@ pub struct AppSnapshot {
     /// Per-account auto session prime schedules, keyed by account id.
     #[serde(default)]
     pub auto_prime: std::collections::BTreeMap<String, AutoPrimeSetting>,
+    /// In-flight prime attempts, keyed by account id. Runtime-only state persisted separately from
+    /// state.json so the GUI and headless daemon cannot overwrite each other's retry progress.
+    #[serde(default)]
+    pub prime_attempts: std::collections::BTreeMap<String, PrimeAttemptStatus>,
     #[serde(default)]
     pub tool_setups: std::collections::BTreeMap<String, ToolSetup>,
     #[serde(default)]
     pub api_gateway: ApiGatewaySnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PrimeAttemptPhase {
+    Precheck,
+    NeedSend,
+    Confirming,
+    WaitingRetry,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeObservation {
+    pub reset_at: Option<String>,
+    pub observed_at: String,
+}
+
+/// Durable state for one account's in-flight prime workflow. At most one attempt exists per
+/// account; scheduled + extend triggers are coalesced through the two boolean flags.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPrimeAttempt {
+    #[serde(default = "prime_runtime_version")]
+    pub version: u32,
+    pub account_id: String,
+    pub tool_id: ToolId,
+    #[serde(default)]
+    pub consumes_scheduled_slot: bool,
+    #[serde(default)]
+    pub resolves_extend: bool,
+    #[serde(default)]
+    pub manual: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_time: Option<String>,
+    pub anchor_at: String,
+    pub deadline_at: String,
+    pub phase: PrimeAttemptPhase,
+    pub next_action_at: String,
+    #[serde(default)]
+    pub send_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_send_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_reset_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observation: Option<PrimeObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_key: Option<String>,
+}
+
+fn prime_runtime_version() -> u32 {
+    1
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeRuntimeState {
+    #[serde(default)]
+    pub attempts: std::collections::BTreeMap<String, PendingPrimeAttempt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeAttemptStatus {
+    pub phase: PrimeAttemptPhase,
+    pub deadline_at: String,
+    pub next_action_at: String,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

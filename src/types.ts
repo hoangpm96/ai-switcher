@@ -70,8 +70,19 @@ export interface AppSnapshot {
   autoSwitchThreshold: number;
   autoSwitchSettings: Record<string, AutoSwitchSetting>;
   autoPrime: Record<string, AutoPrimeSetting>;
+  primeAttempts: Record<string, PrimeAttemptStatus>;
   toolSetups: Record<string, ToolSetup>;
   apiGateway: ApiGatewaySnapshot;
+}
+
+export type PrimeAttemptPhase = "precheck" | "needSend" | "confirming" | "waitingRetry";
+
+export interface PrimeAttemptStatus {
+  phase: PrimeAttemptPhase;
+  deadlineAt: string;
+  nextActionAt: string;
+  attempts: number;
+  lastError?: string | null;
 }
 
 export type ApiGatewayServerState = "stopped" | "running" | "errored";

@@ -28,9 +28,18 @@ function resultLabel(result?: string | null): string {
       return "bỏ qua (token)";
     case "hold":
       return "đã hoãn";
+    case "retrying":
+      return "đang thử lại";
     default:
       return "chưa prime";
   }
+}
+
+function localHHMM(iso: string): string {
+  const parsed = new Date(iso);
+  return Number.isNaN(parsed.getTime())
+    ? iso
+    : parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 export function AutoSessionView({
@@ -275,6 +284,7 @@ export function AutoSessionView({
         <div className="autoGrid">
           {accounts.map(({ tool, account }) => {
             const setting = snapshot.autoPrime[account.id];
+            const attempt = snapshot.primeAttempts[account.id];
             const enabled = setting?.enabled ?? false;
             const busy = busyId === account.id;
             return (
@@ -315,6 +325,12 @@ export function AutoSessionView({
                     {timeOf(account)} → reset ~{plusFiveHours(timeOf(account))}
                   </p>
                 )}
+                {attempt && (
+                  <p className="autoCardHint">
+                    Đang mở session · thử lại {localHHMM(attempt.nextActionAt)} · hết hạn{" "}
+                    {localHHMM(attempt.deadlineAt)}
+                  </p>
+                )}
                 <div className="autoExtendToggle">
                   <button
                     type="button"
@@ -329,7 +345,9 @@ export function AutoSessionView({
                   <span title="Khi phiên 5h sắp hết (≤30 phút), tự mở phiên kế tiếp mà không cần hỏi. Tắt = app sẽ hỏi trước.">
                     Tự gia hạn
                   </span>
-                  <span className="autoCardResult">{resultLabel(setting?.lastResult)}</span>
+                  <span className="autoCardResult">
+                    {attempt ? "đang xác nhận…" : resultLabel(setting?.lastResult)}
+                  </span>
                 </div>
               </div>
             );

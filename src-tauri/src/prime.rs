@@ -20,14 +20,20 @@ use std::time::Duration;
 /// The cheapest model that the subscription endpoint accepts for each tool.
 const CLAUDE_PRIME_MODEL: &str = "claude-haiku-4-5-20251001";
 const CODEX_PRIME_MODEL: &str = "gpt-5.5";
-const CLAUDE_CODE_SYSTEM_PREAMBLE: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_CODE_SYSTEM_PREAMBLE: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Send-retry policy (D3): on a failed send, wait then retry, up to this many attempts total.
-pub const SEND_MAX_ATTEMPTS: u32 = 5;
+/// Delay used only when a caller explicitly asks one bounded invocation to retry. Durable
+/// scheduled retries are orchestrated by app_state and persisted in prime-runtime.json.
 pub const SEND_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 /// Confirm-retry policy (D4): after a 2xx send, re-read the live window until `reset_at` moves.
 pub const CONFIRM_MAX_TRIES: u32 = 5;
 pub const CONFIRM_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Codex needs two observations: a rolling reset advances with wall time, while a real session's
+/// reset remains fixed. 75s is safely above the 60s minimum proof gap while staying inside one
+/// short caffeinated wake transaction.
+pub const CODEX_OBSERVATION_DELAY: Duration = Duration::from_secs(75);
+pub const CODEX_FIXED_RESET_EPSILON_SECONDS: i64 = 15;
 /// Hard cap on how long a prime CLI invocation may run before we kill it (a hung CLI must never
 /// hold the prime worker — see the scheduler's overlap guard).
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(120);
@@ -45,7 +51,8 @@ pub enum PrimeOutcome {
     /// so we did NOT send — failing closed rather than priming into an unknown window. Transient;
     /// the next scheduled tick retries.
     SkipUnknownState,
-    /// The send kept failing after `SEND_MAX_ATTEMPTS`. Carries a short reason.
+    /// The bounded send burst failed. The persisted scheduler decides whether the deadline permits
+    /// another burst.
     FailSend { reason: String },
     /// Send was OK but the window never moved after `CONFIRM_MAX_TRIES`.
     FailUnconfirmed,
@@ -57,18 +64,17 @@ pub fn is_prime_eligible(tool_id: &ToolId, has_api_provider: bool) -> bool {
     !has_api_provider && matches!(tool_id, ToolId::Claude | ToolId::Codex)
 }
 
-/// Run one full prime attempt for an account. Blocking — the caller runs it on a worker thread.
-/// `sleeper` is invoked for retry delays so tests can run without real waiting. `binary` is the
-/// account's resolved CLI path (claude/codex) — used to prime via the CLI (preferred) and to
-/// refresh Claude's token; None falls back to the HTTP path. `send_attempts` caps D3's send tries:
-/// the scheduler passes `SEND_MAX_ATTEMPTS` (it has all day to retry), the on-demand "Prime ngay"
-/// passes 1 (fail fast, let the user tap again — no back-to-back retries hammering the provider).
-pub fn prime_account(
+/// Run one bounded prime burst. The crash-safety hook is invoked after precheck succeeds and
+/// immediately
+/// before the first external send. The scheduler uses it to durably persist `Confirming`,
+/// `baseline_reset_at`, and `last_send_at`; a failed hook aborts the send.
+pub fn prime_account_with_hook(
     tool_id: &ToolId,
     config_dir: &Path,
     binary: Option<&Path>,
     send_attempts: u32,
     mut sleeper: impl FnMut(Duration),
+    mut before_send: impl FnMut(Option<&str>) -> Result<(), String>,
 ) -> PrimeOutcome {
     // Hold the Mac awake for the whole attempt. A pmset wake only buys a brief awake window before
     // macOS idle-sleeps again; D3's retries (up to 5 × 5') and D4's confirm polls can outlast it,
@@ -86,12 +92,12 @@ pub fn prime_account(
     // in the terminal, so we only HOLD when the window is DEFINITELY a real anchored one. Codex's
     // `Ambiguous` (reset ≈ now + 5h — rolling for a low-usage account, which never anchors from a
     // bare "hi") falls through to send, matching the terminal's behaviour.
-    let before = quota::read_live_five_hour(tool_id, config_dir);
-    let before_reset = before.as_ref().and_then(|w| w.reset_at.clone());
-    let state = before
-        .as_ref()
-        .map(|w| quota::classify_five_hour(tool_id, w))
-        .unwrap_or(quota::WindowState::Unknown);
+    let before = match quota::read_live_five_hour(tool_id, config_dir) {
+        Ok(window) => window,
+        Err(_) => return PrimeOutcome::SkipUnknownState,
+    };
+    let before_reset = before.reset_at.clone();
+    let state = quota::classify_five_hour(tool_id, &before);
     match state {
         // A real anchored window is running → don't pile a prime into it. `Anchored` is only
         // produced from a parseable future reset, so `before_reset` is present.
@@ -111,6 +117,9 @@ pub fn prime_account(
     }
 
     // D3 — send "hi", retrying on failure up to `send_attempts` times.
+    if let Err(reason) = before_send(before_reset.as_deref()) {
+        return PrimeOutcome::FailSend { reason };
+    }
     let attempts = send_attempts.max(1);
     let mut last_reason = String::new();
     let mut sent = false;
@@ -137,26 +146,32 @@ pub fn prime_account(
     // D4 — confirm the prime took.
     //
     // Provider-aware:
-    //   - Codex: a bare "hi" does NOT reliably anchor the 5h window on a low-usage account — the
-    //     endpoint keeps reporting a ROLLING `reset_at` (≈ now + 5h) regardless. Waiting for an
-    //     "anchored" reset would hang for minutes and then fail. So, like running `codex exec "hi"`
-    //     in a terminal, a 2xx send IS the success: report it immediately, reading the current
-    //     reset_at just for display (best-effort).
+    //   - Codex: a bare "hi" does NOT reliably anchor the 5h window on a low-usage account. A
+    //     single snapshot around now+5h is ambiguous, so observe twice: rolling resets advance with
+    //     wall time; an active session's reset stays fixed.
     //   - Claude: `reset_at` is a stable anchor, so we can (and should) confirm the window actually
     //     moved to a new future reset before claiming success. Poll a few times — the provider may
     //     take a few seconds to refresh.
     if matches!(tool_id, ToolId::Codex) {
-        let new_reset = quota::read_live_five_hour(tool_id, config_dir)
-            .and_then(|w| w.reset_at)
-            .or(before_reset)
-            .unwrap_or_default();
-        return PrimeOutcome::Success {
-            new_reset_at: new_reset,
-        };
+        let first = quota::read_live_five_hour(tool_id, config_dir).ok();
+        sleeper(CODEX_OBSERVATION_DELAY);
+        let second = quota::read_live_five_hour(tool_id, config_dir).ok();
+        if let (Some(first), Some(second)) = (first, second) {
+            if let (Some(first_reset), Some(second_reset)) =
+                (first.reset_at.as_deref(), second.reset_at.as_deref())
+            {
+                if codex_reset_is_fixed(first_reset, second_reset) {
+                    return PrimeOutcome::Success {
+                        new_reset_at: second_reset.to_string(),
+                    };
+                }
+            }
+        }
+        return PrimeOutcome::FailUnconfirmed;
     }
     for _ in 0..CONFIRM_MAX_TRIES {
         sleeper(CONFIRM_RETRY_DELAY);
-        if let Some(window) = quota::read_live_five_hour(tool_id, config_dir) {
+        if let Ok(window) = quota::read_live_five_hour(tool_id, config_dir) {
             if let Some(new_reset) = &window.reset_at {
                 if window_moved(before_reset.as_deref(), new_reset) {
                     return PrimeOutcome::Success {
@@ -167,6 +182,65 @@ pub fn prime_account(
         }
     }
     PrimeOutcome::FailUnconfirmed
+}
+
+/// Resume an attempt that may have crashed after its durable `Confirming` marker was written.
+/// This path never sends: it only proves whether a real session is active, preventing a blind
+/// duplicate request after restart.
+pub fn confirm_active_session(
+    tool_id: &ToolId,
+    config_dir: &Path,
+    baseline_reset_at: Option<&str>,
+    mut sleeper: impl FnMut(Duration),
+) -> PrimeOutcome {
+    match tool_id {
+        ToolId::Claude => {
+            let Ok(window) = quota::read_live_five_hour(tool_id, config_dir) else {
+                return PrimeOutcome::SkipUnknownState;
+            };
+            match window.reset_at {
+                Some(reset_at) if claude_reset_confirms(baseline_reset_at, &reset_at) => {
+                    PrimeOutcome::Success {
+                        new_reset_at: reset_at,
+                    }
+                }
+                _ => PrimeOutcome::FailUnconfirmed,
+            }
+        }
+        ToolId::Codex => {
+            let first = quota::read_live_five_hour(tool_id, config_dir).ok();
+            sleeper(CODEX_OBSERVATION_DELAY);
+            let second = quota::read_live_five_hour(tool_id, config_dir).ok();
+            if let (Some(first), Some(second)) = (first, second) {
+                if let (Some(first_reset), Some(second_reset)) =
+                    (first.reset_at.as_deref(), second.reset_at.as_deref())
+                {
+                    if codex_reset_is_fixed(first_reset, second_reset) {
+                        return PrimeOutcome::Success {
+                            new_reset_at: second_reset.to_string(),
+                        };
+                    }
+                }
+            }
+            PrimeOutcome::FailUnconfirmed
+        }
+        ToolId::Antigravity => PrimeOutcome::SkipUnknownState,
+    }
+}
+
+fn claude_reset_confirms(baseline: Option<&str>, candidate: &str) -> bool {
+    is_future(candidate) && baseline.is_none_or(|before| before != candidate)
+}
+
+fn codex_reset_is_fixed(first: &str, second: &str) -> bool {
+    let Ok(first) = chrono::DateTime::parse_from_rfc3339(first) else {
+        return false;
+    };
+    let Ok(second) = chrono::DateTime::parse_from_rfc3339(second) else {
+        return false;
+    };
+    second > chrono::Utc::now()
+        && (second.timestamp() - first.timestamp()).abs() <= CODEX_FIXED_RESET_EPSILON_SECONDS
 }
 
 /// Keeps the Mac awake (no idle sleep) for as long as it is alive, by holding a child
@@ -235,9 +309,7 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
                 .env("CLAUDE_CONFIG_DIR", config_dir);
         }
         ToolId::Codex => {
-            command
-                .args(["exec", "hi"])
-                .env("CODEX_HOME", config_dir);
+            command.args(["exec", "hi"]).env("CODEX_HOME", config_dir);
         }
         ToolId::Antigravity => return Err("antigravity unsupported".to_string()),
     }
@@ -395,5 +467,37 @@ mod tests {
         assert!(window_moved(Some(future_a), future_b));
         // New value in the past → not a valid new window.
         assert!(!window_moved(Some(future_a), past));
+    }
+
+    #[test]
+    fn codex_fixed_reset_proof_rejects_rolling_value() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(5);
+        let fixed_a = future.to_rfc3339();
+        let fixed_b = (future + chrono::Duration::seconds(10)).to_rfc3339();
+        let rolling = (future + chrono::Duration::seconds(75)).to_rfc3339();
+        assert!(codex_reset_is_fixed(&fixed_a, &fixed_b));
+        assert!(!codex_reset_is_fixed(&fixed_a, &rolling));
+    }
+
+    #[test]
+    fn codex_fixed_reset_boundary_is_fifteen_seconds() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(5);
+        assert!(codex_reset_is_fixed(
+            &future.to_rfc3339(),
+            &(future + chrono::Duration::seconds(15)).to_rfc3339()
+        ));
+        assert!(!codex_reset_is_fixed(
+            &future.to_rfc3339(),
+            &(future + chrono::Duration::seconds(16)).to_rfc3339()
+        ));
+    }
+
+    #[test]
+    fn claude_resume_requires_reset_movement_from_baseline() {
+        let baseline = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let moved = (chrono::Utc::now() + chrono::Duration::hours(5)).to_rfc3339();
+        assert!(!claude_reset_confirms(Some(&baseline), &baseline));
+        assert!(claude_reset_confirms(Some(&baseline), &moved));
+        assert!(claude_reset_confirms(None, &moved)); // valid empty precheck
     }
 }

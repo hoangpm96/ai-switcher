@@ -9,6 +9,35 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LiveQuotaError {
+    RateLimited,
+    Authentication,
+    Network,
+    InvalidResponse,
+    Unsupported,
+}
+
+fn classify_live_quota_error(error: &anyhow::Error) -> LiveQuotaError {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("429") {
+        LiveQuotaError::RateLimited
+    } else if message.contains("401")
+        || message.contains("403")
+        || message.contains("access_token")
+        || message.contains("oauth token")
+    {
+        LiveQuotaError::Authentication
+    } else if message.contains("timeout")
+        || message.contains("network")
+        || message.contains("connection")
+    {
+        LiveQuotaError::Network
+    } else {
+        LiveQuotaError::InvalidResponse
+    }
+}
+
 /// `config_dir` is the `CLAUDE_CONFIG_DIR` of the account being read (profile dir,
 /// or `~/.claude` for the default account). Claude stores the keychain token by the
 /// hash of this path, so the correct dir must be passed to read each account's quota.
@@ -132,7 +161,6 @@ fn parse_rfc3339_epoch(reset_at: &str) -> Option<i64> {
         .map(|t| t.timestamp())
 }
 
-
 // ---------------------------------------------------------------------------
 // Claude Code — calls the OAuth usage endpoint (same source the /usage command uses).
 //
@@ -223,7 +251,13 @@ fn quota_from_claude_usage(value: &serde_json::Value) -> Result<QuotaInfo> {
 /// Best-effort plan label from Claude's usage payload. The endpoint isn't documented to
 /// always carry one, so try a few likely keys and ignore if absent.
 fn claude_plan(value: &serde_json::Value) -> Option<String> {
-    for key in ["subscription_type", "plan", "plan_type", "tier", "account_type"] {
+    for key in [
+        "subscription_type",
+        "plan",
+        "plan_type",
+        "tier",
+        "account_type",
+    ] {
         if let Some(raw) = value.get(key).and_then(serde_json::Value::as_str) {
             if let Some(plan) = pretty_plan(raw) {
                 return Some(plan);
@@ -672,23 +706,28 @@ fn read_codex_rollout_quota() -> Result<QuotaInfo> {
 /// Auto-prime's confirmation step needs the truth straight from the provider right after
 /// sending "hi" — the Claude cache (60s) or the Codex rollout file (only updated by the CLI)
 /// would otherwise return a stale `reset_at`.
-pub(crate) fn read_live_five_hour(tool_id: &ToolId, config_dir: &Path) -> Option<QuotaWindow> {
+pub(crate) fn read_live_five_hour(
+    tool_id: &ToolId,
+    config_dir: &Path,
+) -> std::result::Result<QuotaWindow, LiveQuotaError> {
     match tool_id {
         ToolId::Claude => {
             invalidate_claude_cache(config_dir);
-            let quota = read_claude_quota(config_dir).ok()?;
-            Some(quota.five_hour)
+            let quota = read_claude_quota(config_dir).map_err(|e| classify_live_quota_error(&e))?;
+            Ok(quota.five_hour)
         }
         ToolId::Codex => {
-            let quota = read_codex_usage_endpoint(config_dir).ok()?;
-            Some(quota.five_hour)
+            let quota =
+                read_codex_usage_endpoint(config_dir).map_err(|e| classify_live_quota_error(&e))?;
+            Ok(quota.five_hour)
         }
-        ToolId::Antigravity => None,
+        ToolId::Antigravity => Err(LiveQuotaError::Unsupported),
     }
 }
 
 fn read_codex_usage_endpoint(config_dir: &Path) -> Result<QuotaInfo> {
-    let token = codex_access_token_fresh(config_dir).context("couldn't get Codex's access_token")?;
+    let token =
+        codex_access_token_fresh(config_dir).context("couldn't get Codex's access_token")?;
     let body = curl_get(
         "https://chatgpt.com/backend-api/wham/usage",
         &[
@@ -709,7 +748,8 @@ pub(crate) fn codex_access_token_fresh(config_dir: &Path) -> Option<String> {
     let mut value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let tokens = value.get("tokens")?;
     let access_token = tokens.get("access_token")?.as_str()?.to_string();
-    if jwt_expiry(&access_token).is_none_or(|expiry| expiry > chrono::Utc::now().timestamp() + 300) {
+    if jwt_expiry(&access_token).is_none_or(|expiry| expiry > chrono::Utc::now().timestamp() + 300)
+    {
         return Some(access_token);
     }
 
@@ -988,14 +1028,25 @@ fn pretty_plan(raw: &str) -> Option<String> {
         return None;
     }
     // Pick the most recognisable tier keyword if present; otherwise title-case the last token.
-    for tier in ["max", "pro", "plus", "team", "enterprise", "edu", "business"] {
+    for tier in [
+        "max",
+        "pro",
+        "plus",
+        "team",
+        "enterprise",
+        "edu",
+        "business",
+    ] {
         if cleaned.contains(tier) {
             let mut chars = tier.chars();
             let first = chars.next().unwrap().to_uppercase().to_string();
             return Some(format!("{first}{}", chars.as_str()));
         }
     }
-    let token = cleaned.split(['_', '-', ' ']).next_back().unwrap_or(&cleaned);
+    let token = cleaned
+        .split(['_', '-', ' '])
+        .next_back()
+        .unwrap_or(&cleaned);
     let mut chars = token.chars();
     let first = chars.next()?.to_uppercase().to_string();
     Some(format!("{first}{}", chars.as_str()))
@@ -1173,7 +1224,10 @@ mod tests {
     #[test]
     fn reset_near_full_window_within_and_outside_tolerance() {
         let now = 1_000_000;
-        assert!(reset_is_near_full_window(now + CODEX_FIVE_HOUR_SECONDS, now));
+        assert!(reset_is_near_full_window(
+            now + CODEX_FIVE_HOUR_SECONDS,
+            now
+        ));
         // 80s short of now + 5h (freshly anchored 80s ago) = still within 90s tolerance.
         assert!(reset_is_near_full_window(
             now + CODEX_FIVE_HOUR_SECONDS - 80,

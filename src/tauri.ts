@@ -47,6 +47,7 @@ const demoSnapshot: AppSnapshot = {
     claude: { enabled: false, time: "07:30" },
     codex: { enabled: false, time: "08:00" },
   },
+  primeAttempts: {},
   toolSetups: {
     claude: {
       binaryPath: "/Users/demo/.local/bin/claude",

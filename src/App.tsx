@@ -46,6 +46,7 @@ import type {
   ApiUsageReport,
   AppSnapshot,
   AutoPrimeSetting,
+  PrimeAttemptStatus,
   BinaryCandidate,
   ConfigCandidate,
   CreateApiGatewayKeyInput,
@@ -84,6 +85,7 @@ const emptySnapshot: AppSnapshot = {
   autoSwitchThreshold: 100,
   autoSwitchSettings: {},
   autoPrime: {},
+  primeAttempts: {},
   toolSetups: {},
   apiGateway: {
     config: {
@@ -639,6 +641,7 @@ export function App() {
                     tool={currentTool}
                     busy={busy}
                     autoPrime={snapshot.autoPrime[account.id] ?? null}
+                    primeAttempt={snapshot.primeAttempts[account.id] ?? null}
                     onExtend={(accept) =>
                       run("extend", () =>
                         api.confirmExtend({
@@ -1777,6 +1780,7 @@ function AccountCard({
   tool,
   busy,
   autoPrime,
+  primeAttempt,
   onExtend,
   onPrimeNow,
   onSwitch,
@@ -1791,6 +1795,7 @@ function AccountCard({
   tool: ToolStatus;
   busy: string | null;
   autoPrime: AutoPrimeSetting | null;
+  primeAttempt: PrimeAttemptStatus | null;
   onExtend: (accept: boolean) => void;
   onPrimeNow: () => void;
   onSwitch: () => void;
@@ -1827,7 +1832,16 @@ function AccountCard({
     minsToReset > 0 &&
     minsToReset <= 30;
   const autoStatus = (() => {
-    if (!canPrime || !primeOn) return null;
+    if (!canPrime) return null;
+    if (primeAttempt) {
+      const deadline = new Date(primeAttempt.deadlineAt).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      return `Đang mở session · thử tới ${deadline}`;
+    }
+    if (!primeOn) return null;
     if (autoPrime?.extendRequested) return "Sẽ mở phiên mới khi phiên cũ hết";
     if (autoPrime?.lastResult === "success") return `Auto ${autoPrime.time} · đã prime`;
     return `Auto ${autoPrime?.time}`;
@@ -1844,7 +1858,8 @@ function AccountCard({
     canPrime &&
     account.quota?.primeAvailable === true &&
     !needsLogin &&
-    !autoPrime?.extendRequested;
+    !autoPrime?.extendRequested &&
+    !primeAttempt;
   const primingNow = busy === `prime:${account.id}`;
 
   return (
