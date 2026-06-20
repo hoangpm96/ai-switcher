@@ -448,6 +448,30 @@ pub enum PrimeAttemptPhase {
     NeedSend,
     Confirming,
     WaitingRetry,
+    Finalizing,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PrimeAttemptSource {
+    #[default]
+    Schedule,
+    AutoExtend,
+    UserExtend,
+    Manual,
+    ScheduleAutoExtend,
+    ScheduleUserExtend,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PrimeTerminalOutcome {
+    Success { new_reset_at: String },
+    Hold { reset_at: String },
+    FailSend { reason: String },
+    FailUnconfirmed,
+    SkipNoToken,
+    SkipUnknownState,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -466,6 +490,10 @@ pub struct PendingPrimeAttempt {
     pub version: u32,
     pub account_id: String,
     pub tool_id: ToolId,
+    #[serde(default = "new_prime_attempt_id")]
+    pub attempt_id: String,
+    #[serde(default)]
+    pub source: PrimeAttemptSource,
     #[serde(default)]
     pub consumes_scheduled_slot: bool,
     #[serde(default)]
@@ -492,10 +520,16 @@ pub struct PendingPrimeAttempt {
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<PrimeTerminalOutcome>,
 }
 
 fn prime_runtime_version() -> u32 {
     1
+}
+
+fn new_prime_attempt_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -512,6 +546,7 @@ pub struct PrimeAttemptStatus {
     pub deadline_at: String,
     pub next_action_at: String,
     pub attempts: u32,
+    pub source: PrimeAttemptSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
@@ -556,6 +591,9 @@ pub struct AutoPrimeSetting {
     /// ISO timestamp of the most recent prime attempt (any outcome).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_attempt_at: Option<String>,
+    /// Idempotency marker for terminal state/log finalization across process crashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_terminal_attempt_id: Option<String>,
     /// On-demand extend (mechanism 2): set true when the user accepts the "extend?" prompt.
     /// The next time the current 5h window ends, the account is primed once, then this clears.
     #[serde(default)]
@@ -596,6 +634,7 @@ impl Default for AutoPrimeSetting {
             last_primed_time: None,
             last_result: None,
             last_attempt_at: None,
+            last_terminal_attempt_id: None,
             extend_requested: false,
             extend_reminded_reset: None,
             auto_extend: false,

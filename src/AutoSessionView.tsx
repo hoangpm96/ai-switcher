@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlarmClock, BarChart3, FileText, FolderOpen, Loader2, Moon } from "lucide-react";
 import { api } from "./tauri";
-import type { Account, AppSnapshot, AutoPrimeDayStat, ToolId } from "./types";
+import type {
+  Account,
+  AppSnapshot,
+  AutoPrimeDayStat,
+  PrimeAttemptSource,
+  ToolId,
+} from "./types";
 
 const PRIME_TOOLS: ToolId[] = ["claude", "codex"];
 
@@ -40,6 +46,23 @@ function localHHMM(iso: string): string {
   return Number.isNaN(parsed.getTime())
     ? iso
     : parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function attemptSourceLabel(source: PrimeAttemptSource): string {
+  switch (source) {
+    case "schedule":
+      return "Lịch";
+    case "autoExtend":
+      return "Tự gia hạn";
+    case "userExtend":
+      return "Gia hạn";
+    case "manual":
+      return "Prime ngay";
+    case "scheduleAutoExtend":
+      return "Lịch + tự gia hạn";
+    case "scheduleUserExtend":
+      return "Lịch + gia hạn";
+  }
 }
 
 export function AutoSessionView({
@@ -327,8 +350,8 @@ export function AutoSessionView({
                 )}
                 {attempt && (
                   <p className="autoCardHint">
-                    Đang mở session · thử lại {localHHMM(attempt.nextActionAt)} · hết hạn{" "}
-                    {localHHMM(attempt.deadlineAt)}
+                    {attemptSourceLabel(attempt.source)} · đang mở session · thử lại{" "}
+                    {localHHMM(attempt.nextActionAt)} · hết hạn {localHHMM(attempt.deadlineAt)}
                   </p>
                 )}
                 <div className="autoExtendToggle">

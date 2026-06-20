@@ -124,7 +124,7 @@ impl ManagedState {
             if let Ok(entries) = std::fs::read_dir(&tool_root) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.is_dir() && !valid_dirs.iter().any(|d| *d == path) {
+                    if path.is_dir() && !valid_dirs.contains(&path) {
                         let _ = std::fs::remove_dir_all(&path);
                     }
                 }
@@ -1123,6 +1123,7 @@ impl ManagedState {
         use fs2::FileExt;
         let Ok(lock_file) = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.store.prime_lock_path())
@@ -1504,7 +1505,7 @@ impl ManagedState {
                         && !entry.extend_requested
                     {
                         no_response.push(format!(
-                            "{tool_label} · account \"{account_name}\" — đã nhắc gia hạn nhưng không có phản hồi, phiên đã hết"
+                            "[EXTEND-PROMPT] {tool_label} · account \"{account_name}\" — đã nhắc gia hạn nhưng không có phản hồi, phiên đã hết"
                         ));
                         entry.extend_reminded_reset = None;
                         changed = true;
@@ -1520,7 +1521,7 @@ impl ManagedState {
         }
         for (tool_label, account_name, defer) in &auto_extended {
             self.append_prime_log(&format!(
-                "{tool_label} · account \"{account_name}\" — auto-extend BẬT: sẽ tự mở phiên mới lúc {at} (theo lịch nếu lịch rơi trong 5h tới, không thì ngay khi phiên cũ hết)",
+                "[AUTO-EXTEND] {tool_label} · account \"{account_name}\" — ĐÃ ARM: sẽ tự mở session lúc {at} (theo lịch nếu lịch rơi trong 5h tới, không thì ngay khi phiên cũ hết)",
                 at = local_hhmm_from_iso(defer)
             ));
         }
@@ -1580,6 +1581,27 @@ impl ManagedState {
         }
     }
 
+    /// Terminal finalization may resume after a crash. The attempt marker makes log append
+    /// idempotent even if state.json was saved but prime-runtime.json was not yet cleared.
+    fn append_prime_log_once(&self, attempt_id: &str, line: &str) -> Result<()> {
+        use std::io::Write;
+        let marker = format!("[attempt={}]", short_attempt_id(attempt_id));
+        let existing =
+            std::fs::read_to_string(self.store.auto_prime_log_path()).unwrap_or_default();
+        if existing.contains(&marker) {
+            return Ok(());
+        }
+        let stamped = format!("[{}] {}\n", local_log_timestamp(), line);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.store.auto_prime_log_path())
+            .context("opening auto-prime log")?;
+        file.write_all(stamped.as_bytes())
+            .context("writing auto-prime log")?;
+        Ok(())
+    }
+
     /// The scheduler tick: prime every account whose time has arrived and that hasn't yet primed
     /// for that time today. Runs sequentially with a gap between accounts. Called by the background
     /// thread (every minute) and once at startup (to catch a missed time → "primed muộn"). `late`
@@ -1610,6 +1632,7 @@ impl ManagedState {
         // persisted last_primed_date before deciding what is due.
         let lock_file = match std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.store.prime_lock_path())
@@ -1705,6 +1728,30 @@ impl ManagedState {
                         return None;
                     }
                     if let Some(mut attempt) = runtime.attempts.get(&account.id).cloned() {
+                        if attempt.phase == PrimeAttemptPhase::Finalizing
+                            && attempt.terminal_outcome.is_some()
+                        {
+                            let default_dir = resolved_default_config_dir(&data, &account.tool_id);
+                            return Some(PrimeJob {
+                                tool_id: account.tool_id.clone(),
+                                account_id: account.id.clone(),
+                                account_name: account.name.clone(),
+                                config_dir: account_config_dir_with_default(
+                                    &self.store,
+                                    account,
+                                    &default_dir,
+                                ),
+                                binary: configured_binary_path(&data, &account.tool_id),
+                                is_extend: attempt.resolves_extend,
+                                scheduled: attempt.consumes_scheduled_slot,
+                                manual: attempt.manual,
+                                claim_paths: attempt
+                                    .claim_key
+                                    .as_deref()
+                                    .map(|key| vec![self.store.prime_claim_path(key)])
+                                    .unwrap_or_default(),
+                            });
+                        }
                         let scheduled_still_valid = setting.enabled
                             && attempt
                                 .scheduled_time
@@ -1751,10 +1798,24 @@ impl ManagedState {
                                 attempt.consumes_scheduled_slot = true;
                                 attempt.scheduled_date = Some(today.clone());
                                 attempt.scheduled_time = Some(setting.time.clone());
+                                attempt.source = coalesced_prime_source(
+                                    true,
+                                    attempt.resolves_extend,
+                                    setting.auto_extend,
+                                );
                                 runtime_changed = true;
                             }
                             if setting.extend_requested && !attempt.resolves_extend {
                                 attempt.resolves_extend = true;
+                                runtime_changed = true;
+                            }
+                            let source = coalesced_prime_source(
+                                attempt.consumes_scheduled_slot,
+                                attempt.resolves_extend,
+                                setting.auto_extend,
+                            );
+                            if attempt.source != source {
+                                attempt.source = source;
                                 runtime_changed = true;
                             }
                             if runtime_changed {
@@ -1835,6 +1896,12 @@ impl ManagedState {
                         version: 1,
                         account_id: account.id.clone(),
                         tool_id: account.tool_id.clone(),
+                        attempt_id: Uuid::new_v4().to_string(),
+                        source: coalesced_prime_source(
+                            scheduled_due,
+                            extend_due,
+                            setting.auto_extend,
+                        ),
                         consumes_scheduled_slot: scheduled_due,
                         resolves_extend: extend_due,
                         manual: false,
@@ -1850,12 +1917,23 @@ impl ManagedState {
                         last_observation: None,
                         last_error: None,
                         claim_key: Some(claim_key),
+                        terminal_outcome: None,
                     };
                     runtime.attempts.insert(account.id.clone(), attempt);
                     runtime_changed = true;
                     started_account_ids.insert(account.id.clone());
                     started.push(format!(
-                        "{} · account \"{}\" — START: {}, deadline = {}",
+                        "[{}][attempt={}] {} · account \"{}\" — START: {}, deadline = {}",
+                        prime_source_label(
+                            &runtime.attempts.get(&account.id).expect("inserted").source
+                        ),
+                        short_attempt_id(
+                            &runtime
+                                .attempts
+                                .get(&account.id)
+                                .expect("inserted")
+                                .attempt_id
+                        ),
                         account.tool_id.prime_label(),
                         account.name,
                         if extend_due {
@@ -1895,18 +1973,16 @@ impl ManagedState {
                 })
                 .collect()
         };
-        if runtime_changed {
-            if self.store.save_prime_runtime(&runtime).is_err() {
-                for job in due
-                    .iter()
-                    .filter(|job| started_account_ids.contains(&job.account_id))
-                {
-                    for path in &job.claim_paths {
-                        let _ = std::fs::remove_file(path);
-                    }
+        if runtime_changed && self.store.save_prime_runtime(&runtime).is_err() {
+            for job in due
+                .iter()
+                .filter(|job| started_account_ids.contains(&job.account_id))
+            {
+                for path in &job.claim_paths {
+                    let _ = std::fs::remove_file(path);
                 }
-                return;
             }
+            return;
         }
         for line in started {
             self.append_prime_log(&line);
@@ -1919,10 +1995,28 @@ impl ManagedState {
             let Some(mut attempt) = runtime.attempts.get(&job.account_id).cloned() else {
                 continue;
             };
+            if let Some(terminal) = attempt.terminal_outcome.clone() {
+                let outcome = prime_outcome_from_terminal(&terminal);
+                let _ = self.finalize_prime_attempt(
+                    &mut runtime,
+                    job,
+                    &mut attempt,
+                    &outcome,
+                    late,
+                    app,
+                );
+                continue;
+            }
             if seconds_until(&attempt.deadline_at) <= 0 {
-                runtime.attempts.remove(&job.account_id);
-                let _ = self.store.save_prime_runtime(&runtime);
-                self.record_prime_outcome(job, &deadline_failure_from(&attempt), late, app);
+                let outcome = deadline_failure_from(&attempt);
+                let _ = self.finalize_prime_attempt(
+                    &mut runtime,
+                    job,
+                    &mut attempt,
+                    &outcome,
+                    late,
+                    app,
+                );
                 continue;
             }
             let resume_confirmation =
@@ -1930,9 +2024,15 @@ impl ManagedState {
             if !resume_confirmation
                 && seconds_until(&attempt.deadline_at) <= PRIME_PROOF_BUDGET_SECONDS
             {
-                runtime.attempts.remove(&job.account_id);
-                let _ = self.store.save_prime_runtime(&runtime);
-                self.record_prime_outcome(job, &deadline_failure_from(&attempt), late, app);
+                let outcome = deadline_failure_from(&attempt);
+                let _ = self.finalize_prime_attempt(
+                    &mut runtime,
+                    job,
+                    &mut attempt,
+                    &outcome,
+                    late,
+                    app,
+                );
                 continue;
             }
 
@@ -1967,17 +2067,23 @@ impl ManagedState {
             match outcome {
                 crate::prime::PrimeOutcome::Success { .. }
                 | crate::prime::PrimeOutcome::Hold { .. } => {
-                    runtime.attempts.remove(&job.account_id);
-                    let _ = self.store.save_prime_runtime(&runtime);
-                    self.record_prime_outcome(job, &outcome, late, app);
+                    let _ = self.finalize_prime_attempt(
+                        &mut runtime,
+                        job,
+                        &mut attempt,
+                        &outcome,
+                        late,
+                        app,
+                    );
                 }
                 retryable => {
                     if seconds_until(&attempt.deadline_at) <= 0 {
-                        runtime.attempts.remove(&job.account_id);
-                        let _ = self.store.save_prime_runtime(&runtime);
-                        self.record_prime_outcome(
+                        let outcome = terminal_failure_from(&retryable);
+                        let _ = self.finalize_prime_attempt(
+                            &mut runtime,
                             job,
-                            &terminal_failure_from(&retryable),
+                            &mut attempt,
+                            &outcome,
                             late,
                             app,
                         );
@@ -1994,7 +2100,9 @@ impl ManagedState {
                         let _ = self.store.save_prime_runtime(&runtime);
                         if attempt.send_attempts == 1 {
                             self.append_prime_log(&format!(
-                                "{} · account \"{}\" — PENDING: {}, thử lại lúc {} (deadline {})",
+                                "[{}][attempt={}] {} · account \"{}\" — PENDING: {}, thử lại lúc {} (deadline {})",
+                                prime_source_label(&attempt.source),
+                                short_attempt_id(&attempt.attempt_id),
                                 job.tool_id.prime_label(),
                                 job.account_name,
                                 retry_reason(&retryable),
@@ -2086,6 +2194,7 @@ impl ManagedState {
         let _guard = ClearOnDrop(&self.priming);
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.store.prime_lock_path())?;
@@ -2107,6 +2216,8 @@ impl ManagedState {
             version: 1,
             account_id: job.account_id.clone(),
             tool_id: job.tool_id.clone(),
+            attempt_id: Uuid::new_v4().to_string(),
+            source: crate::models::PrimeAttemptSource::Manual,
             consumes_scheduled_slot: false,
             resolves_extend: false,
             manual: true,
@@ -2122,6 +2233,7 @@ impl ManagedState {
             last_observation: None,
             last_error: None,
             claim_key: None,
+            terminal_outcome: None,
         };
         runtime
             .attempts
@@ -2180,9 +2292,14 @@ impl ManagedState {
                 let _ = app.emit("auto-prime-changed", ());
             }
         } else {
-            runtime.attempts.remove(&job.account_id);
-            self.store.save_prime_runtime(&runtime)?;
-            self.record_prime_outcome(&job, &outcome, false, app);
+            self.finalize_prime_attempt(
+                &mut runtime,
+                &job,
+                &mut manual_attempt,
+                &outcome,
+                false,
+                app,
+            )?;
         }
 
         let (kind, message) = match &outcome {
@@ -2223,6 +2340,40 @@ impl ManagedState {
         })
     }
 
+    /// Crash-consistent terminal protocol:
+    /// 1) persist Finalizing + terminal outcome; 2) idempotently update state + log;
+    /// 3) remove runtime. A crash at any boundary resumes Finalizing on the next scheduler tick.
+    fn finalize_prime_attempt(
+        &self,
+        runtime: &mut crate::models::PrimeRuntimeState,
+        job: &PrimeJob,
+        attempt: &mut crate::models::PendingPrimeAttempt,
+        outcome: &crate::prime::PrimeOutcome,
+        late: bool,
+        app: Option<&AppHandle>,
+    ) -> Result<()> {
+        attempt.phase = crate::models::PrimeAttemptPhase::Finalizing;
+        attempt.terminal_outcome = Some(prime_terminal_from_outcome(outcome));
+        attempt.next_action_at = now();
+        runtime
+            .attempts
+            .insert(job.account_id.clone(), attempt.clone());
+        self.store.save_prime_runtime(runtime)?;
+
+        self.record_prime_outcome(
+            job,
+            outcome,
+            late,
+            app,
+            &attempt.attempt_id,
+            &attempt.source,
+        )?;
+
+        runtime.attempts.remove(&job.account_id);
+        self.store.save_prime_runtime(runtime)?;
+        Ok(())
+    }
+
     /// Persist the per-account result + append the matching log line, and refresh the account's
     /// displayed quota on success so the new reset shows immediately.
     fn record_prime_outcome(
@@ -2231,7 +2382,9 @@ impl ManagedState {
         outcome: &crate::prime::PrimeOutcome,
         late: bool,
         app: Option<&AppHandle>,
-    ) {
+        attempt_id: &str,
+        source: &crate::models::PrimeAttemptSource,
+    ) -> Result<()> {
         use crate::prime::PrimeOutcome;
         let tool_id = &job.tool_id;
         let account_id = job.account_id.as_str();
@@ -2239,6 +2392,11 @@ impl ManagedState {
         let is_extend = job.is_extend;
         let is_manual = job.manual;
         let tool_label = tool_id.prime_label();
+        let log_prefix = format!(
+            "[{}][attempt={}]",
+            prime_source_label(source),
+            short_attempt_id(attempt_id)
+        );
         let (result, line): (&str, String) = match outcome {
             PrimeOutcome::Success { new_reset_at } => {
                 let reset = local_hhmm_from_iso(new_reset_at);
@@ -2246,48 +2404,48 @@ impl ManagedState {
                     (
                         "success",
                         format!(
-                            "{tool_label} · account \"{account_name}\" — SUCCESS: session xác nhận muộn lúc {now} do máy không thức đúng giờ, reset = {reset}",
+                            "{log_prefix} {tool_label} · account \"{account_name}\" — SUCCESS: session xác nhận muộn lúc {now} do máy không thức đúng giờ, reset = {reset}",
                             now = local_now_hhmm()
                         ),
                     )
                 } else if is_extend {
                     (
                         "success",
-                        format!("{tool_label} · account \"{account_name}\" — SUCCESS: gia hạn, session đã xác nhận, reset = {reset}"),
+                        format!("{log_prefix} {tool_label} · account \"{account_name}\" — SUCCESS: gia hạn, session đã xác nhận, reset = {reset}"),
                     )
                 } else {
                     (
                         "success",
-                        format!("{tool_label} · account \"{account_name}\" — SUCCESS: session đã xác nhận, reset = {reset}"),
+                        format!("{log_prefix} {tool_label} · account \"{account_name}\" — SUCCESS: session đã xác nhận, reset = {reset}"),
                     )
                 }
             }
             PrimeOutcome::Hold { reset_at } => (
                 "hold",
                 format!(
-                    "{tool_label} · account \"{account_name}\" — HOÃN: phiên cũ còn tới {reset}, sẽ thử lại khi phiên cũ hết",
+                    "{log_prefix} {tool_label} · account \"{account_name}\" — HOÃN: phiên cũ còn tới {reset}, sẽ thử lại khi phiên cũ hết",
                     reset = local_hhmm_from_iso(reset_at)
                 ),
             ),
             PrimeOutcome::SkipNoToken => (
                 "skip",
-                format!("{tool_label} · account \"{account_name}\" — SKIP: token hết hạn, cần đăng nhập lại"),
+                format!("{log_prefix} {tool_label} · account \"{account_name}\" — SKIP: token hết hạn, cần đăng nhập lại"),
             ),
             PrimeOutcome::SkipUnknownState => (
                 "skip",
-                format!("{tool_label} · account \"{account_name}\" — SKIP: chưa đọc được trạng thái phiên, thử lại sau"),
+                format!("{log_prefix} {tool_label} · account \"{account_name}\" — SKIP: chưa đọc được trạng thái phiên, thử lại sau"),
             ),
             PrimeOutcome::FailSend { reason } => (
                 "failed",
                 if is_manual {
-                    format!("{tool_label} · account \"{account_name}\" — FAIL: prime tay gửi lỗi ({reason})")
+                    format!("{log_prefix} {tool_label} · account \"{account_name}\" — FAIL: prime tay gửi lỗi ({reason})")
                 } else {
-                    format!("{tool_label} · account \"{account_name}\" — FAIL: gửi lỗi tới hết deadline ({reason})")
+                    format!("{log_prefix} {tool_label} · account \"{account_name}\" — FAIL: gửi lỗi tới hết deadline ({reason})")
                 },
             ),
             PrimeOutcome::FailUnconfirmed => (
                 "failed",
-                format!("{tool_label} · account \"{account_name}\" — FAIL: không xác nhận được session trong deadline"),
+                format!("{log_prefix} {tool_label} · account \"{account_name}\" — FAIL: không xác nhận được session trong deadline"),
             ),
         };
 
@@ -2307,88 +2465,104 @@ impl ManagedState {
         // matters — a SkipNoToken that repeats every minute (expired token) shouldn't trigger a
         // reload (and a flash of disabled controls) each time.
         let mut visible_change = false;
-        if let Ok(mut data) = self.data.lock() {
+        let mut already_applied = false;
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             if self.headless {
                 if let Ok(latest) = self.store.load() {
                     *data = latest;
                 }
             }
             if let Some(setting) = data.auto_prime.get_mut(account_id) {
-                visible_change = setting.last_result.as_deref() != Some(result);
-                setting.last_result = Some(result.to_string());
-                setting.last_attempt_at = Some(now());
-                let succeeded = matches!(outcome, PrimeOutcome::Success { .. });
-                // SkipUnknownState is terminal for the day: we couldn't read the window state, and
-                // re-probing every tick for the whole catch-up window would just spam the read + log.
-                // The next day's anchor retries; if the user wants it sooner they tap "Prime ngay".
-                let terminal = matches!(
-                    outcome,
-                    PrimeOutcome::Success { .. }
-                        | PrimeOutcome::FailUnconfirmed
-                        | PrimeOutcome::FailSend { .. }
-                        | PrimeOutcome::SkipUnknownState
-                );
-                // "Consume" today's scheduled slot (set last_primed_date/time so the daily prime
-                // doesn't re-fire) ONLY for a job that the daily schedule actually triggered. A manual
-                // "Prime ngay" or a one-time extend is NOT the daily anchor — letting their success
-                // stamp last_primed would suppress a later daily prime (e.g. a 06:00 manual prime
-                // cancelling the 11:00 anchor). A scheduled job consumes on any terminal outcome (it
-                // used its full retry budget and is done for today).
-                // A scheduled HOLD also consumes today's slot: the window is already live, so there's
-                // nothing to prime today — re-attempting every wake just re-reads quota and re-logs
-                // "HOÃN". Consuming on Hold (in addition to terminal outcomes) makes a held scheduled
-                // prime one-shot for the day, exactly like a success. (Manual/extend Holds don't reach
-                // here as `job.scheduled`.)
-                let consume_scheduled =
-                    job.scheduled && (terminal || matches!(outcome, PrimeOutcome::Hold { .. }));
-                if consume_scheduled {
-                    setting.last_primed_date = Some(local_today());
-                    setting.last_primed_time = Some(setting.time.clone());
-                }
-                // Resolve the extend/defer state only when this attempt actually settled THIS
-                // account's pending request — i.e. a terminal SCHEDULER/extend job, or a manual
-                // SUCCESS. A manual FAILURE must leave any armed auto-extend untouched: the manual
-                // job set is_extend=false and isn't the extend, so clearing here would silently
-                // disarm an extend the user is still waiting on. (`resolve_pending` mirrors
-                // `consume_scheduled`'s manual-fail carve-out, for the extend flags this time.)
-                let resolve_pending = if job.manual {
-                    succeeded
+                already_applied = setting.last_terminal_attempt_id.as_deref() == Some(attempt_id);
+                if already_applied {
+                    // State was committed before a crash; only log/runtime cleanup may remain.
+                    visible_change = false;
                 } else {
-                    job.is_extend && terminal
-                };
-                if resolve_pending {
-                    // The extend request is resolved (opened, or exhausted retries) — clear it so it
-                    // doesn't re-fire next tick. Also clear the "reminded for this window" marker:
-                    // it belongs to the window that just ended, and leaving it set is stale state.
-                    // (The UI already hides the prompt via reset_at mismatch, but don't rely on that
-                    // — a fresh window earns a fresh reminder from the poller.)
-                    setting.extend_requested = false;
-                    setting.deferred_until = None;
-                    setting.extend_reminded_reset = None;
-                }
-                match outcome {
-                    // Held on an EXTEND: defer the re-attempt to just after the old window ends, so
-                    // the armed extend opens the fresh window the moment the current one closes. Only
-                    // an extend defers-and-retries — it's a commitment to roll the session over. Uses
-                    // the same grace past reset_at as the other extend defers (clock-skew buffer).
-                    PrimeOutcome::Hold { reset_at } if !job.manual && job.is_extend => {
-                        setting.deferred_until = Some(reset_at_plus_grace(reset_at));
+                    visible_change = setting.last_result.as_deref() != Some(result);
+                    setting.last_result = Some(result.to_string());
+                    setting.last_attempt_at = Some(now());
+                    setting.last_terminal_attempt_id = Some(attempt_id.to_string());
+                    let succeeded = matches!(outcome, PrimeOutcome::Success { .. });
+                    // SkipUnknownState is terminal for the day: we couldn't read the window state, and
+                    // re-probing every tick for the whole catch-up window would just spam the read + log.
+                    // The next day's anchor retries; if the user wants it sooner they tap "Prime ngay".
+                    let terminal = matches!(
+                        outcome,
+                        PrimeOutcome::Success { .. }
+                            | PrimeOutcome::FailUnconfirmed
+                            | PrimeOutcome::FailSend { .. }
+                            | PrimeOutcome::SkipUnknownState
+                    );
+                    // "Consume" today's scheduled slot (set last_primed_date/time so the daily prime
+                    // doesn't re-fire) ONLY for a job that the daily schedule actually triggered. A manual
+                    // "Prime ngay" or a one-time extend is NOT the daily anchor — letting their success
+                    // stamp last_primed would suppress a later daily prime (e.g. a 06:00 manual prime
+                    // cancelling the 11:00 anchor). A scheduled job consumes on any terminal outcome (it
+                    // used its full retry budget and is done for today).
+                    // A scheduled HOLD also consumes today's slot: the window is already live, so there's
+                    // nothing to prime today — re-attempting every wake just re-reads quota and re-logs
+                    // "HOÃN". Consuming on Hold (in addition to terminal outcomes) makes a held scheduled
+                    // prime one-shot for the day, exactly like a success. (Manual/extend Holds don't reach
+                    // here as `job.scheduled`.)
+                    let consume_scheduled =
+                        job.scheduled && (terminal || matches!(outcome, PrimeOutcome::Hold { .. }));
+                    if consume_scheduled {
+                        setting.last_primed_date = Some(local_today());
+                        setting.last_primed_time = Some(setting.time.clone());
                     }
-                    // Held on a plain SCHEDULED prime: do NOT arm a defer. The slot was just consumed
-                    // (above), so today is done — there's no point retrying when the old window ends,
-                    // and a midnight defer would (a) re-log HOÃN and (b) steal the next morning's wake
-                    // (next_wake_time picks the earliest instant; a 00:10 defer beats the 06:20 anchor).
-                    // Clear any stale defer too, belt-and-braces.
-                    PrimeOutcome::Hold { .. } if job.scheduled => {
+                    // Resolve the extend/defer state only when this attempt actually settled THIS
+                    // account's pending request — i.e. a terminal SCHEDULER/extend job, or a manual
+                    // SUCCESS. A manual FAILURE must leave any armed auto-extend untouched: the manual
+                    // job set is_extend=false and isn't the extend, so clearing here would silently
+                    // disarm an extend the user is still waiting on. (`resolve_pending` mirrors
+                    // `consume_scheduled`'s manual-fail carve-out, for the extend flags this time.)
+                    let resolve_pending = if job.manual {
+                        succeeded
+                    } else {
+                        job.is_extend && terminal
+                    };
+                    if resolve_pending {
+                        // The extend request is resolved (opened, or exhausted retries) — clear it so it
+                        // doesn't re-fire next tick. Also clear the "reminded for this window" marker:
+                        // it belongs to the window that just ended, and leaving it set is stale state.
+                        // (The UI already hides the prompt via reset_at mismatch, but don't rely on that
+                        // — a fresh window earns a fresh reminder from the poller.)
+                        setting.extend_requested = false;
                         setting.deferred_until = None;
+                        setting.extend_reminded_reset = None;
                     }
-                    // Manual success already cleared deferred_until via resolve_pending; a scheduler
-                    // success clears it here.
-                    PrimeOutcome::Success { .. } if !job.manual => setting.deferred_until = None,
-                    _ => {}
+                    match outcome {
+                        // Held on an EXTEND: defer the re-attempt to just after the old window ends, so
+                        // the armed extend opens the fresh window the moment the current one closes. Only
+                        // an extend defers-and-retries — it's a commitment to roll the session over. Uses
+                        // the same grace past reset_at as the other extend defers (clock-skew buffer).
+                        PrimeOutcome::Hold { reset_at } if !job.manual && job.is_extend => {
+                            setting.deferred_until = Some(reset_at_plus_grace(reset_at));
+                        }
+                        // Held on a plain SCHEDULED prime: do NOT arm a defer. The slot was just consumed
+                        // (above), so today is done — there's no point retrying when the old window ends,
+                        // and a midnight defer would (a) re-log HOÃN and (b) steal the next morning's wake
+                        // (next_wake_time picks the earliest instant; a 00:10 defer beats the 06:20 anchor).
+                        // Clear any stale defer too, belt-and-braces.
+                        PrimeOutcome::Hold { .. } if job.scheduled => {
+                            setting.deferred_until = None;
+                        }
+                        // Manual success already cleared deferred_until via resolve_pending; a scheduler
+                        // success clears it here.
+                        PrimeOutcome::Success { .. } if !job.manual => {
+                            setting.deferred_until = None
+                        }
+                        _ => {}
+                    }
                 }
             }
-            let _ = self.store.save(&data);
+            if !already_applied {
+                self.store.save(&data)?;
+            }
         }
 
         // Append the activity-log line only when something changed (new result), it's a manual
@@ -2400,8 +2574,8 @@ impl ManagedState {
                 | PrimeOutcome::FailUnconfirmed
                 | PrimeOutcome::FailSend { .. }
         );
-        if visible_change || job.manual || terminal {
-            self.append_prime_log(&line);
+        if visible_change || job.manual || terminal || already_applied {
+            self.append_prime_log_once(attempt_id, &line)?;
         }
 
         match outcome {
@@ -2432,6 +2606,7 @@ impl ManagedState {
                 let _ = app.emit("auto-prime-changed", ());
             }
         }
+        Ok(())
     }
 
     /// If the tool's currently-used account (plain command) has hit the threshold → automatically
@@ -3277,6 +3452,7 @@ fn build_snapshot(
                         deadline_at: attempt.deadline_at,
                         next_action_at: attempt.next_action_at,
                         attempts: attempt.send_attempts,
+                        source: attempt.source,
                         last_error: attempt.last_error,
                     },
                 )
@@ -3646,6 +3822,96 @@ fn retry_reason(outcome: &crate::prime::PrimeOutcome) -> String {
     }
 }
 
+fn prime_terminal_from_outcome(
+    outcome: &crate::prime::PrimeOutcome,
+) -> crate::models::PrimeTerminalOutcome {
+    match outcome {
+        crate::prime::PrimeOutcome::Success { new_reset_at } => {
+            crate::models::PrimeTerminalOutcome::Success {
+                new_reset_at: new_reset_at.clone(),
+            }
+        }
+        crate::prime::PrimeOutcome::Hold { reset_at } => {
+            crate::models::PrimeTerminalOutcome::Hold {
+                reset_at: reset_at.clone(),
+            }
+        }
+        crate::prime::PrimeOutcome::FailSend { reason } => {
+            crate::models::PrimeTerminalOutcome::FailSend {
+                reason: reason.clone(),
+            }
+        }
+        crate::prime::PrimeOutcome::FailUnconfirmed => {
+            crate::models::PrimeTerminalOutcome::FailUnconfirmed
+        }
+        crate::prime::PrimeOutcome::SkipNoToken => crate::models::PrimeTerminalOutcome::SkipNoToken,
+        crate::prime::PrimeOutcome::SkipUnknownState => {
+            crate::models::PrimeTerminalOutcome::SkipUnknownState
+        }
+    }
+}
+
+fn prime_outcome_from_terminal(
+    outcome: &crate::models::PrimeTerminalOutcome,
+) -> crate::prime::PrimeOutcome {
+    match outcome {
+        crate::models::PrimeTerminalOutcome::Success { new_reset_at } => {
+            crate::prime::PrimeOutcome::Success {
+                new_reset_at: new_reset_at.clone(),
+            }
+        }
+        crate::models::PrimeTerminalOutcome::Hold { reset_at } => {
+            crate::prime::PrimeOutcome::Hold {
+                reset_at: reset_at.clone(),
+            }
+        }
+        crate::models::PrimeTerminalOutcome::FailSend { reason } => {
+            crate::prime::PrimeOutcome::FailSend {
+                reason: reason.clone(),
+            }
+        }
+        crate::models::PrimeTerminalOutcome::FailUnconfirmed => {
+            crate::prime::PrimeOutcome::FailUnconfirmed
+        }
+        crate::models::PrimeTerminalOutcome::SkipNoToken => crate::prime::PrimeOutcome::SkipNoToken,
+        crate::models::PrimeTerminalOutcome::SkipUnknownState => {
+            crate::prime::PrimeOutcome::SkipUnknownState
+        }
+    }
+}
+
+fn coalesced_prime_source(
+    scheduled: bool,
+    extend: bool,
+    auto_extend: bool,
+) -> crate::models::PrimeAttemptSource {
+    use crate::models::PrimeAttemptSource;
+    match (scheduled, extend, auto_extend) {
+        (true, true, true) => PrimeAttemptSource::ScheduleAutoExtend,
+        (true, true, false) => PrimeAttemptSource::ScheduleUserExtend,
+        (true, false, _) => PrimeAttemptSource::Schedule,
+        (false, true, true) => PrimeAttemptSource::AutoExtend,
+        (false, true, false) => PrimeAttemptSource::UserExtend,
+        (false, false, _) => PrimeAttemptSource::Manual,
+    }
+}
+
+fn prime_source_label(source: &crate::models::PrimeAttemptSource) -> &'static str {
+    use crate::models::PrimeAttemptSource;
+    match source {
+        PrimeAttemptSource::Schedule => "SCHEDULE",
+        PrimeAttemptSource::AutoExtend => "AUTO-EXTEND",
+        PrimeAttemptSource::UserExtend => "EXTEND",
+        PrimeAttemptSource::Manual => "MANUAL",
+        PrimeAttemptSource::ScheduleAutoExtend => "SCHEDULE+AUTO-EXTEND",
+        PrimeAttemptSource::ScheduleUserExtend => "SCHEDULE+EXTEND",
+    }
+}
+
+fn short_attempt_id(attempt_id: &str) -> &str {
+    attempt_id.get(..8).unwrap_or(attempt_id)
+}
+
 fn terminal_failure_from(outcome: &crate::prime::PrimeOutcome) -> crate::prime::PrimeOutcome {
     match outcome {
         crate::prime::PrimeOutcome::FailSend { reason } => crate::prime::PrimeOutcome::FailSend {
@@ -3965,6 +4231,73 @@ mod tests {
     use super::*;
     use chrono::{Duration, Local, TimeZone};
 
+    fn finalization_test_state(root: std::path::PathBuf) -> ManagedState {
+        let store = Store::for_test(root).unwrap();
+        let account_id = "account-1".to_string();
+        let mut data = StoredState::default();
+        data.accounts.push(Account {
+            id: account_id.clone(),
+            tool_id: ToolId::Codex,
+            name: "Test Codex".to_string(),
+            state: AccountState::Idle,
+            fingerprint: "test".to_string(),
+            created_at: now(),
+            updated_at: now(),
+            last_used_at: None,
+            quota: None,
+            launcher_command: None,
+            is_default: false,
+            avatar_url: None,
+            api_provider: None,
+        });
+        data.auto_prime.insert(
+            account_id,
+            crate::models::AutoPrimeSetting {
+                enabled: true,
+                time: "07:00".to_string(),
+                ..Default::default()
+            },
+        );
+        store.save(&data).unwrap();
+        ManagedState {
+            api_server: Mutex::new(crate::api_gateway::ApiServerHandle::stopped(
+                &data.api_gateway,
+            )),
+            store,
+            data: Mutex::new(data),
+            headless: true,
+            priming: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn finalizing_attempt() -> crate::models::PendingPrimeAttempt {
+        crate::models::PendingPrimeAttempt {
+            version: 1,
+            account_id: "account-1".to_string(),
+            tool_id: ToolId::Codex,
+            attempt_id: "12345678-finalization-test".to_string(),
+            source: crate::models::PrimeAttemptSource::Schedule,
+            consumes_scheduled_slot: true,
+            resolves_extend: false,
+            manual: false,
+            scheduled_date: Some(local_today()),
+            scheduled_time: Some("07:00".to_string()),
+            anchor_at: now(),
+            deadline_at: add_minutes_iso(&now(), 45),
+            phase: crate::models::PrimeAttemptPhase::Finalizing,
+            next_action_at: now(),
+            send_attempts: 1,
+            last_send_at: Some(now()),
+            baseline_reset_at: None,
+            last_observation: None,
+            last_error: None,
+            claim_key: Some("scheduled|account-1|today|07:00".to_string()),
+            terminal_outcome: Some(crate::models::PrimeTerminalOutcome::Success {
+                new_reset_at: add_minutes_iso(&now(), 300),
+            }),
+        }
+    }
+
     /// Build an ISO-8601 (RFC-3339) string for a local instant `offset` from a base, so the tests
     /// are timezone-independent (the helper interprets the anchor in `Local`).
     fn local_iso(base: chrono::DateTime<Local>) -> String {
@@ -4139,5 +4472,114 @@ mod tests {
             "retryable outcome can release and reclaim the slot"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_finalization_is_idempotent_across_runtime_cleanup_crash() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-switcher-prime-finalize-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let managed = finalization_test_state(root.clone());
+        let mut attempt = finalizing_attempt();
+        let outcome = prime_outcome_from_terminal(attempt.terminal_outcome.as_ref().unwrap());
+        let job = PrimeJob {
+            tool_id: ToolId::Codex,
+            account_id: "account-1".to_string(),
+            account_name: "Test Codex".to_string(),
+            config_dir: root.join("profile"),
+            binary: None,
+            is_extend: false,
+            scheduled: true,
+            manual: false,
+            claim_paths: Vec::new(),
+        };
+        let mut runtime = crate::models::PrimeRuntimeState::default();
+        runtime
+            .attempts
+            .insert(attempt.account_id.clone(), attempt.clone());
+
+        managed
+            .finalize_prime_attempt(&mut runtime, &job, &mut attempt, &outcome, false, None)
+            .unwrap();
+        assert!(managed
+            .store
+            .load_prime_runtime()
+            .unwrap()
+            .attempts
+            .is_empty());
+
+        // Simulate a crash after state+log committed but before runtime cleanup persisted.
+        let mut crashed_runtime = crate::models::PrimeRuntimeState::default();
+        crashed_runtime
+            .attempts
+            .insert(attempt.account_id.clone(), attempt.clone());
+        managed.store.save_prime_runtime(&crashed_runtime).unwrap();
+        managed
+            .finalize_prime_attempt(
+                &mut crashed_runtime,
+                &job,
+                &mut attempt,
+                &outcome,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let stored = managed.store.load().unwrap();
+        let setting = &stored.auto_prime["account-1"];
+        assert_eq!(
+            setting.last_terminal_attempt_id.as_deref(),
+            Some("12345678-finalization-test")
+        );
+        assert_eq!(setting.last_result.as_deref(), Some("success"));
+        let log = managed.auto_prime_log();
+        assert_eq!(log.matches("[attempt=12345678]").count(), 1);
+        assert!(log.contains("[SCHEDULE]"));
+        assert!(managed
+            .store
+            .load_prime_runtime()
+            .unwrap()
+            .attempts
+            .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prime_source_labels_cover_schedule_extend_and_manual() {
+        use crate::models::PrimeAttemptSource;
+        assert_eq!(
+            prime_source_label(&PrimeAttemptSource::Schedule),
+            "SCHEDULE"
+        );
+        assert_eq!(
+            prime_source_label(&PrimeAttemptSource::AutoExtend),
+            "AUTO-EXTEND"
+        );
+        assert_eq!(
+            prime_source_label(&PrimeAttemptSource::UserExtend),
+            "EXTEND"
+        );
+        assert_eq!(prime_source_label(&PrimeAttemptSource::Manual), "MANUAL");
+        assert_eq!(
+            prime_source_label(&PrimeAttemptSource::ScheduleAutoExtend),
+            "SCHEDULE+AUTO-EXTEND"
+        );
+    }
+
+    #[test]
+    fn terminal_outcome_round_trip_preserves_skip_results() {
+        assert!(matches!(
+            prime_outcome_from_terminal(&prime_terminal_from_outcome(
+                &crate::prime::PrimeOutcome::SkipNoToken
+            )),
+            crate::prime::PrimeOutcome::SkipNoToken
+        ));
+        assert!(matches!(
+            prime_outcome_from_terminal(&prime_terminal_from_outcome(
+                &crate::prime::PrimeOutcome::SkipUnknownState
+            )),
+            crate::prime::PrimeOutcome::SkipUnknownState
+        ));
     }
 }

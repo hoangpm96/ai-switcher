@@ -75,13 +75,26 @@ export interface AppSnapshot {
   apiGateway: ApiGatewaySnapshot;
 }
 
-export type PrimeAttemptPhase = "precheck" | "needSend" | "confirming" | "waitingRetry";
+export type PrimeAttemptPhase =
+  | "precheck"
+  | "needSend"
+  | "confirming"
+  | "waitingRetry"
+  | "finalizing";
+export type PrimeAttemptSource =
+  | "schedule"
+  | "autoExtend"
+  | "userExtend"
+  | "manual"
+  | "scheduleAutoExtend"
+  | "scheduleUserExtend";
 
 export interface PrimeAttemptStatus {
   phase: PrimeAttemptPhase;
   deadlineAt: string;
   nextActionAt: string;
   attempts: number;
+  source: PrimeAttemptSource;
   lastError?: string | null;
 }
 
@@ -187,6 +200,7 @@ export interface AutoPrimeSetting {
   /** "success" | "failed" | "skip" | "hold" */
   lastResult?: string | null;
   lastAttemptAt?: string | null;
+  lastTerminalAttemptId?: string | null;
   /** User accepted "extend?" — prime once the current window ends. */
   extendRequested?: boolean;
   /** reset_at the user was last reminded for (so the "extend?" button shows). */

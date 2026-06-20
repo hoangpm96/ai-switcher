@@ -253,6 +253,8 @@ mod tests {
                 version: 1,
                 account_id: "account-1".to_string(),
                 tool_id: ToolId::Codex,
+                attempt_id: "attempt-1".to_string(),
+                source: crate::models::PrimeAttemptSource::Schedule,
                 consumes_scheduled_slot: true,
                 resolves_extend: false,
                 manual: false,
@@ -268,6 +270,7 @@ mod tests {
                 last_observation: None,
                 last_error: Some("rolling".to_string()),
                 claim_key: Some("scheduled|account-1|2026-06-20|07:00".to_string()),
+                terminal_outcome: None,
             },
         );
         store.save_prime_runtime(&runtime).unwrap();

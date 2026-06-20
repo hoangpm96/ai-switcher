@@ -60,6 +60,23 @@ import type {
   ToolStatus,
 } from "./types";
 
+function primeAttemptSourceLabel(source: PrimeAttemptStatus["source"]): string {
+  switch (source) {
+    case "schedule":
+      return "Lịch";
+    case "autoExtend":
+      return "Tự gia hạn";
+    case "userExtend":
+      return "Gia hạn";
+    case "manual":
+      return "Prime ngay";
+    case "scheduleAutoExtend":
+      return "Lịch + tự gia hạn";
+    case "scheduleUserExtend":
+      return "Lịch + gia hạn";
+  }
+}
+
 /** Host shown on an API account card (best-effort parse of the gateway URL). */
 function gatewayHost(baseUrl: string) {
   try {
@@ -1839,7 +1856,7 @@ function AccountCard({
         minute: "2-digit",
         hour12: false,
       });
-      return `Đang mở session · thử tới ${deadline}`;
+      return `${primeAttemptSourceLabel(primeAttempt.source)} · đang mở session · thử tới ${deadline}`;
     }
     if (!primeOn) return null;
     if (autoPrime?.extendRequested) return "Sẽ mở phiên mới khi phiên cũ hết";
