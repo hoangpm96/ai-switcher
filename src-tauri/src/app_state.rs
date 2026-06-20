@@ -1581,11 +1581,11 @@ impl ManagedState {
         }
     }
 
-    /// Terminal finalization may resume after a crash. The attempt marker makes log append
-    /// idempotent even if state.json was saved but prime-runtime.json was not yet cleared.
+    /// Terminal finalization may resume after a crash. The terminal marker makes the result log
+    /// idempotent without colliding with START/PENDING lines that share the same attempt id.
     fn append_prime_log_once(&self, attempt_id: &str, line: &str) -> Result<()> {
         use std::io::Write;
-        let marker = format!("[attempt={}]", short_attempt_id(attempt_id));
+        let marker = format!("[terminal={}]", short_attempt_id(attempt_id));
         let existing =
             std::fs::read_to_string(self.store.auto_prime_log_path()).unwrap_or_default();
         if existing.contains(&marker) {
@@ -2393,8 +2393,9 @@ impl ManagedState {
         let is_manual = job.manual;
         let tool_label = tool_id.prime_label();
         let log_prefix = format!(
-            "[{}][attempt={}]",
+            "[{}][attempt={}][terminal={}]",
             prime_source_label(source),
+            short_attempt_id(attempt_id),
             short_attempt_id(attempt_id)
         );
         let (result, line): (&str, String) = match outcome {
@@ -4535,6 +4536,7 @@ mod tests {
         assert_eq!(setting.last_result.as_deref(), Some("success"));
         let log = managed.auto_prime_log();
         assert_eq!(log.matches("[attempt=12345678]").count(), 1);
+        assert_eq!(log.matches("[terminal=12345678]").count(), 1);
         assert!(log.contains("[SCHEDULE]"));
         assert!(managed
             .store
@@ -4542,6 +4544,63 @@ mod tests {
             .unwrap()
             .attempts
             .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_finalization_logs_result_even_after_start_line_with_same_attempt() {
+        let root = std::env::temp_dir().join(format!(
+            "ai-switcher-prime-finalize-start-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let managed = finalization_test_state(root.clone());
+        let mut attempt = finalizing_attempt();
+        let outcome = prime_outcome_from_terminal(attempt.terminal_outcome.as_ref().unwrap());
+        let job = PrimeJob {
+            tool_id: ToolId::Codex,
+            account_id: "account-1".to_string(),
+            account_name: "Test Codex".to_string(),
+            config_dir: root.join("profile"),
+            binary: None,
+            is_extend: false,
+            scheduled: true,
+            manual: false,
+            claim_paths: Vec::new(),
+        };
+        managed.append_prime_log(
+            "[SCHEDULE][attempt=12345678] Codex · account \"Test Codex\" — START: theo lịch, deadline = 07:45",
+        );
+        let mut runtime = crate::models::PrimeRuntimeState::default();
+        runtime
+            .attempts
+            .insert(attempt.account_id.clone(), attempt.clone());
+
+        managed
+            .finalize_prime_attempt(&mut runtime, &job, &mut attempt, &outcome, false, None)
+            .unwrap();
+
+        // Simulate a crash replay after the terminal line was already written. START/PENDING share
+        // the attempt marker, so the idempotency marker must be terminal-specific.
+        let mut replay_runtime = crate::models::PrimeRuntimeState::default();
+        replay_runtime
+            .attempts
+            .insert(attempt.account_id.clone(), attempt.clone());
+        managed
+            .finalize_prime_attempt(
+                &mut replay_runtime,
+                &job,
+                &mut attempt,
+                &outcome,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let log = managed.auto_prime_log();
+        assert_eq!(log.matches("[attempt=12345678]").count(), 2);
+        assert_eq!(log.matches("[terminal=12345678]").count(), 1);
+        assert_eq!(log.matches("— START:").count(), 1);
+        assert_eq!(log.matches("— SUCCESS:").count(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 
