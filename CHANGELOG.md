@@ -5,6 +5,20 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8] - 2026-06-21
+
+### Fixed
+
+- **Auto Session now verifies and retries scheduled primes before declaring success.** Codex primes
+  require a stable fixed-reset proof, Claude primes require the reset window to move from the
+  baseline, and both keep retrying within the bounded catch-up/deadline window instead of marking a
+  send-only attempt as successful.
+- **Prime attempts now finish crash-safely and log their source clearly.** Terminal state is
+  finalized atomically across `prime-runtime.json`, `state.json`, and the activity log, so a crash
+  cannot silently lose or duplicate a result. Activity log lines now include the trigger source
+  (`SCHEDULE`, `AUTO-EXTEND`, `EXTEND`, or `MANUAL`) plus an attempt id, while terminal result
+  lines use a separate marker so they are not hidden by earlier START/PENDING entries.
+
 ## [0.5.7] - 2026-06-20
 
 ### Added
