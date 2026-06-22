@@ -329,8 +329,13 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path, binary: Option<&Path>)
             .unwrap_or_else(|| PathBuf::from("claude"));
         let mut command = Command::new(&resolved);
         command
-            .args(["-p", "hi", "--max-turns", "1"])
+            .args(["-p", "hi", "--max-turns", "1", "--no-session-persistence"])
             .env("CLAUDE_CONFIG_DIR", config_dir)
+            // Token refresh is a background auth request, not a user coding session. Avoid loading
+            // shared project/plugin/MCP metadata: project history may reference protected folders
+            // such as ~/Downloads, causing macOS to prompt on behalf of AI Account Switcher.
+            .env("CLAUDE_CODE_SAFE_MODE", "1")
+            .current_dir(config_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
