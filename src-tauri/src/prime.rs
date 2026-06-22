@@ -322,17 +322,40 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
                 .current_dir(config_dir);
         }
         ToolId::Codex => {
-            command.args(["exec", "hi"]).env("CODEX_HOME", config_dir);
+            command
+                .args([
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--ephemeral",
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--sandbox",
+                    "read-only",
+                    "hi",
+                ])
+                .env("CODEX_HOME", config_dir)
+                // The GUI process normally starts with `/` as cwd. `codex exec` rejects that as an
+                // untrusted non-repository unless explicitly allowed. Use the account profile as a
+                // harmless read-only working root and do not persist the one-message session.
+                .current_dir(config_dir);
         }
         ToolId::Antigravity => return Err("antigravity unsupported".to_string()),
     }
-    // Don't inherit a TTY; discard output so a hung/chatty CLI can't block on stdin or fill a pipe
-    // buffer. We only care about the exit status.
+    // Don't inherit a TTY. stdout is irrelevant, but retain stderr so failures are diagnosable
+    // instead of surfacing only as "CLI exit 1".
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     let mut child = command.spawn().map_err(|e| format!("CLI: {e}"))?;
+    let mut stderr = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            String::from_utf8_lossy(&bytes).trim().to_string()
+        })
+    });
 
     // Hard timeout: a CLI that hangs (network stall, auth/update prompt) must NOT hold the prime
     // worker forever — that would block the scheduler's overlap guard and skip every later prime.
@@ -340,10 +363,18 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let detail = stderr
+                    .take()
+                    .and_then(|reader| reader.join().ok())
+                    .map(|text| concise_cli_error(&text))
+                    .filter(|text| !text.is_empty());
                 return if status.success() {
                     Ok(())
                 } else {
-                    Err(format!("CLI exit {}", status.code().unwrap_or(-1)))
+                    let code = status.code().unwrap_or(-1);
+                    Err(detail
+                        .map(|detail| format!("CLI exit {code}: {detail}"))
+                        .unwrap_or_else(|| format!("CLI exit {code}")))
                 };
             }
             Ok(None) => {
@@ -356,6 +387,21 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
             }
             Err(e) => return Err(format!("CLI: {e}")),
         }
+    }
+}
+
+fn concise_cli_error(stderr: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let text = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "Reading additional input from stdin...")
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if text.chars().count() <= MAX_CHARS {
+        text
+    } else {
+        format!("{}…", text.chars().take(MAX_CHARS).collect::<String>())
     }
 }
 
@@ -550,5 +596,14 @@ mod tests {
         assert!(entries.contains(&PathBuf::from("/opt/homebrew/bin")));
         assert!(entries.contains(&PathBuf::from("/usr/local/bin")));
         assert!(entries.contains(&PathBuf::from("/usr/bin")));
+    }
+
+    #[test]
+    fn cli_error_is_short_and_drops_codex_stdin_noise() {
+        let error = concise_cli_error(
+            "Reading additional input from stdin...\nNot inside a trusted directory\n",
+        );
+        assert_eq!(error, "Not inside a trusted directory");
+        assert!(concise_cli_error(&"x".repeat(500)).chars().count() <= 241);
     }
 }
