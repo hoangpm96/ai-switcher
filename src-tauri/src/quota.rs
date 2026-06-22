@@ -190,7 +190,9 @@ fn parse_rfc3339_epoch(reset_at: &str) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 static CLAUDE_CACHE: Mutex<BTreeMap<String, (Instant, QuotaInfo)>> = Mutex::new(BTreeMap::new());
+static CLAUDE_RECOVERY: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
 const CLAUDE_CACHE_TTL: Duration = Duration::from_secs(60);
+const CLAUDE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 /// Drop the cached Claude quota for one config dir so the next `read_quota` re-fetches.
 /// Auto-prime's confirmation re-check needs the fresh `resets_at` right after sending "hi",
@@ -216,15 +218,33 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
         .context("couldn't get Claude's OAuth token")?;
     let version = claude_version().unwrap_or_else(|| "0.0.0".to_string());
     let user_agent = format!("claude-code/{version}");
-    let body = curl_get(
-        "https://api.anthropic.com/api/oauth/usage",
-        &[
-            ("Authorization", format!("Bearer {token}").as_str()),
-            ("anthropic-beta", "oauth-2025-04-20"),
-            ("User-Agent", user_agent.as_str()),
-            ("Accept", "application/json"),
-        ],
-    )?;
+    let request = |token: &str| {
+        curl_get(
+            "https://api.anthropic.com/api/oauth/usage",
+            &[
+                ("Authorization", format!("Bearer {token}").as_str()),
+                ("anthropic-beta", "oauth-2025-04-20"),
+                ("User-Agent", user_agent.as_str()),
+                ("Accept", "application/json"),
+            ],
+        )
+    };
+    let body = match request(&token) {
+        Ok(body) => body,
+        Err(error)
+            if claude_usage_needs_cli_recovery(&error)
+                && claim_claude_recovery(&cache_key)
+                && refresh_claude_oauth(config_dir, binary.as_deref()) =>
+        {
+            // Claude CLI can repair OAuth/Keychain state even while the stored expiresAt still
+            // looks valid. This mirrors the user's observed workaround of opening `claude`, then
+            // retries the quota endpoint exactly once with the newly persisted token.
+            let refreshed = claude_oauth_token(config_dir)
+                .context("Claude CLI refresh did not persist an OAuth token")?;
+            request(&refreshed)?
+        }
+        Err(error) => return Err(error),
+    };
 
     let value: serde_json::Value =
         serde_json::from_str(&body).context("Claude usage response is not JSON")?;
@@ -323,39 +343,63 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path, binary: Option<&Path>)
         // (typically just /usr/bin:/bin), so a bare `Command::new("claude")` fails to spawn and the
         // refresh is silently skipped — leaving an expired token that 401s. `command_path` scans the
         // usual install dirs (homebrew, npm-global, ~/.local/bin) the same way `claude_version` does.
-        let resolved = binary
-            .map(Path::to_path_buf)
-            .or_else(|| crate::tools::command_path("claude"))
-            .unwrap_or_else(|| PathBuf::from("claude"));
-        let mut command = Command::new(&resolved);
-        command
-            .args(["-p", "hi", "--max-turns", "1", "--no-session-persistence"])
-            .env("CLAUDE_CONFIG_DIR", config_dir)
-            // Token refresh is a background auth request, not a user coding session. Avoid loading
-            // shared project/plugin/MCP metadata: project history may reference protected folders
-            // such as ~/Downloads, causing macOS to prompt on behalf of AI Account Switcher.
-            .env("CLAUDE_CODE_SAFE_MODE", "1")
-            .current_dir(config_dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        if let Ok(mut child) = command.spawn() {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() >= deadline => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    Ok(None) => std::thread::sleep(Duration::from_millis(200)),
-                    Err(_) => break,
-                }
-            }
-        }
+        let _ = refresh_claude_oauth(config_dir, binary);
     }
     claude_oauth_token(config_dir)
+}
+
+fn refresh_claude_oauth(config_dir: &Path, binary: Option<&Path>) -> bool {
+    let resolved = binary
+        .map(Path::to_path_buf)
+        .or_else(|| crate::tools::command_path("claude"))
+        .unwrap_or_else(|| PathBuf::from("claude"));
+    let mut command = Command::new(&resolved);
+    command
+        .args(["-p", "hi", "--max-turns", "1", "--no-session-persistence"])
+        .env("CLAUDE_CONFIG_DIR", config_dir)
+        // Token refresh is a background auth request, not a user coding session. Avoid loading
+        // shared project/plugin/MCP metadata: project history may reference protected folders
+        // such as ~/Downloads, causing macOS to prompt on behalf of AI Account Switcher.
+        .env("CLAUDE_CODE_SAFE_MODE", "1")
+        .current_dir(config_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => return false,
+        }
+    }
+}
+
+fn claude_usage_needs_cli_recovery(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("HTTP 401") || message.contains("HTTP 429")
+}
+
+fn claim_claude_recovery(cache_key: &str) -> bool {
+    let Ok(mut attempts) = CLAUDE_RECOVERY.lock() else {
+        return false;
+    };
+    if attempts
+        .get(cache_key)
+        .is_some_and(|last| last.elapsed() < CLAUDE_RECOVERY_COOLDOWN)
+    {
+        return false;
+    }
+    attempts.insert(cache_key.to_string(), Instant::now());
+    true
 }
 
 /// Claude's keychain suffix for a config dir = `sha256(path)[:8]` (hex).
@@ -1233,6 +1277,31 @@ mod tests {
         };
         let quota = quota_with(non_zero, None);
         assert_eq!(prime_available_for(&ToolId::Claude, &quota), Some(true));
+    }
+
+    #[test]
+    fn claude_usage_recovery_only_handles_auth_or_rate_limit_statuses() {
+        assert!(claude_usage_needs_cli_recovery(&anyhow::anyhow!(
+            "HTTP 401"
+        )));
+        assert!(claude_usage_needs_cli_recovery(&anyhow::anyhow!(
+            "HTTP 429"
+        )));
+        assert!(!claude_usage_needs_cli_recovery(&anyhow::anyhow!(
+            "HTTP 500"
+        )));
+        assert!(!claude_usage_needs_cli_recovery(&anyhow::anyhow!(
+            "network timeout"
+        )));
+    }
+
+    #[test]
+    fn claude_usage_recovery_is_cooled_down_per_profile() {
+        let first = format!("profile-{}", uuid::Uuid::new_v4());
+        let second = format!("profile-{}", uuid::Uuid::new_v4());
+        assert!(claim_claude_recovery(&first));
+        assert!(!claim_claude_recovery(&first));
+        assert!(claim_claude_recovery(&second));
     }
 
     #[test]
