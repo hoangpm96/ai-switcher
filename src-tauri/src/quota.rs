@@ -9,6 +9,33 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// Claude invocation used for background OAuth refreshes and primes.
+///
+/// `--safe-mode` disables customisations, but Claude 2.1.x can still initialise its built-in
+/// tool/sandbox layer and preflight macOS protected folders. Disabling every tool and context
+/// source keeps this an API-only request while preserving OAuth/Keychain refresh behaviour.
+pub(crate) const CLAUDE_BACKGROUND_ARGS: &[&str] = &[
+    "-p",
+    "hi",
+    "--max-turns",
+    "1",
+    "--no-session-persistence",
+    "--safe-mode",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "{\"mcpServers\":{}}",
+    "--tools",
+    "",
+    "--disable-slash-commands",
+    "--no-chrome",
+    "--permission-mode",
+    "dontAsk",
+    "--prompt-suggestions",
+    "false",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LiveQuotaError {
     RateLimited,
@@ -355,11 +382,11 @@ fn refresh_claude_oauth(config_dir: &Path, binary: Option<&Path>) -> bool {
         .unwrap_or_else(|| PathBuf::from("claude"));
     let mut command = Command::new(&resolved);
     command
-        .args(["-p", "hi", "--max-turns", "1", "--no-session-persistence"])
+        .args(CLAUDE_BACKGROUND_ARGS)
         .env("CLAUDE_CONFIG_DIR", config_dir)
-        // Token refresh is a background auth request, not a user coding session. Avoid loading
-        // shared project/plugin/MCP metadata: project history may reference protected folders
-        // such as ~/Downloads, causing macOS to prompt on behalf of AI Account Switcher.
+        // Safe mode disables customisations but Claude can still initialise its built-in
+        // tool/sandbox layer and preflight macOS protected folders. This refresh needs only OAuth
+        // and one API request, so explicitly disable all tools and context sources as well.
         .env("CLAUDE_CODE_SAFE_MODE", "1")
         .current_dir(config_dir)
         .stdin(std::process::Stdio::null())
@@ -1112,6 +1139,29 @@ fn pretty_plan(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_background_invocation_disables_context_and_tools() {
+        let args = CLAUDE_BACKGROUND_ARGS.join(" ");
+        for required in [
+            "--safe-mode",
+            "--setting-sources",
+            "--strict-mcp-config",
+            "--tools",
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--permission-mode dontAsk",
+            "--no-session-persistence",
+        ] {
+            assert!(args.contains(required), "missing hardened flag: {required}");
+        }
+        assert!(CLAUDE_BACKGROUND_ARGS
+            .windows(2)
+            .any(|pair| pair == ["--tools", ""]));
+        assert!(CLAUDE_BACKGROUND_ARGS
+            .windows(2)
+            .any(|pair| pair == ["--setting-sources", ""]));
+    }
 
     #[test]
     fn parses_codex_rate_limits_line() {

@@ -313,11 +313,12 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
     match tool_id {
         ToolId::Claude => {
             command
-                .args(["-p", "hi", "--max-turns", "1", "--no-session-persistence"])
+                .args(quota::CLAUDE_BACKGROUND_ARGS)
                 .env("CLAUDE_CONFIG_DIR", config_dir)
-                // A background prime needs auth + one API request only. Safe mode prevents Claude
-                // from loading shared project/plugin/MCP metadata (which may contain paths under
-                // Downloads and trigger a macOS protected-folder prompt attributed to this app).
+                // A background prime needs auth + one API request only. Safe mode alone still lets
+                // Claude initialise its built-in tool/sandbox layer, which preflights Desktop,
+                // Documents, Downloads and Media Library through macOS TCC. Disable every context
+                // and tool source explicitly so the child remains an API-only OAuth invocation.
                 .env("CLAUDE_CODE_SAFE_MODE", "1")
                 .current_dir(config_dir);
         }
