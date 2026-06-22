@@ -5,6 +5,15 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.11] - 2026-06-23
+
+### Fixed
+
+- **Claude manual and scheduled primes now send directly over HTTP.** Prime no longer starts the
+  Claude Code CLI just to send the minimal background request, avoiding macOS Apple Music/Media
+  Library permission prompts caused by Claude's sandbox/tool preflights. The existing scheduler,
+  pmset wake helper, retry, hold/defer, and reset-confirmation flow are unchanged.
+
 ## [0.5.10] - 2026-06-22
 
 ### Fixed
@@ -327,6 +336,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - API / proxy gateway accounts for Claude Code and Codex.
 - Universal macOS `.dmg` release via GitHub Actions.
 
+[0.5.11]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.11
+[0.5.10]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.10
+[0.5.9]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.9
+[0.5.8]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.8
+[0.5.7]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.7
+[0.5.6]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.6
+[0.5.5]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.5
+[0.5.4]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.4
+[0.5.3]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.3
+[0.5.2]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.2
+[0.5.1]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.1
+[0.5.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.5.0
 [0.4.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.4.0
 [0.3.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.3.0
 [0.2.0]: https://github.com/hoangpm96/ai-switcher/releases/tag/v0.2.0

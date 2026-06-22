@@ -39,7 +39,7 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 ### Auto Session
 
 - Give each Claude/Codex subscription account **one daily prime time**; the app sends a minimal "hi" to request a fresh 5-hour window, then confirms the provider's reset state. Primes at most once per day per account. Set or change a time after today's slot has passed and the first prime is the **next** occurrence — not an immediate catch-up the same evening.
-- Priming runs the account's own `claude` / `codex` CLI (so it can refresh its token), with a direct HTTP fallback. The background invocation is isolated from projects, plugins, hooks, MCP servers, history, and shared config paths so it does not traverse macOS-protected folders such as Desktop, Documents, Downloads, or mounted volumes. Scheduled/extend attempts are verified before success is recorded and retry within the bounded catch-up/deadline window when confirmation is not yet visible. Each attempt — success, hold, skip, fail, or late catch-up — is written to an activity log with the trigger source (`SCHEDULE`, `AUTO-EXTEND`, `EXTEND`, or `MANUAL`) plus an attempt id, with a per-day stats summary.
+- Priming sends the minimal background request directly over HTTP with the selected profile's OAuth token, avoiding Claude/Codex agent runtime startup and macOS sandbox preflights for protected locations such as Desktop, Documents, Downloads, and Media Library. Scheduled/extend attempts are verified before success is recorded and retry within the bounded catch-up/deadline window when confirmation is not yet visible. Each attempt — success, hold, skip, fail, or late catch-up — is written to an activity log with the trigger source (`SCHEDULE`, `AUTO-EXTEND`, `EXTEND`, or `MANUAL`) plus an attempt id, with a per-day stats summary.
 - Optionally install a **one-time privileged helper** so the Mac wakes itself ~10 minutes before a prime via `pmset`, plus an optional per-user headless daemon so each macOS profile runs only its own configured accounts even when the GUI is not scheduled during DarkWake. The app does not store or enter your macOS password. After sleep, the login Keychain may remain locked; in that case credential access is skipped and retried after that user unlocks the Mac. Without the helper/daemon, priming runs whenever the machine is awake / the app is open. A missed time is caught up only within a **bounded window** (~60 min past the anchor) — wake or open the app hours later and that day's anchor is treated as missed, so it never fires a stray prime into a still-live window late at night.
 - **Prime ngay (on demand).** When the provider reports that an account has no active five-hour window, the card shows a manual prime button. After clicking it, the UI first says that the request was sent and is awaiting confirmation; it says a session opened only after the reset state is verified. If the provider cannot prove a new fixed window, the app reports that clearly instead of claiming success.
 - **On-demand extend:** when a window is about to end (≤30 min) the app prompts on the account to open the next one the instant the current ends; a per-account toggle can do this automatically without asking, deferring to your scheduled anchor time when that falls inside the upcoming window.
@@ -48,7 +48,7 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 #### Prime and quota troubleshooting
 
 - **Claude quota returns HTTP 401 or 429:** the app runs one isolated Claude CLI refresh, reloads the profile token, and retries the usage endpoint once. Recovery is limited to once per account every five minutes to avoid repeated CLI launches or permission prompts. If it still fails, open that account's dedicated Claude command once after unlocking the Mac, then refresh in the app.
-- **Prime reports a CLI error:** the activity log includes the concise CLI stderr reason. Confirm that the account's dedicated command can start and that the profile is still logged in.
+- **Prime reports a send error:** manual and scheduled primes use direct HTTP for Claude/Codex. If a send still fails, confirm the profile is logged in and that quota can be refreshed; Claude token recovery may still launch one isolated CLI refresh for HTTP 401/429.
 - **No Prime ngay button:** the button appears only when quota was read successfully and the provider reports no active five-hour window. Authentication, network, or unknown quota state fails closed rather than offering a prime the app cannot safely verify.
 
 ### Antigravity IDE (GUI)
@@ -85,15 +85,15 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a version tag like `v0.5.10` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
+Pushing a version tag like `v0.5.11` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
 
 ```bash
-git tag v0.5.10
-git push origin main v0.5.10
+git tag v0.5.11
+git push origin main v0.5.11
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version history and
-[the v0.5.10 release notes](docs/releases/v0.5.10.md) for the current release.
+[the v0.5.11 release notes](docs/releases/v0.5.11.md) for the current release.
 
 ## License
 

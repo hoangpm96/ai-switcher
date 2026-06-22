@@ -284,11 +284,9 @@ fn read_token(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Opt
 
 /// Send a minimal "hi" to open a fresh window.
 ///
-/// Claude uses its hardened CLI invocation so the CLI can repair stale Keychain/OAuth state.
-/// Codex always uses the direct endpoint: even an ephemeral, read-only `codex exec` starts Git
-/// discovery under its macOS sandbox, which preflights Desktop/Documents/Downloads/Media Library
-/// and causes permission prompts attributed to this app. Codex's token can be refreshed directly,
-/// so starting the full agent runtime is unnecessary.
+/// Prime directly over HTTP whenever possible. Starting the full Claude/Codex agent runtime for a
+/// one-token background request can still initialise sandbox/tool preflights and trigger macOS TCC
+/// prompts attributed to this app.
 fn send_hi(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Result<(), String> {
     if !uses_cli_for_prime(tool_id) {
         return send_hi_http(tool_id, config_dir);
@@ -305,7 +303,7 @@ fn send_hi(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Result
 }
 
 fn uses_cli_for_prime(tool_id: &ToolId) -> bool {
-    matches!(tool_id, ToolId::Claude)
+    matches!(tool_id, ToolId::Antigravity)
 }
 
 /// Prime by running the account's CLI non-interactively, with the account's config dir in the
@@ -553,9 +551,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_prime_bypasses_agent_cli() {
+    fn subscription_primes_bypass_agent_cli() {
         assert!(!uses_cli_for_prime(&ToolId::Codex));
-        assert!(uses_cli_for_prime(&ToolId::Claude));
+        assert!(!uses_cli_for_prime(&ToolId::Claude));
     }
 
     #[test]
