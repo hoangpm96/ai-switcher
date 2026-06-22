@@ -13,9 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launched `codex exec hi` from `/`, so Codex rejected the request with exit 1 after the v0.5.9 PATH
   fix. Background Codex primes now use an ephemeral, read-only automation invocation with the
   account profile as the working directory and `--skip-git-repo-check`.
-- **Background Claude prime/token refresh no longer scans user projects or asks for Downloads
-  access.** The isolated invocation disables project, plugin, hook, and MCP customizations, avoids
-  session persistence, and runs inside the account profile instead of loading shared project paths.
+- **Background Claude prime/token refresh no longer scans user projects or triggers protected-folder
+  permission prompts.** The isolated invocation disables project, plugin, hook, and MCP
+  customizations, avoids session persistence, and runs inside the account profile instead of
+  loading shared paths that may point at Desktop, Documents, Downloads, mounted volumes, or other
+  macOS-protected locations.
 - **CLI prime failures now include a concise stderr reason.** Future failures report the actual
   Codex/Claude error instead of only an opaque numeric exit code.
 - **Claude quota now self-recovers from stale OAuth/Keychain state reported as HTTP 401 or 429.**
@@ -24,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Recovery is bounded per account.** Each Claude profile can trigger at most one recovery within
   five minutes; network errors and server 5xx responses do not invoke the CLI, preventing retry
   loops and excess requests.
+- **Auto Session documentation now matches confirmation semantics.** A successful CLI/HTTP send is
+  only a pending request; the app reports an opened session only after the provider reset state is
+  verified. Locked login Keychains and unknown quota states remain retryable/fail-closed rather
+  than being presented as successful primes.
 
 ## [0.5.9] - 2026-06-22
 

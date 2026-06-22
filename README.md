@@ -20,7 +20,7 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 - **Per-tool auto-switch.** Configure separately for Claude and Codex — the bare command falls back to another account when the active one nears its quota.
 - **Usage & cost tab.** Token usage and estimated cost per tool, plus an aggregated **All** view across tools, charted over a selectable date range.
 - **Local API gateway.** Expose Claude/Codex subscription accounts through a local OpenAI/Anthropic-compatible server with API keys, model combos, fallback rotation, cooldown handling, and gateway usage tracking.
-- **Auto Session.** Anchor each Claude/Codex account's 5-hour reset to your work rhythm — the app sends and verifies a prime request at a time you pick (optionally waking the Mac and running a headless user-context prime worker), can open the next window the moment the current one ends so you keep coding without waiting, and gives you a **Prime ngay** button to request a new window on demand.
+- **Auto Session.** Anchor each Claude/Codex account's 5-hour reset to your work rhythm — the app sends a prime request at a time you pick, then verifies the provider's reset state before reporting success. It can optionally wake the Mac and run a headless worker under the correct macOS user, and provides a **Prime ngay** button for on-demand requests.
 
 ### Claude Code & Codex (CLI)
 
@@ -38,12 +38,18 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 
 ### Auto Session
 
-- Give each Claude/Codex subscription account **one daily prime time**; the app sends a minimal "hi" then to open a fresh 5-hour window, so your reset clock lands when you actually start coding. Primes at most once per day per account. Set or change a time after today's slot has passed and the first prime is the **next** occurrence — not an immediate catch-up the same evening.
-- Priming runs the account's own `claude` / `codex` CLI (so it refreshes its own token), with a direct HTTP fallback. Scheduled/extend attempts are verified before success is recorded and retry within the bounded catch-up/deadline window when confirmation is not yet visible. Each attempt — success, hold, skip, fail, or late catch-up — is written to an activity log with the trigger source (`SCHEDULE`, `AUTO-EXTEND`, `EXTEND`, or `MANUAL`) plus an attempt id, with a per-day stats summary.
-- Optionally install a **one-time privileged helper** so the Mac wakes itself ~10 minutes before a prime via `pmset`, plus an optional user-scoped headless daemon so due prime requests can run under the correct macOS profile even when the GUI is not scheduled during DarkWake. The app does not store your macOS password; if the login Keychain is still locked, token access can fail and the request is retried after unlock. Without the helper/daemon, priming runs whenever the machine is awake / the app is open. A missed time is caught up only within a **bounded window** (~60 min past the anchor) — wake or open the app hours later and that day's anchor is treated as missed, so it never fires a stray prime into a still-live window late at night.
-- **Prime ngay (on demand).** When an account's window has ended, a button on the card opens the next 5-hour window right away — no need to drop to a terminal. It reports back whether a new window opened, the current one is still running, or the token needs a re-login.
+- Give each Claude/Codex subscription account **one daily prime time**; the app sends a minimal "hi" to request a fresh 5-hour window, then confirms the provider's reset state. Primes at most once per day per account. Set or change a time after today's slot has passed and the first prime is the **next** occurrence — not an immediate catch-up the same evening.
+- Priming runs the account's own `claude` / `codex` CLI (so it can refresh its token), with a direct HTTP fallback. The background invocation is isolated from projects, plugins, hooks, MCP servers, history, and shared config paths so it does not traverse macOS-protected folders such as Desktop, Documents, Downloads, or mounted volumes. Scheduled/extend attempts are verified before success is recorded and retry within the bounded catch-up/deadline window when confirmation is not yet visible. Each attempt — success, hold, skip, fail, or late catch-up — is written to an activity log with the trigger source (`SCHEDULE`, `AUTO-EXTEND`, `EXTEND`, or `MANUAL`) plus an attempt id, with a per-day stats summary.
+- Optionally install a **one-time privileged helper** so the Mac wakes itself ~10 minutes before a prime via `pmset`, plus an optional per-user headless daemon so each macOS profile runs only its own configured accounts even when the GUI is not scheduled during DarkWake. The app does not store or enter your macOS password. After sleep, the login Keychain may remain locked; in that case credential access is skipped and retried after that user unlocks the Mac. Without the helper/daemon, priming runs whenever the machine is awake / the app is open. A missed time is caught up only within a **bounded window** (~60 min past the anchor) — wake or open the app hours later and that day's anchor is treated as missed, so it never fires a stray prime into a still-live window late at night.
+- **Prime ngay (on demand).** When the provider reports that an account has no active five-hour window, the card shows a manual prime button. After clicking it, the UI first says that the request was sent and is awaiting confirmation; it says a session opened only after the reset state is verified. If the provider cannot prove a new fixed window, the app reports that clearly instead of claiming success.
 - **On-demand extend:** when a window is about to end (≤30 min) the app prompts on the account to open the next one the instant the current ends; a per-account toggle can do this automatically without asking, deferring to your scheduled anchor time when that falls inside the upcoming window.
 - Quota for every account (including the machine default) is read live from the provider, so the displayed usage and reset time stay current and a refresh always reflects the real state.
+
+#### Prime and quota troubleshooting
+
+- **Claude quota returns HTTP 401 or 429:** the app runs one isolated Claude CLI refresh, reloads the profile token, and retries the usage endpoint once. Recovery is limited to once per account every five minutes to avoid repeated CLI launches or permission prompts. If it still fails, open that account's dedicated Claude command once after unlocking the Mac, then refresh in the app.
+- **Prime reports a CLI error:** the activity log includes the concise CLI stderr reason. Confirm that the account's dedicated command can start and that the profile is still logged in.
+- **No Prime ngay button:** the button appears only when quota was read successfully and the provider reports no active five-hour window. Authentication, network, or unknown quota state fails closed rather than offering a prime the app cannot safely verify.
 
 ### Antigravity IDE (GUI)
 
@@ -79,14 +85,15 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a version tag like `v0.5.8` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
+Pushing a version tag like `v0.5.10` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
 
 ```bash
-git tag v0.5.8
-git push origin main v0.5.8
+git tag v0.5.10
+git push origin main v0.5.10
 ```
 
-See [CHANGELOG.md](CHANGELOG.md) for the per-version history.
+See [CHANGELOG.md](CHANGELOG.md) for the per-version history and
+[the v0.5.10 release notes](docs/releases/v0.5.10.md) for the current release.
 
 ## License
 
