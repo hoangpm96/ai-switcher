@@ -2243,10 +2243,10 @@ impl ManagedState {
         // the whole on-demand op for symmetry).
         let _awake = CaffeinateHold::active();
 
-        // On-demand prime fails fast: a SINGLE send attempt (no 5×5' backoff that the scheduler
-        // uses), so a button press returns in seconds and the user can just tap again. For Codex,
-        // D4 returns right after a 2xx send (a "hi" anchors the window only with a backend delay, so
-        // there's nothing to confirm-poll for); Claude still confirm-polls to see the moved reset.
+        // On-demand prime uses a SINGLE send attempt (no 5×5' backoff that the scheduler uses), so
+        // a send failure returns quickly and the user can tap again. Confirmation is still
+        // provider-aware: Claude polls for a moved reset, while Codex observes the reset twice to
+        // distinguish a fixed anchored window from the rolling now+5h placeholder.
         let outcome = crate::prime::prime_account_with_hook(
             &job.tool_id,
             &job.config_dir,

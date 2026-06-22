@@ -5,17 +5,6 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.11] - 2026-06-22
-
-### Fixed
-
-- **Claude quota now self-recovers from stale OAuth/Keychain state reported as HTTP 401 or 429.**
-  The app runs one isolated Claude CLI refresh, reloads the persisted token, and retries the usage
-  endpoint once—the same recovery users observed after opening `claude` manually.
-- **Recovery is bounded per account.** Each Claude profile can trigger at most one recovery within
-  five minutes; network errors and server 5xx responses do not invoke the CLI, preventing retry
-  loops and excess requests.
-
 ## [0.5.10] - 2026-06-22
 
 ### Fixed
@@ -29,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session persistence, and runs inside the account profile instead of loading shared project paths.
 - **CLI prime failures now include a concise stderr reason.** Future failures report the actual
   Codex/Claude error instead of only an opaque numeric exit code.
+- **Claude quota now self-recovers from stale OAuth/Keychain state reported as HTTP 401 or 429.**
+  The app runs one isolated Claude CLI refresh, reloads the persisted token, and retries the usage
+  endpoint once—the same recovery users observed after opening `claude` manually.
+- **Recovery is bounded per account.** Each Claude profile can trigger at most one recovery within
+  five minutes; network errors and server 5xx responses do not invoke the CLI, preventing retry
+  loops and excess requests.
 
 ## [0.5.9] - 2026-06-22
 
