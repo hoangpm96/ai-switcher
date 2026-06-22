@@ -282,11 +282,17 @@ fn read_token(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Opt
     }
 }
 
-/// Send a minimal "hi" to open a fresh window. Prefer the account's own CLI (`claude -p` /
-/// `codex exec`) — it refreshes its own token and uses the provider's exact endpoint/model, which
-/// is far more robust against token expiry (the 401 the user hit) and provider changes. Fall back
-/// to a direct HTTP call only when no CLI binary is configured.
+/// Send a minimal "hi" to open a fresh window.
+///
+/// Claude uses its hardened CLI invocation so the CLI can repair stale Keychain/OAuth state.
+/// Codex always uses the direct endpoint: even an ephemeral, read-only `codex exec` starts Git
+/// discovery under its macOS sandbox, which preflights Desktop/Documents/Downloads/Media Library
+/// and causes permission prompts attributed to this app. Codex's token can be refreshed directly,
+/// so starting the full agent runtime is unnecessary.
 fn send_hi(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Result<(), String> {
+    if !uses_cli_for_prime(tool_id) {
+        return send_hi_http(tool_id, config_dir);
+    }
     if let Some(binary) = binary {
         match send_hi_cli(tool_id, config_dir, binary) {
             Ok(()) => return Ok(()),
@@ -296,6 +302,10 @@ fn send_hi(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Result
         }
     }
     send_hi_http(tool_id, config_dir)
+}
+
+fn uses_cli_for_prime(tool_id: &ToolId) -> bool {
+    matches!(tool_id, ToolId::Claude)
 }
 
 /// Prime by running the account's CLI non-interactively, with the account's config dir in the
@@ -540,6 +550,12 @@ mod tests {
         assert!(is_prime_eligible(&ToolId::Codex, false));
         assert!(!is_prime_eligible(&ToolId::Claude, true)); // API-proxy account
         assert!(!is_prime_eligible(&ToolId::Antigravity, false));
+    }
+
+    #[test]
+    fn codex_prime_bypasses_agent_cli() {
+        assert!(!uses_cli_for_prime(&ToolId::Codex));
+        assert!(uses_cli_for_prime(&ToolId::Claude));
     }
 
     #[test]
