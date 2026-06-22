@@ -1856,7 +1856,7 @@ function AccountCard({
         minute: "2-digit",
         hour12: false,
       });
-      return `${primeAttemptSourceLabel(primeAttempt.source)} · đang mở session · thử tới ${deadline}`;
+      return `${primeAttemptSourceLabel(primeAttempt.source)} · đã gửi yêu cầu prime, đang xác nhận · thử tới ${deadline}`;
     }
     if (!primeOn) return null;
     if (autoPrime?.extendRequested) return "Sẽ mở phiên mới khi phiên cũ hết";
@@ -1955,7 +1955,7 @@ function AccountCard({
           className="primeNowBtn"
           onClick={onPrimeNow}
           disabled={busy !== null}
-          title="Gửi một tin nhắn tối thiểu để mở phiên 5 giờ mới ngay bây giờ"
+          title="Gửi yêu cầu prime; app chỉ báo đã mở phiên sau khi xác nhận được reset mới"
         >
           {primingNow ? <Loader2 className="spin" size={14} /> : <AlarmClock size={14} />} Prime ngay
         </button>

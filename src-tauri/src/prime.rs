@@ -14,6 +14,7 @@
 use crate::models::ToolId;
 use crate::quota;
 use serde_json::json;
+use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
@@ -302,6 +303,13 @@ fn send_hi(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Result
 fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(), String> {
     use std::process::Command;
     let mut command = Command::new(binary);
+    // Finder/Dock apps and LaunchDaemons commonly inherit only
+    // `/usr/bin:/bin:/usr/sbin:/sbin`. npm-installed CLIs are scripts with an
+    // `#!/usr/bin/env node` shebang, so spawning the configured `codex` path can
+    // succeed while the script itself exits 127 because `env` cannot find Node.
+    // Supply the same deterministic install locations used by tool detection,
+    // while preserving any useful entries inherited from the user's session.
+    command.env("PATH", cli_path(binary));
     match tool_id {
         ToolId::Claude => {
             command
@@ -344,6 +352,33 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
             Err(e) => return Err(format!("CLI: {e}")),
         }
     }
+}
+
+fn cli_path(binary: &Path) -> OsString {
+    use std::collections::HashSet;
+
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |path: std::path::PathBuf| {
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    };
+
+    if let Some(parent) = binary.parent() {
+        push(parent.to_path_buf());
+    }
+    for path in crate::tools::common_bin_dirs() {
+        push(path);
+    }
+    if let Some(inherited) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&inherited) {
+            push(path);
+        }
+    }
+
+    std::env::join_paths(paths)
+        .unwrap_or_else(|_| OsString::from("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
 /// POST a minimal "hi" directly. Returns Ok(()) on a 2xx, Err(reason) otherwise.
@@ -445,6 +480,7 @@ fn window_moved(before: Option<&str>, after: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn eligibility_excludes_api_and_antigravity() {
@@ -499,5 +535,15 @@ mod tests {
         assert!(!claude_reset_confirms(Some(&baseline), &baseline));
         assert!(claude_reset_confirms(Some(&baseline), &moved));
         assert!(claude_reset_confirms(None, &moved)); // valid empty precheck
+    }
+
+    #[test]
+    fn cli_path_includes_runtime_locations_for_env_shebangs() {
+        let path = cli_path(Path::new("/Users/test/.npm-global/bin/codex"));
+        let entries = std::env::split_paths(&path).collect::<Vec<PathBuf>>();
+        assert!(entries.contains(&PathBuf::from("/Users/test/.npm-global/bin")));
+        assert!(entries.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(entries.contains(&PathBuf::from("/usr/local/bin")));
+        assert!(entries.contains(&PathBuf::from("/usr/bin")));
     }
 }

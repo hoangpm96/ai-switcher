@@ -104,8 +104,16 @@ pub(crate) fn classify_five_hour(tool_id: &ToolId, window: &QuotaWindow) -> Wind
     }
     let now = chrono::Utc::now().timestamp();
     match window.reset_at.as_deref() {
-        // No reset_at: "fully ended" (Primeable) only when the endpoint actually reported an empty
-        // window (used% 0). A missing/None percent means the field wasn't reported → Unknown.
+        // Claude's successful usage response uses `resets_at: null` when there is no active 5-hour
+        // window. `utilization` can still be non-zero because it is usage metadata, not proof that
+        // a session is currently anchored. Requiring exactly 0 hid "Prime ngay" for valid,
+        // logged-in accounts with no session.
+        //
+        // Codex is kept conservative: a missing reset is only known-primeable when the endpoint
+        // explicitly reports an empty window. Full-response errors are filtered by
+        // `classify_window`; `read_live_five_hour` only reaches this branch after a successful API
+        // response.
+        None if matches!(tool_id, ToolId::Claude) => WindowState::Primeable,
         None => match window.percent_used {
             Some(p) if p <= 0.0 => WindowState::Primeable,
             _ => WindowState::Unknown,
@@ -1202,16 +1210,28 @@ mod tests {
     }
 
     #[test]
-    fn prime_available_null_reset_without_zero_used_is_none() {
-        // reset_at None but percent unknown = field wasn't reported (e.g. only weekly present) →
-        // unknown, NOT "fully ended". Must not offer prime.
+    fn claude_null_reset_is_primeable_even_without_zero_used() {
+        // A successful Claude usage response with no reset means no anchored session. Utilization
+        // is historical usage metadata and may be non-zero or omitted.
         let missing = QuotaWindow {
             label: "5-hour limit".to_string(),
             percent_used: None,
             reset_at: None,
         };
         let quota = quota_with(missing, None);
-        assert_eq!(prime_available_for(&ToolId::Claude, &quota), None);
+        assert_eq!(prime_available_for(&ToolId::Claude, &quota), Some(true));
+
+        let non_zero = QuotaWindow {
+            label: "5-hour limit".to_string(),
+            percent_used: Some(12.0),
+            reset_at: None,
+        };
+        let quota = quota_with(non_zero, None);
+        assert_eq!(prime_available_for(&ToolId::Claude, &quota), Some(true));
+    }
+
+    #[test]
+    fn codex_null_reset_without_zero_used_is_unknown() {
         let missing2 = QuotaWindow {
             label: "5-hour limit".to_string(),
             percent_used: None,

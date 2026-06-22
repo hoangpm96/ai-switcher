@@ -350,7 +350,7 @@ export function AutoSessionView({
                 )}
                 {attempt && (
                   <p className="autoCardHint">
-                    {attemptSourceLabel(attempt.source)} · đang mở session · thử lại{" "}
+                    {attemptSourceLabel(attempt.source)} · đã gửi yêu cầu prime, đang xác nhận · thử lại{" "}
                     {localHHMM(attempt.nextActionAt)} · hết hạn {localHHMM(attempt.deadlineAt)}
                   </p>
                 )}
