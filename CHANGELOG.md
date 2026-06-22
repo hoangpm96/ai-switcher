@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only a pending request; the app reports an opened session only after the provider reset state is
   verified. Locked login Keychains and unknown quota states remain retryable/fail-closed rather
   than being presented as successful primes.
+- **Claude background requests no longer trigger macOS protected-folder prompts.** Safe mode alone
+  still initialized Claude's built-in tool/sandbox layer. Prime and OAuth recovery now explicitly
+  disable tools, settings sources, MCP, Chrome integration, slash commands, and prompt suggestions,
+  keeping the invocation API-only while preserving OAuth refresh.
+- **Codex prime no longer starts the Codex agent runtime or Git discovery.** Manual and scheduled
+  primes now call Codex's response endpoint directly with the selected profile's OAuth token, then
+  verify the live quota reset. This avoids Git/sandbox preflights for Desktop, Documents, Downloads,
+  Media Library, and other protected locations.
 
 ## [0.5.9] - 2026-06-22
 
