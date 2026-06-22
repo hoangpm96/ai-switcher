@@ -5,6 +5,20 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.10] - 2026-06-22
+
+### Fixed
+
+- **Codex “Prime ngay” now runs successfully outside a Git repository.** The app previously
+  launched `codex exec hi` from `/`, so Codex rejected the request with exit 1 after the v0.5.9 PATH
+  fix. Background Codex primes now use an ephemeral, read-only automation invocation with the
+  account profile as the working directory and `--skip-git-repo-check`.
+- **Background Claude prime/token refresh no longer scans user projects or asks for Downloads
+  access.** The isolated invocation disables project, plugin, hook, and MCP customizations, avoids
+  session persistence, and runs inside the account profile instead of loading shared project paths.
+- **CLI prime failures now include a concise stderr reason.** Future failures report the actual
+  Codex/Claude error instead of only an opaque numeric exit code.
+
 ## [0.5.9] - 2026-06-22
 
 ### Fixed
