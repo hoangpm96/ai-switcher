@@ -5,6 +5,21 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.9] - 2026-06-22
+
+### Fixed
+
+- **Codex manual and scheduled primes no longer fail with `CLI exit 127`.** GUI apps and the
+  user-scoped LaunchDaemon now give CLI subprocesses a deterministic PATH containing common Node,
+  Homebrew, npm, pnpm, Bun, Cargo, and system binary locations. This allows npm-installed Codex
+  scripts using `#!/usr/bin/env node` to run while preserving each account's isolated `CODEX_HOME`.
+- **Claude now shows “Prime ngay” when no five-hour session is active.** A successful Claude usage
+  response with `resets_at: null` is treated as no anchored session even when utilization is
+  non-zero or omitted; read/authentication errors remain unknown and fail closed.
+- **Pending prime copy no longer claims a session is already opening.** The UI says the prime
+  request was sent and is awaiting confirmation, and only reports an opened session after a new
+  reset has been verified.
+
 ## [0.5.8] - 2026-06-21
 
 ### Fixed
