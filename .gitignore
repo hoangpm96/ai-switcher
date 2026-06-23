@@ -9,6 +9,15 @@ src-tauri/gen
 
 # Personal Claude Code settings
 .claude/settings.local.json
+.agents/
+.codex/
 
 # BA / internal docs
 docs/
+review.md
+
+# Local scratch / test debris (never publish)
+scripts/
+test_codex_sandbox
+test_codex_sandbox.rs
+.agy-review-*

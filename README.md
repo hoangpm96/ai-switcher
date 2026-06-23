@@ -47,8 +47,9 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 
 #### Prime and quota troubleshooting
 
-- **Claude quota returns HTTP 401 or 429:** the app runs one isolated Claude CLI refresh, reloads the profile token, and retries the usage endpoint once. Recovery is limited to once per account every five minutes to avoid repeated CLI launches or permission prompts. If it still fails, open that account's dedicated Claude command once after unlocking the Mac, then refresh in the app.
-- **Prime reports a send error:** manual and scheduled primes use direct HTTP for Claude/Codex. If a send still fails, confirm the profile is logged in and that quota can be refreshed; Claude token recovery may still launch one isolated CLI refresh for HTTP 401/429.
+- **Claude quota returns HTTP 401 or 429:** the app refreshes the account's OAuth token directly over HTTP (using the stored refresh token) and retries the usage endpoint once, writing the rotated credential back through the native keychain API. No `claude` CLI is launched, so the refresh never triggers a macOS protected-folder prompt. Recovery is limited to once per account every five minutes, and concurrent refreshes for the same account are serialized.
+- **Prime reports a send error:** manual and scheduled primes send directly over HTTP for Claude/Codex. If a send still fails, confirm the profile is logged in and that quota can be refreshed.
+- **Codex prime takes a little while to confirm:** sending the prime anchors the Codex five-hour window, but the freshly anchored reset reads close to "now + 5h" for the first minute or so. The app confirms by watching the reset settle to a fixed value (typically within 15–30 seconds) rather than assuming success, so a manual prime may show "awaiting confirmation" briefly before reporting the opened session.
 - **No Prime ngay button:** the button appears only when quota was read successfully and the provider reports no active five-hour window. Authentication, network, or unknown quota state fails closed rather than offering a prime the app cannot safely verify.
 
 ### Antigravity IDE (GUI)
