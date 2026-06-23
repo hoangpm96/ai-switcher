@@ -5,6 +5,26 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.12] - 2026-06-23
+
+### Fixed
+
+- **Scheduled and manual Codex primes now confirm reliably.** A bare "hi" anchors the Codex 5-hour
+  window, but the freshly anchored reset sits at roughly "now + 5h" for the first ~90 seconds, so the
+  previous two-reads-75s-apart drift check (and the later "reset clearly inside the window" check)
+  often reported failure even though the session had opened. Confirmation now polls the live window
+  and succeeds as soon as the reset epoch is observed **unchanged across two reads** (a fixed,
+  anchored reset stays put, while a rolling placeholder advances with the clock) — typically within
+  15–30 seconds — tolerating a slow anchor or a transient read error. The poll is bounded by both a
+  poll count and a hard wall-clock budget so a scheduler tick is never cut off mid-confirmation.
+- **Claude OAuth token refresh now happens over HTTP instead of launching the Claude CLI.** Reading a
+  Claude account's quota when its token was near expiry previously spawned `claude` to refresh,
+  which made macOS attribute the CLI's protected-folder preflight (Desktop/Documents/Downloads) to
+  AI Account Switcher and pop a permission prompt. The refresh now uses the stored refresh token
+  directly and writes the rotated credential back through the native keychain API — no subprocess,
+  no folder prompt. Concurrent refreshes for the same account are serialized, and the credential
+  write is retried to avoid stranding an account on a transient keychain error.
+
 ## [0.5.11] - 2026-06-23
 
 ### Fixed

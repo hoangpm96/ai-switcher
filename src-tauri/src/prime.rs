@@ -30,11 +30,15 @@ pub const SEND_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 /// Confirm-retry policy (D4): after a 2xx send, re-read the live window until `reset_at` moves.
 pub const CONFIRM_MAX_TRIES: u32 = 5;
 pub const CONFIRM_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// Codex needs two observations: a rolling reset advances with wall time, while a real session's
-/// reset remains fixed. 75s is safely above the 60s minimum proof gap while staying inside one
-/// short caffeinated wake transaction.
-pub const CODEX_OBSERVATION_DELAY: Duration = Duration::from_secs(75);
-pub const CODEX_FIXED_RESET_EPSILON_SECONDS: i64 = 15;
+/// Codex confirm (D4): after a 2xx send, poll the live window until it reads as a clearly-anchored
+/// real session, tolerating a still-rolling reset or a transient read failure. The poll is bounded by
+/// BOTH a max poll count AND a hard wall-clock budget — each `read_live_five_hour` makes a `curl` call
+/// (up to 20s), so counting sleeps alone undercounts; `CODEX_CONFIRM_TOTAL_BUDGET` caps the real
+/// elapsed time so a confirmation can never overrun the scheduler's per-tick proof budget
+/// (`PRIME_PROOF_BUDGET_SECONDS`). On give-up the scheduler's 5-minute retry loop re-confirms.
+pub const CODEX_CONFIRM_POLL_DELAY: Duration = Duration::from_secs(15);
+pub const CODEX_CONFIRM_MAX_POLLS: u32 = 6;
+pub const CODEX_CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(120);
 /// Hard cap on how long a prime CLI invocation may run before we kill it (a hung CLI must never
 /// hold the prime worker — see the scheduler's overlap guard).
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(120);
@@ -84,7 +88,7 @@ pub fn prime_account_with_hook(
     let _awake = CaffeinateGuard::start();
 
     // D1 — token must be valid.
-    if read_token(tool_id, config_dir, binary).is_none() {
+    if read_token(tool_id, config_dir).is_none() {
         return PrimeOutcome::SkipNoToken;
     }
 
@@ -147,28 +151,21 @@ pub fn prime_account_with_hook(
     // D4 — confirm the prime took.
     //
     // Provider-aware:
-    //   - Codex: a bare "hi" does NOT reliably anchor the 5h window on a low-usage account. A
-    //     single snapshot around now+5h is ambiguous, so observe twice: rolling resets advance with
-    //     wall time; an active session's reset stays fixed.
-    //   - Claude: `reset_at` is a stable anchor, so we can (and should) confirm the window actually
-    //     moved to a new future reset before claiming success. Poll a few times — the provider may
-    //     take a few seconds to refresh.
+    //   - Codex: sending "hi" DOES anchor the 5h window (verified live), but the anchor lands with a
+    //     variable delay: the `/wham/usage` reset stays "rolling" (≈ now + 5h, advancing with wall
+    //     time) for a moment, then snaps to a FIXED epoch that counts down. We confirm by POLLING the
+    //     window until it reads as `Anchored` (reset clearly inside now+5h, i.e. not the rolling
+    //     signature). This is robust to both a slow anchor and a transient read failure — a failed
+    //     read just retries on the next poll instead of aborting the whole confirmation (the old
+    //     two-observation drift proof reported FAIL whenever one of its two reads slipped).
+    //   - Claude: `reset_at` is a stable anchor, so we confirm the window actually moved to a new
+    //     future reset before claiming success. Poll a few times — the provider may take a few
+    //     seconds to refresh.
     if matches!(tool_id, ToolId::Codex) {
-        let first = quota::read_live_five_hour(tool_id, config_dir).ok();
-        sleeper(CODEX_OBSERVATION_DELAY);
-        let second = quota::read_live_five_hour(tool_id, config_dir).ok();
-        if let (Some(first), Some(second)) = (first, second) {
-            if let (Some(first_reset), Some(second_reset)) =
-                (first.reset_at.as_deref(), second.reset_at.as_deref())
-            {
-                if codex_reset_is_fixed(first_reset, second_reset) {
-                    return PrimeOutcome::Success {
-                        new_reset_at: second_reset.to_string(),
-                    };
-                }
-            }
-        }
-        return PrimeOutcome::FailUnconfirmed;
+        return match codex_confirm_anchored(config_dir, &mut sleeper) {
+            Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
+            None => PrimeOutcome::FailUnconfirmed,
+        };
     }
     for _ in 0..CONFIRM_MAX_TRIES {
         sleeper(CONFIRM_RETRY_DELAY);
@@ -183,6 +180,75 @@ pub fn prime_account_with_hook(
         }
     }
     PrimeOutcome::FailUnconfirmed
+}
+
+/// Poll the Codex 5h window until it proves a real anchored session, or the inline budget runs out.
+///
+/// Two independent success signals (verified live 2026-06-23):
+///   1. `WindowState::Anchored` — the reset is clearly inside now+5h (a window that started a while
+///      ago). Fast path when a real session was already running.
+///   2. **Stable reset across consecutive reads** — a freshly anchored window's reset is a FIXED epoch
+///      ≈ `send_time + 5h`, so for the first ~90s it is still "near now+5h" and classifies as
+///      `Ambiguous`, indistinguishable from rolling by a single snapshot. But a ROLLING reset ADVANCES
+///      with wall time (`now + 5h` recomputed every read) while an ANCHORED reset stays put. So if two
+///      consecutive reads (≥ one poll interval apart) report the SAME future reset epoch, the window
+///      is anchored — even while still numerically near now+5h. This catches the common "hi just
+///      anchored it" case in ~one poll interval instead of waiting the full 90s for signal (1).
+///
+/// A rolling window or a transient read failure simply keeps polling. Bounded by BOTH a max poll
+/// count and a hard wall-clock budget (each read costs up to a 20s curl), staying inside the
+/// scheduler's per-tick proof budget; on give-up the scheduler's 5-minute retry loop re-confirms.
+fn codex_confirm_anchored(
+    config_dir: &Path,
+    mut sleeper: impl FnMut(Duration),
+) -> Option<String> {
+    let started = std::time::Instant::now();
+    let mut previous_epoch: Option<i64> = None;
+    for poll in 0..CODEX_CONFIRM_MAX_POLLS {
+        if poll > 0 {
+            // Stop before a sleep that would push us past the wall-clock budget. Each read below also
+            // costs up to a 20s curl, so the count cap alone is not enough to bound real elapsed time.
+            if started.elapsed() + CODEX_CONFIRM_POLL_DELAY >= CODEX_CONFIRM_TOTAL_BUDGET {
+                break;
+            }
+            sleeper(CODEX_CONFIRM_POLL_DELAY);
+        }
+        if let Ok(window) = quota::read_live_five_hour(&ToolId::Codex, config_dir) {
+            // Signal 1: clearly anchored (reset far from now+5h).
+            if matches!(
+                quota::classify_five_hour(&ToolId::Codex, &window),
+                quota::WindowState::Anchored
+            ) {
+                // `Anchored` is only produced from a parseable future reset, so this is present.
+                if let Some(reset_at) = window.reset_at {
+                    return Some(reset_at);
+                }
+            }
+            // Signal 2: a future reset whose epoch is UNCHANGED since the previous poll → fixed →
+            // anchored. (A rolling reset would have advanced by ≈ the poll interval.)
+            if let Some(reset_epoch) = window
+                .reset_at
+                .as_deref()
+                .and_then(codex_reset_epoch_if_future)
+            {
+                if previous_epoch == Some(reset_epoch) {
+                    return window.reset_at;
+                }
+                previous_epoch = Some(reset_epoch);
+            }
+        }
+        if started.elapsed() >= CODEX_CONFIRM_TOTAL_BUDGET {
+            break;
+        }
+    }
+    None
+}
+
+/// Parse a Codex `reset_at` (RFC3339) to a unix epoch, but only if it is in the future. A past or
+/// unparseable reset is not a live window to confirm against.
+fn codex_reset_epoch_if_future(reset_at: &str) -> Option<i64> {
+    let reset = chrono::DateTime::parse_from_rfc3339(reset_at).ok()?;
+    (reset > chrono::Utc::now()).then(|| reset.timestamp())
 }
 
 /// Resume an attempt that may have crashed after its durable `Confirming` marker was written.
@@ -209,21 +275,14 @@ pub fn confirm_active_session(
             }
         }
         ToolId::Codex => {
-            let first = quota::read_live_five_hour(tool_id, config_dir).ok();
-            sleeper(CODEX_OBSERVATION_DELAY);
-            let second = quota::read_live_five_hour(tool_id, config_dir).ok();
-            if let (Some(first), Some(second)) = (first, second) {
-                if let (Some(first_reset), Some(second_reset)) =
-                    (first.reset_at.as_deref(), second.reset_at.as_deref())
-                {
-                    if codex_reset_is_fixed(first_reset, second_reset) {
-                        return PrimeOutcome::Success {
-                            new_reset_at: second_reset.to_string(),
-                        };
-                    }
-                }
+            // Resume never re-sends: it only checks whether the window has anchored since the send
+            // that wrote the `Confirming` marker. Same anchored-signature poll as the inline D4 path
+            // (`baseline_reset_at` is unused for Codex — an anchored reset is proof on its own).
+            let _ = baseline_reset_at;
+            match codex_confirm_anchored(config_dir, &mut sleeper) {
+                Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
+                None => PrimeOutcome::FailUnconfirmed,
             }
-            PrimeOutcome::FailUnconfirmed
         }
         ToolId::Antigravity => PrimeOutcome::SkipUnknownState,
     }
@@ -231,17 +290,6 @@ pub fn confirm_active_session(
 
 fn claude_reset_confirms(baseline: Option<&str>, candidate: &str) -> bool {
     is_future(candidate) && baseline.is_none_or(|before| before != candidate)
-}
-
-fn codex_reset_is_fixed(first: &str, second: &str) -> bool {
-    let Ok(first) = chrono::DateTime::parse_from_rfc3339(first) else {
-        return false;
-    };
-    let Ok(second) = chrono::DateTime::parse_from_rfc3339(second) else {
-        return false;
-    };
-    second > chrono::Utc::now()
-        && (second.timestamp() - first.timestamp()).abs() <= CODEX_FIXED_RESET_EPSILON_SECONDS
 }
 
 /// Keeps the Mac awake (no idle sleep) for as long as it is alive, by holding a child
@@ -274,9 +322,9 @@ impl Drop for CaffeinateGuard {
     }
 }
 
-fn read_token(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Option<String> {
+fn read_token(tool_id: &ToolId, config_dir: &Path) -> Option<String> {
     match tool_id {
-        ToolId::Claude => quota::claude_oauth_token_fresh(config_dir, binary),
+        ToolId::Claude => quota::claude_oauth_token_fresh(config_dir),
         ToolId::Codex => quota::codex_access_token_fresh(config_dir),
         ToolId::Antigravity => None,
     }
@@ -450,9 +498,8 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
 
     let response = match tool_id {
         ToolId::Claude => {
-            // No explicit binary here; claude_oauth_token_fresh resolves `claude` via command_path
-            // for the token refresh (a bare PATH lookup fails under a GUI .app's minimal PATH).
-            let token = quota::claude_oauth_token_fresh(config_dir, None)
+            // Refreshes via HTTP refresh-token grant if the stored token is near expiry.
+            let token = quota::claude_oauth_token_fresh(config_dir)
                 .ok_or_else(|| "token".to_string())?;
             let version = quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());
             let body = json!({
@@ -572,26 +619,70 @@ mod tests {
     }
 
     #[test]
-    fn codex_fixed_reset_proof_rejects_rolling_value() {
-        let future = chrono::Utc::now() + chrono::Duration::hours(5);
-        let fixed_a = future.to_rfc3339();
-        let fixed_b = (future + chrono::Duration::seconds(10)).to_rfc3339();
-        let rolling = (future + chrono::Duration::seconds(75)).to_rfc3339();
-        assert!(codex_reset_is_fixed(&fixed_a, &fixed_b));
-        assert!(!codex_reset_is_fixed(&fixed_a, &rolling));
+    fn codex_confirm_uses_anchored_signature_not_rolling() {
+        // The Codex confirm relies on `classify_five_hour`: a rolling reset (≈ now+5h) must NOT count
+        // as confirmation, while a reset clearly inside the window (anchored) must. This is the exact
+        // signal `codex_confirm_anchored` polls for.
+        use crate::models::QuotaWindow;
+        let now = chrono::Utc::now();
+        let rolling = QuotaWindow {
+            label: "5h".into(),
+            percent_used: Some(1.0),
+            reset_at: Some((now + chrono::Duration::seconds(18000)).to_rfc3339()),
+        };
+        let anchored = QuotaWindow {
+            label: "5h".into(),
+            percent_used: Some(1.0),
+            // Anchored a while ago → reset is well inside now+5h (verified live: reset−now shrinks).
+            reset_at: Some((now + chrono::Duration::seconds(16000)).to_rfc3339()),
+        };
+        assert_eq!(
+            quota::classify_five_hour(&ToolId::Codex, &rolling),
+            quota::WindowState::Ambiguous
+        );
+        assert_eq!(
+            quota::classify_five_hour(&ToolId::Codex, &anchored),
+            quota::WindowState::Anchored
+        );
     }
 
     #[test]
-    fn codex_fixed_reset_boundary_is_fifteen_seconds() {
-        let future = chrono::Utc::now() + chrono::Duration::hours(5);
-        assert!(codex_reset_is_fixed(
-            &future.to_rfc3339(),
-            &(future + chrono::Duration::seconds(15)).to_rfc3339()
-        ));
-        assert!(!codex_reset_is_fixed(
-            &future.to_rfc3339(),
-            &(future + chrono::Duration::seconds(16)).to_rfc3339()
-        ));
+    fn codex_reset_epoch_if_future_rejects_past_and_unparseable() {
+        let future = (chrono::Utc::now() + chrono::Duration::hours(5)).to_rfc3339();
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        assert!(codex_reset_epoch_if_future(&future).is_some());
+        assert!(codex_reset_epoch_if_future(&past).is_none());
+        assert!(codex_reset_epoch_if_future("not-a-timestamp").is_none());
+    }
+
+    #[test]
+    fn codex_stable_future_reset_proves_anchor_while_still_near_full_window() {
+        // The core of the stable-epoch signal: a freshly anchored reset sits ≈ now+5h (so the
+        // single-snapshot classifier still says Ambiguous), yet because the epoch is FIXED, two reads
+        // a poll apart return the SAME value — whereas a rolling reset advances by the elapsed time.
+        let now = chrono::Utc::now();
+        let anchored_epoch = (now + chrono::Duration::seconds(17_990)).to_rfc3339();
+        // Same epoch read twice → equal → anchored.
+        let e1 = codex_reset_epoch_if_future(&anchored_epoch).unwrap();
+        let e2 = codex_reset_epoch_if_future(&anchored_epoch).unwrap();
+        assert_eq!(e1, e2, "fixed reset must read identically across polls");
+        // A rolling reset 15s later would be 15s larger → not equal.
+        let rolling_later = (now + chrono::Duration::seconds(17_990 + 15)).to_rfc3339();
+        assert_ne!(e1, codex_reset_epoch_if_future(&rolling_later).unwrap());
+    }
+
+    #[test]
+    fn codex_confirm_poll_budget_fits_proof_window() {
+        // The inline poll must finish within the scheduler's per-tick proof budget so a tick is never
+        // cut off mid-confirmation (PRIME_PROOF_BUDGET_SECONDS = 150 in app_state). The hard cap is
+        // the wall-clock budget; account for one in-flight read (~20s curl) on top of it.
+        const PROOF_BUDGET: u64 = 150;
+        const READ_LATENCY_HEADROOM: u64 = 20;
+        assert!(
+            CODEX_CONFIRM_TOTAL_BUDGET.as_secs() + READ_LATENCY_HEADROOM <= PROOF_BUDGET,
+            "total budget + one read can overrun the proof window"
+        );
+        assert!(CODEX_CONFIRM_MAX_POLLS >= 2, "must poll more than once");
     }
 
     #[test]

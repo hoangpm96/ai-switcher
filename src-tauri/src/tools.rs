@@ -1160,7 +1160,7 @@ pub(crate) fn common_bin_dirs() -> Vec<PathBuf> {
     ]
 }
 
-fn current_username() -> String {
+pub(crate) fn current_username() -> String {
     std::env::var("USER")
         .ok()
         .filter(|value| !value.is_empty())

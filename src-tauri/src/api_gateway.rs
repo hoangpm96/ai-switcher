@@ -1161,11 +1161,7 @@ fn build_claude_request(
     // (Cline, scripts, Codex-translated requests) can use a Claude subscription account.
     ensure_claude_code_system(&mut body);
     let config_dir = account_config_dir(&state.store, data, account);
-    let binary = data
-        .tool_setups
-        .get(ToolId::Claude.as_str())
-        .and_then(|setup| setup.binary_path.as_deref());
-    let Some(token) = crate::quota::claude_oauth_token_fresh(&config_dir, binary) else {
+    let Some(token) = crate::quota::claude_oauth_token_fresh(&config_dir) else {
         return Err(api_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -1340,7 +1336,7 @@ pub fn discover_account_models(
 ) -> ApiGatewayModelRegistry {
     let config_dir = account_config_dir(store, data, account);
     let result = match account.tool_id {
-        ToolId::Claude => discover_claude_models(&config_dir, binary),
+        ToolId::Claude => discover_claude_models(&config_dir),
         ToolId::Codex => discover_codex_models(&config_dir, binary),
         ToolId::Antigravity => Err(anyhow::anyhow!(
             "Antigravity is not supported by the API gateway"
@@ -1368,8 +1364,8 @@ pub fn discover_account_models(
     }
 }
 
-fn discover_claude_models(config_dir: &FsPath, binary: Option<&FsPath>) -> Result<Vec<String>> {
-    let token = crate::quota::claude_oauth_token_fresh(config_dir, binary)
+fn discover_claude_models(config_dir: &FsPath) -> Result<Vec<String>> {
+    let token = crate::quota::claude_oauth_token_fresh(config_dir)
         .context("Claude OAuth token is missing or expired")?;
     let version = crate::quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());
     let value = reqwest::blocking::Client::builder()
