@@ -367,6 +367,17 @@ export interface PrimeNowDone {
   message: string;
 }
 
+/** A leftover profile directory from a deleted account, surfaced by "Clean up old account data". */
+export interface OrphanAccountDir {
+  toolId: ToolId;
+  id: string;
+  path: string;
+  sizeBytes: number;
+  sizeLabel: string;
+  /** True when the dir was modified recently — likely a live CLI session is using it. */
+  inUse: boolean;
+}
+
 export interface StartApiGatewayInput {
   bindHost: string;
   port: number;

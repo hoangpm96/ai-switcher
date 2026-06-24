@@ -2424,3 +2424,111 @@ button.danger:hover:not(:disabled) {
 .autoStatsTable th:first-child {
   font-variant-numeric: tabular-nums;
 }
+
+.orphanCleanup {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.orphanScan {
+  align-items: center;
+  align-self: flex-start;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 13px;
+  gap: 7px;
+  padding: 8px 13px;
+}
+
+.orphanScan:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.orphanScan:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.orphanList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.orphanHint {
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: 0 0 4px;
+}
+
+.orphanHint strong {
+  color: var(--red);
+}
+
+.orphanRow {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 10px 12px;
+}
+
+.orphanInfo {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.orphanId {
+  color: var(--text-1, #f3ece2);
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.orphanMeta {
+  color: var(--text-3);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.orphanInUse {
+  color: var(--red);
+  font-weight: 600;
+}
+
+.orphanDelete {
+  align-items: center;
+  background: transparent;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--red);
+  cursor: pointer;
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 12.5px;
+  gap: 6px;
+  padding: 6px 11px;
+}
+
+.orphanDelete:hover:not(:disabled) {
+  background: var(--red-soft);
+  border-color: var(--red);
+}
+
+.orphanDelete:disabled {
+  cursor: default;
+  opacity: 0.55;
+}

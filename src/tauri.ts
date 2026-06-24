@@ -11,6 +11,7 @@ import type {
   CreateVirtualApiAccountInput,
   AutoPrimeDayStat,
   ConfirmExtendInput,
+  OrphanAccountDir,
   PrimeNowInput,
   PrimeNowResult,
   SaveApiGatewayComboInput,
@@ -224,6 +225,12 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   }
   if (command === "get_auto_prime_stats") {
     return [] as T;
+  }
+  if (command === "list_orphan_account_dirs") {
+    return [] as T;
+  }
+  if (command === "delete_orphan_account_dir") {
+    return undefined as T;
   }
   if (command === "open_auto_prime_log" || command === "open_auto_prime_log_folder") {
     return undefined as T;
@@ -487,6 +494,9 @@ export const api = {
   primeNow: (input: PrimeNowInput) => invoke<PrimeNowResult>("prime_now", { input }),
   getAutoPrimeLog: () => invoke<string>("get_auto_prime_log"),
   getAutoPrimeStats: () => invoke<AutoPrimeDayStat[]>("get_auto_prime_stats"),
+  listOrphanAccountDirs: () => invoke<OrphanAccountDir[]>("list_orphan_account_dirs"),
+  deleteOrphanAccountDir: (toolId: ToolId, id: string) =>
+    invoke<void>("delete_orphan_account_dir", { toolId, id }),
   openAutoPrimeLog: () => invoke<void>("open_auto_prime_log"),
   openAutoPrimeLogFolder: () => invoke<void>("open_auto_prime_log_folder"),
   wakeHelperStatus: () => invoke<boolean>("wake_helper_status"),

@@ -9,6 +9,7 @@ import {
   ChevronDown,
   CircleHelp,
   Copy,
+  HardDrive,
   Info,
   KeyRound,
   Layers,
@@ -51,6 +52,7 @@ import type {
   ConfigCandidate,
   CreateApiGatewayKeyInput,
   DetectionReport,
+  OrphanAccountDir,
   PrimeNowDone,
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
@@ -575,6 +577,7 @@ export function App() {
           <SettingsView
             snapshot={snapshot}
             busy={busy !== null}
+            notify={notify}
             onSetup={(toolId) => {
               setSelectedTool(toolId);
               setDialog("setup");
@@ -808,11 +811,13 @@ export function App() {
 function SettingsView({
   snapshot,
   busy,
+  notify,
   onSetup,
   onAutoSwitchChange,
 }: {
   snapshot: AppSnapshot;
   busy: boolean;
+  notify: (text: string, kind?: "success" | "error" | "info") => void;
   onSetup: (toolId: ToolId) => void;
   onAutoSwitchChange: (toolId: ToolId, enabled: boolean, threshold: number) => void;
 }) {
@@ -863,8 +868,106 @@ function SettingsView({
             );
           })}
         </div>
+
+        <div className="settingsSection">
+          <div className="settingsSectionHead">
+            <HardDrive />
+            <div>
+              <strong>Storage</strong>
+              <small>Reclaim disk from accounts you've removed.</small>
+            </div>
+          </div>
+          <OrphanCleanup notify={notify} />
+        </div>
       </div>
     </section>
+  );
+}
+
+/** Lists leftover profile folders from removed accounts and lets the user delete each one. */
+function OrphanCleanup({
+  notify,
+}: {
+  notify: (text: string, kind?: "success" | "error" | "info") => void;
+}) {
+  const [orphans, setOrphans] = useState<OrphanAccountDir[] | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [deleting, setDeleting] = useState<string | null>(null);
+
+  async function scan() {
+    setScanning(true);
+    try {
+      setOrphans(await api.listOrphanAccountDirs());
+    } catch (err) {
+      notify(errorMessage(err), "error");
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function remove(orphan: OrphanAccountDir) {
+    if (orphan.inUse) {
+      const ok = window.confirm(
+        `Thư mục "${orphan.id}" vừa được dùng gần đây — có thể một phiên CLI đang chạy. Vẫn xóa?`,
+      );
+      if (!ok) return;
+    }
+    setDeleting(orphan.path);
+    try {
+      await api.deleteOrphanAccountDir(orphan.toolId, orphan.id);
+      setOrphans((current) => current?.filter((o) => o.path !== orphan.path) ?? null);
+      notify(`Đã xóa dữ liệu cũ: ${orphan.id} (${orphan.sizeLabel})`, "success");
+    } catch (err) {
+      notify(errorMessage(err), "error");
+    } finally {
+      setDeleting(null);
+    }
+  }
+
+  return (
+    <div className="orphanCleanup">
+      <button className="orphanScan" onClick={() => void scan()} disabled={scanning}>
+        {scanning ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />} Quét dữ liệu cũ
+      </button>
+
+      {orphans !== null &&
+        (orphans.length === 0 ? (
+          <p className="orphanHint">Không có dữ liệu tài khoản cũ để dọn.</p>
+        ) : (
+          <div className="orphanList">
+            <p className="orphanHint">
+              Thư mục của tài khoản đã xóa khỏi app. Xóa để lấy lại dung lượng. Mục đánh dấu
+              <strong> đang dùng</strong> có thể thuộc một phiên CLI đang chạy — cân nhắc trước khi
+              xóa.
+            </p>
+            {orphans.map((orphan) => (
+              <div className="orphanRow" key={orphan.path}>
+                <div className="orphanInfo">
+                  <span className="orphanId">
+                    {orphan.toolId} · {orphan.id}
+                  </span>
+                  <span className="orphanMeta">
+                    {orphan.sizeLabel}
+                    {orphan.inUse && <span className="orphanInUse"> · đang dùng</span>}
+                  </span>
+                </div>
+                <button
+                  className="orphanDelete"
+                  onClick={() => void remove(orphan)}
+                  disabled={deleting === orphan.path}
+                >
+                  {deleting === orphan.path ? (
+                    <Loader2 className="spin" size={14} />
+                  ) : (
+                    <Trash2 size={14} />
+                  )}{" "}
+                  Xóa
+                </button>
+              </div>
+            ))}
+          </div>
+        ))}
+    </div>
   );
 }
 

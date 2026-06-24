@@ -121,20 +121,102 @@ impl ManagedState {
                 }
             }
 
-            // Clean up orphan profile dirs (not managed by any account).
-            let tool_root = self.store.account_dir(&tool_id, "");
-            if let Ok(entries) = std::fs::read_dir(&tool_root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() && !valid_dirs.contains(&path) {
-                        let _ = std::fs::remove_dir_all(&path);
-                    }
-                }
-            }
+            // NOTE: orphan profile dirs (a folder under accounts/{tool}/ with no matching account)
+            // are deliberately NOT auto-deleted. A dir can be missing from our account list yet still
+            // be a LIVE Claude/Codex profile that another CLI session uses directly via
+            // CLAUDE_CONFIG_DIR/CODEX_HOME (verified: such a dir kept being recreated mid-session with
+            // fresh transcripts). Silently `remove_dir_all`-ing it would destroy that session's data.
+            // Cleanup is now opt-in via the "Clean up old account data" action, which surfaces each
+            // dir's size and an in-use warning before the user confirms.
         }
         if changed {
             let _ = install_shell_hook(&self.store);
         }
+    }
+
+    /// List leftover profile directories under `accounts/{tool}/` that belong to no current account.
+    /// Read-only: it never deletes. Each entry carries its on-disk size and an `in_use` flag (a
+    /// recently-modified transcript ⇒ a live CLI session is probably using it) so the UI can warn.
+    pub fn list_orphan_account_dirs(&self) -> Result<Vec<crate::models::OrphanAccountDir>> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        let mut orphans = Vec::new();
+        for tool_id in [ToolId::Claude, ToolId::Codex] {
+            // Dirs we must never offer to delete: every managed account's profile dir, plus the
+            // configured default config dir if it happens to live under the tool root.
+            let mut protected: Vec<std::path::PathBuf> = data
+                .accounts
+                .iter()
+                .filter(|a| a.tool_id == tool_id && !a.is_default)
+                .map(|a| self.store.account_dir(&tool_id, &a.id))
+                .collect();
+            if let Some(default_dir) = configured_default_config_dir(&data, &tool_id) {
+                protected.push(default_dir);
+            }
+            let tool_root = self.store.account_dir(&tool_id, "");
+            let Ok(entries) = std::fs::read_dir(&tool_root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() || protected.contains(&path) {
+                    continue;
+                }
+                let size_bytes = dir_size_bytes(&path);
+                orphans.push(crate::models::OrphanAccountDir {
+                    tool_id: tool_id.clone(),
+                    id: entry.file_name().to_string_lossy().to_string(),
+                    path: path.to_string_lossy().to_string(),
+                    size_bytes,
+                    size_label: human_size(size_bytes),
+                    in_use: dir_recently_active(&path),
+                });
+            }
+        }
+        Ok(orphans)
+    }
+
+    /// Delete one orphan profile directory, identified by its directory NAME (the former account id),
+    /// not a full path — so a crafted absolute path or `..` can never escape the tool root. The name
+    /// must be a single, non-traversal component; the resolved dir must not belong to a managed
+    /// account or be the configured default config dir.
+    pub fn delete_orphan_account_dir(&self, tool_id: ToolId, id: String) -> Result<()> {
+        // A profile dir name is a single path component (an account UUID). Reject anything that could
+        // traverse: separators, `.`/`..`, or an absolute/parent-bearing path.
+        if id.is_empty()
+            || id == "."
+            || id == ".."
+            || id.contains('/')
+            || id.contains('\\')
+            || std::path::Path::new(&id).components().count() != 1
+        {
+            anyhow::bail!("ID thư mục không hợp lệ.");
+        }
+        let target = self.store.account_dir(&tool_id, &id);
+        {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let is_managed = data.accounts.iter().any(|a| {
+                a.tool_id == tool_id
+                    && !a.is_default
+                    && self.store.account_dir(&tool_id, &a.id) == target
+            });
+            let is_default = configured_default_config_dir(&data, &tool_id)
+                .is_some_and(|default_dir| default_dir == target);
+            if is_managed || is_default {
+                anyhow::bail!("Thư mục này đang được sử dụng — không xóa.");
+            }
+        }
+        if !target.is_dir() {
+            anyhow::bail!("Không tìm thấy thư mục.");
+        }
+        std::fs::remove_dir_all(&target)
+            .map_err(|e| anyhow::anyhow!("Không xóa được thư mục: {e}"))?;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> Result<AppSnapshot> {
@@ -3396,6 +3478,78 @@ fn account_config_dir_with_default(
 
 fn resolved_default_config_dir(data: &StoredState, tool_id: &ToolId) -> std::path::PathBuf {
     configured_default_config_dir(data, tool_id).unwrap_or_else(|| default_config_dir(tool_id))
+}
+
+/// Total size of a directory tree in bytes (best-effort; unreadable entries are skipped). Follows
+/// real files only — symlinked shared stores (e.g. `projects` → `~/.claude/projects`) are not
+/// followed, so an orphan dir's size reflects only its own on-disk data, not the shared store.
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.path().symlink_metadata() else {
+            continue;
+        };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            continue; // don't follow symlinks (shared stores) or count their target
+        } else if file_type.is_dir() {
+            total += dir_size_bytes(&entry.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// Whether a profile dir looks like it's being used by a live CLI session right now: any real file
+/// under it modified within the last few minutes. Used only to warn before deletion — never to block.
+fn dir_recently_active(path: &std::path::Path) -> bool {
+    const RECENT_SECS: u64 = 10 * 60;
+    fn newest_mtime_within(path: &std::path::Path, cutoff: std::time::SystemTime) -> bool {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.file_type().is_dir() {
+                if newest_mtime_within(&entry.path(), cutoff) {
+                    return true;
+                }
+            } else if meta.modified().is_ok_and(|m| m >= cutoff) {
+                return true;
+            }
+        }
+        false
+    }
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(RECENT_SECS);
+    newest_mtime_within(path, cutoff)
+}
+
+/// Format a byte count as a short human-readable size (e.g. "4.0 KB", "12.3 MB").
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn configured_default_config_dir(

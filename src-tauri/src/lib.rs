@@ -234,6 +234,27 @@ fn get_auto_prime_stats(state: State<'_, ManagedState>) -> Vec<models::AutoPrime
     state.auto_prime_stats(14)
 }
 
+/// List leftover profile directories from deleted accounts (read-only; surfaces size + in-use).
+#[tauri::command]
+fn list_orphan_account_dirs(
+    state: State<'_, ManagedState>,
+) -> Result<Vec<models::OrphanAccountDir>, String> {
+    state.list_orphan_account_dirs().map_err(display_error)
+}
+
+/// Delete one orphan profile directory the user picked in "Clean up old account data".
+/// Identified by directory name (the former account id), never a full path.
+#[tauri::command]
+fn delete_orphan_account_dir(
+    state: State<'_, ManagedState>,
+    tool_id: ToolId,
+    id: String,
+) -> Result<(), String> {
+    state
+        .delete_orphan_account_dir(tool_id, id)
+        .map_err(display_error)
+}
+
 /// Whether the pmset wake helper LaunchDaemon is installed (so the Mac can wake itself to prime).
 #[tauri::command]
 fn wake_helper_status() -> bool {
@@ -468,6 +489,8 @@ pub fn run() {
             prime_now,
             get_auto_prime_log,
             get_auto_prime_stats,
+            list_orphan_account_dirs,
+            delete_orphan_account_dir,
             open_auto_prime_log,
             open_auto_prime_log_folder,
             wake_helper_status,

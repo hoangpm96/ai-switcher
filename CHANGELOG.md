@@ -5,6 +5,25 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.14] - 2026-06-24
+
+### Added
+
+- **"Clean up old account data" in the Auto Session tab.** Lists leftover profile folders from
+  accounts you've removed, with each folder's size and an "in use" warning when it was modified
+  recently (likely a running CLI session). You delete each one explicitly — nothing is removed
+  automatically.
+
+### Fixed
+
+- **Stopped automatically deleting leftover account folders on startup.** A folder that isn't in the
+  app's account list can still be a live profile another CLI session uses directly, so silently
+  removing it could destroy that session's data. Cleanup is now opt-in via the action above.
+- **Preserve data when linking an account into the shared store.** Turning an account's real
+  transcript/memory folder into a shared link now moves it aside first and only discards it once
+  every file is confirmed present in the shared store — closing a window where a file could be lost
+  to a concurrent write or a name collision.
+
 ## [0.5.13] - 2026-06-24
 
 ### Fixed

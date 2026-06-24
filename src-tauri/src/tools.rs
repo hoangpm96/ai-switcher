@@ -424,11 +424,38 @@ fn link_shared_entry(
         link.is_dir() && fs::symlink_metadata(&link).is_ok_and(|m| !m.file_type().is_symlink());
     if is_real_dir {
         if target.exists() || merge_dirs {
-            merge_dir_into(&link, &target);
-        } else {
-            let _ = fs::rename(&link, &target);
+            // Rename the real dir aside FIRST, then merge from the stable snapshot. The rename is
+            // atomic, so a CLI writing into `link` concurrently either landed before the move (its
+            // data is in the snapshot) or lands after the symlink is created (it follows the symlink
+            // into the shared store). Without this, a write between "copy" and "remove" — or a file
+            // that collided and was skipped during copy — would be destroyed by `remove_dir_all`.
+            // Append a suffix to the FULL name (not `with_extension`, which would mangle a dotted
+            // name like `foo.bar` into `foo.migrating`).
+            let stash = {
+                let mut name = link.file_name().unwrap_or_default().to_os_string();
+                name.push(".migrating");
+                link.with_file_name(name)
+            };
+            let _ = fs::remove_dir_all(&stash); // clear a leftover stash from an interrupted run
+            if fs::rename(&link, &stash).is_ok() {
+                merge_dir_into(&stash, &target);
+                // Only discard the stash once everything in it also exists in the shared store, so a
+                // collision-skipped file is never silently lost; otherwise keep it for recovery.
+                if dir_contents_all_present_in(&stash, &target) {
+                    let _ = fs::remove_dir_all(&stash);
+                }
+            }
+        } else if fs::rename(&link, &target).is_err() {
+            // Target's parent may be missing on a first move; create it and retry, else fall back to
+            // a copy-merge so we still establish the symlink rather than abandoning the dir.
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::rename(&link, &target).is_err() {
+                merge_dir_into(&link, &target);
+                let _ = fs::remove_dir_all(&link);
+            }
         }
-        let _ = fs::remove_dir_all(&link);
     } else if link.is_file()
         && fs::symlink_metadata(&link).is_ok_and(|m| !m.file_type().is_symlink())
     {
@@ -472,12 +499,49 @@ fn merge_dir_into(source: &Path, target: &Path) {
     for entry in entries.flatten() {
         let from = entry.path();
         let to = target.join(entry.file_name());
-        if from.is_dir() {
+        // Use symlink_metadata so a symlink inside `source` is copied/skipped as a link, never
+        // followed — a symlink pointing at `..` or `/` would otherwise recurse without bound.
+        let Ok(meta) = from.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        } else if meta.file_type().is_dir() {
             merge_dir_into(&from, &to);
         } else if !to.exists() {
             let _ = fs::copy(&from, &to);
         }
     }
+}
+
+/// Whether every file in `source` now exists at the matching path under `target` — i.e. the merge
+/// lost nothing and `source` is safe to delete. A collision-skipped file present in both still
+/// counts as present; a `source`-only file that failed to copy makes this false so the stash is kept.
+///
+/// Fails CLOSED: any read/metadata error returns false so the stash is preserved rather than deleting
+/// data we couldn't verify was copied. Symlinks count as present (they aren't followed during merge,
+/// so we don't require their target to exist).
+fn dir_contents_all_present_in(source: &Path, target: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(source) else {
+        return false; // can't verify → keep the stash
+    };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let Ok(meta) = from.symlink_metadata() else {
+            return false; // can't verify this entry → keep the stash
+        };
+        if meta.file_type().is_symlink() {
+            continue; // not merged (links aren't followed); don't demand the target exists
+        } else if meta.file_type().is_dir() {
+            if !dir_contents_all_present_in(&from, &to) {
+                return false;
+            }
+        } else if !to.exists() {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(unix)]

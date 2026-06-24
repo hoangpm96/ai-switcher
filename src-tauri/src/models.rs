@@ -725,6 +725,27 @@ pub struct PrimeNowDone {
     pub message: String,
 }
 
+/// A leftover profile directory under `accounts/{tool}/` that belongs to no current account — e.g.
+/// an account deleted from the app, or a profile another CLI session uses directly. Surfaced by the
+/// "Clean up old account data" action so the user can reclaim disk, with an in-use warning so a live
+/// profile isn't deleted by accident.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanAccountDir {
+    pub tool_id: ToolId,
+    /// The directory name (the former account id).
+    pub id: String,
+    /// Absolute path on disk.
+    pub path: String,
+    /// Total size in bytes.
+    pub size_bytes: u64,
+    /// Human-readable size (e.g. "4.0 KB", "12.3 MB").
+    pub size_label: String,
+    /// True if the dir looks actively used — recently modified transcripts — so deleting it would
+    /// likely disrupt a running CLI session. The UI warns and does not pre-select these.
+    pub in_use: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum DetectionSource {
