@@ -32,8 +32,10 @@ pub struct ManagedState {
     /// on-disk state before saving, because the GUI may remain alive while macOS launches them.
     headless: bool,
     /// True while a prime batch is running, so the per-minute scheduler tick doesn't start a
-    /// second overlapping batch (a single attempt can block for minutes on send retries).
-    pub priming: std::sync::atomic::AtomicBool,
+    /// second overlapping batch (a single attempt can block for minutes on send retries). An `Arc`
+    /// so a backgrounded manual prime can move a clear-on-drop guard into its worker thread without
+    /// a raw pointer (see `PrimingGuard`).
+    pub priming: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ManagedState {
@@ -60,7 +62,7 @@ impl ManagedState {
             data: Mutex::new(data),
             api_server: Mutex::new(server),
             headless,
-            priming: std::sync::atomic::AtomicBool::new(false),
+            priming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         if headless {
             return Ok(managed);
@@ -757,14 +759,26 @@ impl ManagedState {
     }
 
     pub fn refresh_tool(&self, tool_id: ToolId, app: Option<&AppHandle>) -> Result<AppSnapshot> {
-        // Phase 1: collect (account_id, config_dir) — brief lock, no HTTP.
-        let accounts_info: Vec<(String, std::path::PathBuf)> = {
+        // Phase 1: collect (account_id, config_dir) — brief lock, no HTTP, no disk I/O.
+        // Also collect the dirs that may need their shared session link healed; the filesystem work
+        // runs AFTER the lock is dropped so a slow disk never blocks the UI or other commands.
+        let (accounts_info, heal_targets): (
+            Vec<(String, std::path::PathBuf)>,
+            Vec<std::path::PathBuf>,
+        ) = {
             let data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             let default_config_dir = resolved_default_config_dir(&data, &tool_id);
-            data.accounts
+            let heal_targets = data
+                .accounts
+                .iter()
+                .filter(|a| a.tool_id == tool_id && !a.is_default && a.api_provider.is_none())
+                .map(|a| self.store.account_dir(&tool_id, &a.id))
+                .collect();
+            let accounts_info = data
+                .accounts
                 .iter()
                 .filter(|a| {
                     a.tool_id == tool_id
@@ -777,9 +791,30 @@ impl ManagedState {
                         account_config_dir_with_default(&self.store, a, &default_config_dir),
                     )
                 })
-                .collect()
+                .collect();
+            (accounts_info, heal_targets)
         };
-        // Mutex released — HTTP calls run in parallel without blocking other operations.
+        // Mutex released — disk I/O + HTTP calls run without blocking other operations.
+
+        // Self-heal the shared session link for each managed account (outside the lock). An account
+        // whose `projects/` (Claude) / `sessions/` (Codex) is still a real directory — created but
+        // never switched into — keeps its memory/transcripts to itself instead of the shared store,
+        // so memory saved while using it is invisible to other accounts. `link_shared_sessions_to` is
+        // idempotent (a no-op once the symlink already points at the shared target), so this cheaply
+        // guarantees a newly-added account shares memory without waiting for a switch, login, or app
+        // restart. (Config links stay on the login/heal paths — they don't carry memory and shouldn't
+        // churn on every periodic refresh.)
+        if let Some(configured_default) = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            configured_default_config_dir(&data, &tool_id)
+        } {
+            for dir in &heal_targets {
+                crate::tools::link_shared_sessions_to(&tool_id, dir, &configured_default);
+            }
+        }
 
         // Phase 2: fetch all quotas in parallel (no mutex held).
         let results: Vec<(String, QuotaInfo)> = {
@@ -1624,7 +1659,7 @@ impl ManagedState {
                 self.0.store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        let _guard = ClearOnDrop(&self.priming);
+        let _guard = ClearOnDrop(&self.priming); // Arc<AtomicBool> derefs to &AtomicBool
 
         // The GUI scheduler and the LaunchDaemon are separate processes. Serialize complete prime
         // batches so both cannot observe the same due slot and send twice. After acquiring the lock,
@@ -2140,7 +2175,6 @@ impl ManagedState {
         app: Option<&AppHandle>,
     ) -> Result<crate::models::PrimeNowResult> {
         use crate::models::{PendingPrimeAttempt, PrimeAttemptPhase};
-        use crate::prime::PrimeOutcome;
         use fs2::FileExt;
         use std::sync::atomic::Ordering;
 
@@ -2185,13 +2219,10 @@ impl ManagedState {
         {
             anyhow::bail!("Đang có một lượt prime khác chạy — thử lại sau giây lát.");
         }
-        struct ClearOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
-        impl Drop for ClearOnDrop<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let _guard = ClearOnDrop(&self.priming);
+        // The overlap guard holds a clone of the `Arc<AtomicBool>`, so it can move into the background
+        // worker and outlive this function. `priming` is reset exactly once when the guard drops — on
+        // an early return here, or when the worker thread finishes.
+        let _guard = PrimingGuard::new(self);
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -2212,7 +2243,7 @@ impl ManagedState {
             });
         }
         let anchor_at = now();
-        let mut manual_attempt = PendingPrimeAttempt {
+        let manual_attempt = PendingPrimeAttempt {
             version: 1,
             account_id: job.account_id.clone(),
             tool_id: job.tool_id.clone(),
@@ -2239,6 +2270,57 @@ impl ManagedState {
             .attempts
             .insert(job.account_id.clone(), manual_attempt.clone());
         self.store.save_prime_runtime(&runtime)?;
+
+        // The send+confirm step blocks for up to ~90s (the confirm poll). Run it on a background
+        // thread so the button returns immediately; the final result is delivered via the
+        // `prime-now-done` event. The overlap guard (`_guard`) and exclusive file lock (`lock_file`)
+        // move into the worker so they stay held for the whole operation and release when it ends.
+        // The synchronous fallback (no app handle — headless/tests) keeps the original blocking
+        // behaviour.
+        if let Some(app) = app {
+            let app = app.clone();
+            let account_id = job.account_id.clone();
+            std::thread::spawn(move || {
+                let _guard = _guard;
+                let _lock_file = lock_file;
+                let state = app.state::<ManagedState>();
+                let result = state
+                    .run_manual_prime(job, runtime, manual_attempt, Some(&app))
+                    .unwrap_or_else(|error| crate::models::PrimeNowResult {
+                        kind: "error".to_string(),
+                        message: error.to_string(),
+                    });
+                let _ = app.emit(
+                    "prime-now-done",
+                    crate::models::PrimeNowDone {
+                        account_id,
+                        kind: result.kind,
+                        message: result.message,
+                    },
+                );
+            });
+            return Ok(crate::models::PrimeNowResult {
+                kind: "pending".to_string(),
+                message: "Đang mở phiên mới…".to_string(),
+            });
+        }
+
+        self.run_manual_prime(job, runtime, manual_attempt, None)
+    }
+
+    /// Blocking core of a manual prime: send "hi" once, confirm, then record the outcome. Returns the
+    /// human-facing result. Split out so `prime_now` can run it on a background thread (GUI) or inline
+    /// (headless). Caller holds the overlap guard + file lock for the duration.
+    fn run_manual_prime(
+        &self,
+        job: PrimeJob,
+        mut runtime: crate::models::PrimeRuntimeState,
+        mut manual_attempt: crate::models::PendingPrimeAttempt,
+        app: Option<&AppHandle>,
+    ) -> Result<crate::models::PrimeNowResult> {
+        use crate::models::PrimeAttemptPhase;
+        use crate::prime::PrimeOutcome;
+
         // Keep the Mac awake for the duration (the prime itself also holds caffeinate; this covers
         // the whole on-demand op for symmetry).
         let _awake = CaffeinateHold::active();
@@ -4107,6 +4189,23 @@ fn seconds_until(iso: &str) -> i64 {
     }
 }
 
+/// RAII reset of the `priming` overlap flag. Holds a clone of the `Arc<AtomicBool>`, so it is plainly
+/// `Send` and can move into a backgrounded manual-prime worker to hold the flag for the whole
+/// send+confirm and release it (exactly once) when the worker finishes — or on any early return.
+struct PrimingGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl PrimingGuard {
+    fn new(state: &ManagedState) -> Self {
+        PrimingGuard(std::sync::Arc::clone(&state.priming))
+    }
+}
+
+impl Drop for PrimingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// An RAII `caffeinate -i -w <pid>` hold that prevents idle system sleep until dropped. Kept alive
 /// for the duration of one scheduler tick that bridges the wait to a deferred prime, so the Mac
 /// can't idle-sleep in the gap between a pmset wake and the prime. Drop kills + reaps the child (no
@@ -4267,7 +4366,7 @@ mod tests {
             store,
             data: Mutex::new(data),
             headless: true,
-            priming: std::sync::atomic::AtomicBool::new(false),
+            priming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

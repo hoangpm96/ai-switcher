@@ -51,6 +51,7 @@ import type {
   ConfigCandidate,
   CreateApiGatewayKeyInput,
   DetectionReport,
+  PrimeNowDone,
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
   SetToolSetupInput,
@@ -264,6 +265,18 @@ export function App() {
       void unlisten.then((fn) => fn());
     };
   }, [load]);
+
+  // A backgrounded "Prime ngay" finished → clear its spinner and toast the final result.
+  useEffect(() => {
+    const unlisten = listen<PrimeNowDone>("prime-now-done", (event) => {
+      const { accountId, kind, message } = event.payload;
+      setBusy((current) => (current === `prime:${accountId}` ? null : current));
+      notify(message, kind);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [notify]);
 
   useEffect(() => {
     if (!snapshot.disclaimerAccepted || dialog) return;
@@ -676,13 +689,19 @@ export function App() {
                           toolId: currentTool.id,
                           accountId: account.id,
                         });
-                        // The backend emits auto-prime-changed → snapshot re-pulls itself; just toast.
+                        // "pending" = the prime runs in the background; keep the spinner and wait for
+                        // the `prime-now-done` event to clear it + toast the final result. Any other
+                        // kind is a synchronous outcome (early reject / headless): toast + clear now.
+                        if (res.kind === "pending") {
+                          notify(res.message, "info");
+                          return;
+                        }
                         // Pass the backend's kind straight through: "success" (new window), "info"
                         // (window still running — a Hold, neutral, not an error), "error" (failure).
                         notify(res.message, res.kind);
+                        setBusy(null);
                       } catch (err) {
                         notify(errorMessage(err), "error");
-                      } finally {
                         setBusy(null);
                       }
                     }}

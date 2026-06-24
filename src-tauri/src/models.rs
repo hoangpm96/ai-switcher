@@ -296,12 +296,19 @@ impl Default for ApiGatewaySnapshot {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaWindow {
     pub label: String,
     pub percent_used: Option<f64>,
     pub reset_at: Option<String>,
+    /// Whether the provider reports this window as currently active. Backend-only confirm signal
+    /// for Claude (parsed from `limits[kind == "session"].is_active`): it flips to `true` the moment
+    /// a fresh 5h window opens, before `reset_at` propagates to a new value. `None` when the provider
+    /// doesn't report it (Codex/Antigravity, or older Claude payloads). Skipped from serialization so
+    /// the frontend `QuotaWindow` type is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -339,13 +346,11 @@ impl QuotaInfo {
         Self {
             five_hour: QuotaWindow {
                 label: "5-hour limit".to_string(),
-                percent_used: None,
-                reset_at: None,
+                ..Default::default()
             },
             weekly: QuotaWindow {
                 label: "Weekly limit".to_string(),
-                percent_used: None,
-                reset_at: None,
+                ..Default::default()
             },
             models: None,
             plan: None,
@@ -706,6 +711,16 @@ pub struct PrimeNowInput {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrimeNowResult {
+    pub kind: String,
+    pub message: String,
+}
+
+/// Payload of the `prime-now-done` event: the final outcome of a manual prime that ran on a
+/// background thread. `account_id` lets the UI match it to the button that started it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrimeNowDone {
+    pub account_id: String,
     pub kind: String,
     pub message: String,
 }

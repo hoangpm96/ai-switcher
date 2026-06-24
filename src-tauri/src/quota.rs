@@ -1,12 +1,11 @@
 use crate::models::{QuotaInfo, QuotaWindow, ToolId};
 use crate::tools::home_dir;
 use anyhow::{Context, Result};
-use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Claude invocation used for background OAuth refreshes and primes.
@@ -35,11 +34,6 @@ pub(crate) const CLAUDE_BACKGROUND_ARGS: &[&str] = &[
     "--prompt-suggestions",
     "false",
 ];
-
-/// Claude Code's public OAuth token endpoint + client id, used to refresh an account's access token
-/// via a `refresh_token` grant without spawning the CLI (which would trigger macOS folder prompts).
-const CLAUDE_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LiveQuotaError {
@@ -222,9 +216,7 @@ fn parse_rfc3339_epoch(reset_at: &str) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 static CLAUDE_CACHE: Mutex<BTreeMap<String, (Instant, QuotaInfo)>> = Mutex::new(BTreeMap::new());
-static CLAUDE_RECOVERY: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
 const CLAUDE_CACHE_TTL: Duration = Duration::from_secs(60);
-const CLAUDE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 /// Drop the cached Claude quota for one config dir so the next `read_quota` re-fetches.
 /// Auto-prime's confirmation re-check needs the fresh `resets_at` right after sending "hi",
@@ -260,22 +252,11 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
             ],
         )
     };
-    let body = match request(&token) {
-        Ok(body) => body,
-        Err(error)
-            if claude_usage_needs_token_refresh(&error)
-                && claim_claude_recovery(&cache_key)
-                && refresh_claude_oauth(config_dir) =>
-        {
-            // A 401/429 can mean the cached access token went stale even though its stored expiresAt
-            // still looked valid. Force an OAuth refresh (HTTP refresh-token grant + keychain
-            // write-back), then retry the usage endpoint exactly once with the new token.
-            let refreshed = claude_oauth_token(config_dir)
-                .context("Claude OAuth refresh did not persist a token")?;
-            request(&refreshed)?
-        }
-        Err(error) => return Err(error),
-    };
+    // A 401/429 here means the stored access token has expired. We deliberately do NOT refresh it
+    // ourselves — rotating the one-time-use refresh token would invalidate a live `claude` session on
+    // this account (see `claude_oauth_token_fresh`). Surface the error so the UI shows an "open Claude
+    // Code to refresh" hint; the token gets renewed, conflict-free, the next time the CLI runs.
+    let body = request(&token)?;
 
     let value: serde_json::Value =
         serde_json::from_str(&body).context("Claude usage response is not JSON")?;
@@ -288,8 +269,9 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
 }
 
 fn quota_from_claude_usage(value: &serde_json::Value) -> Result<QuotaInfo> {
-    let five_hour = claude_window("5-hour limit", value.get("five_hour"));
-    let weekly = claude_window("Weekly limit", value.get("seven_day"));
+    let session_active = claude_session_is_active(value);
+    let five_hour = claude_window("5-hour limit", value.get("five_hour"), session_active);
+    let weekly = claude_window("Weekly limit", value.get("seven_day"), None);
 
     if five_hour.percent_used.is_none() && weekly.percent_used.is_none() {
         anyhow::bail!("Claude usage has no utilization");
@@ -326,7 +308,11 @@ fn claude_plan(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn claude_window(label: &str, value: Option<&serde_json::Value>) -> QuotaWindow {
+fn claude_window(
+    label: &str,
+    value: Option<&serde_json::Value>,
+    is_active: Option<bool>,
+) -> QuotaWindow {
     let percent_used = value
         .and_then(|w| w.get("utilization"))
         .and_then(serde_json::Value::as_f64);
@@ -338,7 +324,21 @@ fn claude_window(label: &str, value: Option<&serde_json::Value>) -> QuotaWindow 
         label: label.to_string(),
         percent_used,
         reset_at,
+        is_active,
     }
+}
+
+/// `limits[]` carries one entry per window kind, each with its own `is_active`. The 5h window is the
+/// `kind == "session"` entry; its `is_active` flips to `true` the moment a fresh window opens (before
+/// `five_hour.resets_at` propagates a new value), which is the signal the prime confirm polls for.
+fn claude_session_is_active(value: &serde_json::Value) -> Option<bool> {
+    value
+        .get("limits")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|entry| entry.get("kind").and_then(serde_json::Value::as_str) == Some("session"))?
+        .get("is_active")
+        .and_then(serde_json::Value::as_bool)
 }
 
 pub(crate) fn claude_oauth_token(config_dir: &Path) -> Option<String> {
@@ -351,149 +351,23 @@ pub(crate) fn claude_oauth_token(config_dir: &Path) -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(crate) fn claude_oauth_token_fresh(config_dir: &Path) -> Option<String> {
-    let raw = claude_credentials_blob(config_dir)?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let expires_at = value
-        .get("claudeAiOauth")
-        .and_then(|oauth| oauth.get("expiresAt"))
-        .and_then(serde_json::Value::as_i64);
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    if expires_at.is_some_and(|expiry| expiry <= now_ms + 300_000) {
-        // Refresh the OAuth token directly over HTTP (the same refresh-token grant the CLI performs),
-        // then write the rotated credential back to the keychain. We deliberately do NOT spawn the
-        // `claude` CLI here: launching it as a child of the GUI .app makes macOS attribute the CLI's
-        // protected-folder preflight (Desktop/Documents/Downloads) to AI Account Switcher and pop a
-        // TCC prompt — even under --safe-mode with every tool/context source disabled. An HTTP
-        // refresh touches only the network + keychain, so it never triggers a folder prompt.
-        let _ = refresh_claude_oauth(config_dir);
-    }
-    claude_oauth_token(config_dir)
-}
-
-/// Refreshes an account's Claude OAuth token over HTTP and writes the rotated credential back to
-/// wherever it was read from (keychain entry or `.credentials.json`). Returns true on success.
+/// Returns the account's current Claude access token WITHOUT refreshing it.
 ///
-/// Uses the `refreshToken` already stored in the credential blob against Claude Code's public OAuth
-/// token endpoint. The response rotates the access token (and usually the refresh token); we merge
-/// the new values into the existing blob so unrelated fields (scopes, subscriptionType,
-/// organizationUuid, mcpOAuth) are preserved.
-fn refresh_claude_oauth(config_dir: &Path) -> bool {
-    // Serialize refreshes so concurrent callers for the same expired account don't each fire a
-    // refresh-token grant: the first rotates the token, and any racing grant with the now-consumed
-    // old token would 400. Mirrors Codex's REFRESH_LOCK. The first holder reads the blob, refreshes,
-    // and writes back; later holders re-read inside the lock and, finding a fresh token, skip the
-    // network call. (A single global lock is enough — refreshes are rare and brief.)
-    static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let Ok(_guard) = REFRESH_LOCK.get_or_init(|| Mutex::new(())).lock() else {
-        return false;
-    };
-
-    let Some((source, raw)) = claude_credentials_source(config_dir) else {
-        return false;
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    // Double-checked: a racing caller may have just refreshed while we waited for the lock, leaving a
-    // token that is no longer near expiry. Skip the redundant (and rotation-consuming) grant.
-    let still_fresh = value
-        .get("claudeAiOauth")
-        .and_then(|oauth| oauth.get("expiresAt"))
-        .and_then(serde_json::Value::as_i64)
-        .is_some_and(|expiry| expiry > chrono::Utc::now().timestamp_millis() + 300_000);
-    if still_fresh {
-        return true;
-    }
-    let Some(refresh_token) = value
-        .get("claudeAiOauth")
-        .and_then(|oauth| oauth.get("refreshToken"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-    else {
-        return false;
-    };
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-    let response = client
-        .post(CLAUDE_OAUTH_TOKEN_URL)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLAUDE_OAUTH_CLIENT_ID,
-        }))
-        .send()
-        .ok()
-        .and_then(|resp| resp.error_for_status().ok())
-        .and_then(|resp| resp.json::<serde_json::Value>().ok());
-    let Some(response) = response else {
-        return false;
-    };
-
-    let Some(new_access) = response
-        .get("access_token")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return false;
-    };
-    let Some(oauth) = value
-        .get_mut("claudeAiOauth")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return false;
-    };
-    oauth.insert(
-        "accessToken".to_string(),
-        serde_json::Value::String(new_access.to_string()),
-    );
-    if let Some(new_refresh) = response
-        .get("refresh_token")
-        .and_then(serde_json::Value::as_str)
-    {
-        oauth.insert(
-            "refreshToken".to_string(),
-            serde_json::Value::String(new_refresh.to_string()),
-        );
-    }
-    // `expires_in` is seconds-from-now; the blob stores `expiresAt` as epoch milliseconds.
-    if let Some(expires_in) = response.get("expires_in").and_then(serde_json::Value::as_i64) {
-        let expires_at = chrono::Utc::now().timestamp_millis() + expires_in * 1000;
-        oauth.insert(
-            "expiresAt".to_string(),
-            serde_json::Value::Number(expires_at.into()),
-        );
-    }
-
-    let Ok(encoded) = serde_json::to_string(&value) else {
-        return false;
-    };
-    write_claude_credentials(&source, &encoded)
-}
-
-fn claude_usage_needs_token_refresh(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("HTTP 401") || message.contains("HTTP 429")
-}
-
-fn claim_claude_recovery(cache_key: &str) -> bool {
-    let Ok(mut attempts) = CLAUDE_RECOVERY.lock() else {
-        return false;
-    };
-    if attempts
-        .get(cache_key)
-        .is_some_and(|last| last.elapsed() < CLAUDE_RECOVERY_COOLDOWN)
-    {
-        return false;
-    }
-    attempts.insert(cache_key.to_string(), Instant::now());
-    true
+/// We deliberately never refresh+rotate the OAuth token ourselves. Anthropic's refresh-token grant
+/// is one-time-use: rotating it would consume the refresh token that a live `claude` CLI session
+/// (using this same account) still holds, so its next request would 401 with "Please run /login" —
+/// and a partial write could even strand the account. Keeping the OAuth lifecycle entirely with
+/// Claude Code means switching accounts never invalidates a logged-in session.
+///
+/// Consequence: if an account sits unused past its ~8h access-token lifetime, our quota read for it
+/// will 401 until the user next opens Claude Code on that account (which refreshes the token through
+/// the CLI's own, conflict-free path). The UI surfaces that as a "open Claude Code to refresh" hint
+/// rather than a hard error.
+///
+/// (Kept as a distinct name from `claude_oauth_token` so call sites read intentionally; both now do
+/// the same read-only thing.)
+pub(crate) fn claude_oauth_token_fresh(config_dir: &Path) -> Option<String> {
+    claude_oauth_token(config_dir)
 }
 
 /// Claude's keychain suffix for a config dir = `sha256(path)[:8]` (hex).
@@ -508,101 +382,27 @@ pub fn claude_keychain_suffix(config_dir: &Path) -> String {
         .collect()
 }
 
-/// Where an account's Claude credential lives, so a refreshed blob can be written back to the
-/// exact same place it was read from (keychain entry or per-dir file).
-enum ClaudeCredSource {
-    Keychain { service: String, account: String },
-    File(PathBuf),
-}
-
-/// Locates an account's Claude credential and returns its current blob plus where it lives.
+/// Gets Claude's JSON credential blob for a specific config dir. Read-only — we never write the
+/// keychain back (the OAuth lifecycle stays entirely with Claude Code; see `claude_oauth_token_fresh`).
 ///
 /// Order: (1) per-dir keychain by hash (Claude 2.x) → (2) the `.credentials.json` file inside the
 /// config dir itself (older versions stored a per-dir file) → (3) ONLY when it is the default dir
 /// `~/.claude`: try the old global keychain name. Do NOT fall back to the global one for a profile
 /// dir, to avoid reading the wrong account's token.
-fn claude_credentials_source(config_dir: &Path) -> Option<(ClaudeCredSource, String)> {
-    let suffix = claude_keychain_suffix(config_dir);
-    let per_dir_service = format!("Claude Code-credentials-{suffix}");
-    if let Some((account, blob)) = read_keychain_entry(&per_dir_service) {
-        return Some((
-            ClaudeCredSource::Keychain {
-                service: per_dir_service,
-                account,
-            },
-            blob,
-        ));
-    }
-
-    let file = config_dir.join(".credentials.json");
-    if let Some(blob) = read_file_blob(&file) {
-        return Some((ClaudeCredSource::File(file), blob));
-    }
-
-    if config_dir == home_dir().join(".claude") {
-        if let Some((account, blob)) = read_keychain_entry("Claude Code-credentials") {
-            return Some((
-                ClaudeCredSource::Keychain {
-                    service: "Claude Code-credentials".to_string(),
-                    account,
-                },
-                blob,
-            ));
-        }
-    }
-
-    None
-}
-
-/// Gets Claude's JSON credential for a specific config dir (blob only).
 fn claude_credentials_blob(config_dir: &Path) -> Option<String> {
-    claude_credentials_source(config_dir).map(|(_, blob)| blob)
-}
-
-/// Writes a credential blob back to wherever it was read from, updating the same service/account in
-/// place so Claude Code itself keeps reading it.
-///
-/// Keychain writes go through the `keyring` crate's native API rather than `security
-/// add-generic-password -w <blob>`: the latter would expose the full OAuth token as a process
-/// argument (visible to every user via `ps`), and a wrong account name would create a DUPLICATE
-/// entry instead of updating the existing one. `set_password` on an `Entry` keyed by the exact
-/// service+account upserts the one item without leaking the secret to argv.
-fn write_claude_credentials(source: &ClaudeCredSource, blob: &str) -> bool {
-    match source {
-        ClaudeCredSource::Keychain { service, account } => {
-            let Ok(entry) = keyring::Entry::new(service, account) else {
-                return false;
-            };
-            // The grant rotates the refresh token server-side, so a lost write would strand the
-            // account until re-login. Retry a few times to ride out a transient keychain lock before
-            // giving up (after which the next read still has the old, possibly-now-invalid token).
-            for attempt in 0..3 {
-                if entry.set_password(blob).is_ok() {
-                    return true;
-                }
-                if attempt < 2 {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-            false
-        }
-        ClaudeCredSource::File(path) => {
-            // Match the keychain path's atomicity: write a temp file then rename, preserving perms.
-            let temporary = path.with_extension("json.tmp");
-            if std::fs::write(&temporary, blob).is_err() {
-                return false;
-            }
-            let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-            if std::fs::rename(&temporary, path).is_err() {
-                let _ = std::fs::remove_file(&temporary);
-                return false;
-            }
-            if let Some(permissions) = permissions {
-                let _ = std::fs::set_permissions(path, permissions);
-            }
-            true
+    let suffix = claude_keychain_suffix(config_dir);
+    if let Some(blob) = read_keychain_blob(&format!("Claude Code-credentials-{suffix}")) {
+        return Some(blob);
+    }
+    if let Some(blob) = read_file_blob(&config_dir.join(".credentials.json")) {
+        return Some(blob);
+    }
+    if config_dir == home_dir().join(".claude") {
+        if let Some(blob) = read_keychain_blob("Claude Code-credentials") {
+            return Some(blob);
         }
     }
+    None
 }
 
 fn read_keychain_blob(service: &str) -> Option<String> {
@@ -613,29 +413,6 @@ fn read_keychain_blob(service: &str) -> Option<String> {
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|blob| !blob.is_empty())
-}
-
-/// Reads a keychain entry's account name AND password blob. The account is needed to update the
-/// same entry in place (`add-generic-password -U -a <account>`); falls back to the current macOS
-/// user (the name Claude Code uses for its per-profile entries) if the attribute can't be parsed.
-fn read_keychain_entry(service: &str) -> Option<(String, String)> {
-    let blob = read_keychain_blob(service)?;
-    // Attribute dump (no `-w`) prints `"acct"<blob>="<name>"`. Parse it; fall back to the macOS user.
-    let account = Command::new("security")
-        .args(["find-generic-password", "-s", service])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| parse_keychain_account(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_else(crate::tools::current_username);
-    Some((account, blob))
-}
-
-/// Extracts the `acct` attribute value from `security find-generic-password` attribute output.
-fn parse_keychain_account(dump: &str) -> Option<String> {
-    let line = dump.lines().find(|line| line.contains("\"acct\""))?;
-    let value = line.split('=').nth(1)?.trim().trim_matches('"');
-    (!value.is_empty() && value != "<NULL>").then(|| value.to_string())
 }
 
 fn read_file_blob(path: &Path) -> Option<String> {
@@ -861,6 +638,7 @@ fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo>
             label,
             percent_used: Some(((1.0 - remaining) * 100.0).clamp(0.0, 100.0)),
             reset_at,
+            is_active: None,
         });
     }
 
@@ -883,11 +661,13 @@ fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo>
             label: "5-hour limit".to_string(),
             percent_used: worst.percent_used,
             reset_at: worst.reset_at.clone(),
+            is_active: None,
         },
         weekly: QuotaWindow {
             label: "Weekly limit".to_string(),
             percent_used: None,
             reset_at: None,
+            is_active: None,
         },
         models: Some(models),
         plan,
@@ -985,68 +765,24 @@ fn read_codex_usage_endpoint(config_dir: &Path) -> Result<QuotaInfo> {
     quota_from_codex_endpoint(&value)
 }
 
+/// Returns the account's current Codex access token from `auth.json`, WITHOUT refreshing it.
+///
+/// Same principle as `claude_oauth_token_fresh`: we never run the refresh-token grant or rewrite
+/// `auth.json` ourselves. OpenAI's grant rotates the refresh token, so doing it here would consume
+/// the token a live `codex` session still holds and could log that account out. The Codex CLI owns
+/// the refresh lifecycle (it re-reads `auth.json` per run). Codex access tokens last ~8 days, so an
+/// account essentially never goes stale between uses; if one does, its quota reads as unavailable
+/// until the next `codex` run renews the token.
+///
+/// (Kept as a distinct name so call sites read intentionally; it is now a plain read.)
 pub(crate) fn codex_access_token_fresh(config_dir: &Path) -> Option<String> {
-    static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = REFRESH_LOCK.get_or_init(|| Mutex::new(())).lock().ok()?;
-    let path = config_dir.join("auth.json");
-    let raw = std::fs::read_to_string(&path).ok()?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let tokens = value.get("tokens")?;
-    let access_token = tokens.get("access_token")?.as_str()?.to_string();
-    if jwt_expiry(&access_token).is_none_or(|expiry| expiry > chrono::Utc::now().timestamp() + 300)
-    {
-        return Some(access_token);
-    }
-
-    let refresh_token = tokens.get("refresh_token")?.as_str()?.to_string();
-    let response = reqwest::blocking::Client::new()
-        .post("https://auth.openai.com/oauth/token")
-        .form(&[
-            ("client_id", "app_EMoamEEZ73f0CkXaXp7hrann"),
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
-        ])
-        .send()
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json::<serde_json::Value>()
-        .ok()?;
-    let new_access = response.get("access_token")?.as_str()?.to_string();
-    let tokens = value.get_mut("tokens")?.as_object_mut()?;
-    tokens.insert(
-        "access_token".to_string(),
-        serde_json::Value::String(new_access.clone()),
-    );
-    for field in ["refresh_token", "id_token"] {
-        if let Some(new_value) = response.get(field).and_then(serde_json::Value::as_str) {
-            tokens.insert(
-                field.to_string(),
-                serde_json::Value::String(new_value.to_string()),
-            );
-        }
-    }
-    value["last_refresh"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
-    let encoded = serde_json::to_vec_pretty(&value).ok()?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, encoded).ok()?;
-    let permissions = std::fs::metadata(&path).ok().map(|meta| meta.permissions());
-    std::fs::rename(&temporary, &path).ok()?;
-    if let Some(permissions) = permissions {
-        let _ = std::fs::set_permissions(&path, permissions);
-    }
-    Some(new_access)
-}
-
-fn jwt_expiry(token: &str) -> Option<i64> {
-    let payload = token.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    serde_json::from_slice::<serde_json::Value>(&decoded)
-        .ok()?
-        .get("exp")?
-        .as_i64()
+    let raw = std::fs::read_to_string(config_dir.join("auth.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("tokens")?
+        .get("access_token")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 pub(crate) fn codex_account_id(config_dir: &Path) -> Option<String> {
@@ -1066,13 +802,11 @@ fn quota_from_codex_endpoint(value: &serde_json::Value) -> Result<QuotaInfo> {
 
     let mut five_hour = QuotaWindow {
         label: "5-hour limit".to_string(),
-        percent_used: None,
-        reset_at: None,
+        ..Default::default()
     };
     let mut weekly = QuotaWindow {
         label: "Weekly limit".to_string(),
-        percent_used: None,
-        reset_at: None,
+        ..Default::default()
     };
 
     for key in ["primary_window", "secondary_window"] {
@@ -1204,13 +938,11 @@ fn last_rate_limits_in(text: &str) -> Option<serde_json::Value> {
 fn quota_from_codex_rate_limits(limits: &serde_json::Value) -> Result<QuotaInfo> {
     let mut five_hour = QuotaWindow {
         label: "5-hour limit".to_string(),
-        percent_used: None,
-        reset_at: None,
+        ..Default::default()
     };
     let mut weekly = QuotaWindow {
         label: "Weekly limit".to_string(),
-        percent_used: None,
-        reset_at: None,
+        ..Default::default()
     };
 
     for key in ["primary", "secondary"] {
@@ -1350,6 +1082,7 @@ mod tests {
             label: "5-hour limit".to_string(),
             percent_used: Some(1.0),
             reset_at: Some(reset.to_rfc3339()),
+            is_active: None,
         }
     }
 
@@ -1399,8 +1132,7 @@ mod tests {
             five_hour,
             weekly: QuotaWindow {
                 label: "Weekly limit".to_string(),
-                percent_used: None,
-                reset_at: None,
+                ..Default::default()
             },
             models: None,
             plan: None,
@@ -1414,7 +1146,7 @@ mod tests {
         QuotaWindow {
             label: "5-hour limit".to_string(),
             percent_used: Some(0.0),
-            reset_at: None,
+            ..Default::default()
         }
     }
 
@@ -1457,6 +1189,7 @@ mod tests {
             label: "5-hour limit".to_string(),
             percent_used: Some(50.0),
             reset_at: Some("not-a-timestamp".to_string()),
+            is_active: None,
         };
         let quota = quota_with(bad, None);
         assert_eq!(prime_available_for(&ToolId::Claude, &quota), None);
@@ -1464,6 +1197,7 @@ mod tests {
             label: "5-hour limit".to_string(),
             percent_used: Some(50.0),
             reset_at: Some("not-a-timestamp".to_string()),
+            is_active: None,
         };
         let quota2 = quota_with(bad2, None);
         assert_eq!(prime_available_for(&ToolId::Codex, &quota2), None);
@@ -1475,8 +1209,7 @@ mod tests {
         // is historical usage metadata and may be non-zero or omitted.
         let missing = QuotaWindow {
             label: "5-hour limit".to_string(),
-            percent_used: None,
-            reset_at: None,
+            ..Default::default()
         };
         let quota = quota_with(missing, None);
         assert_eq!(prime_available_for(&ToolId::Claude, &quota), Some(true));
@@ -1484,43 +1217,17 @@ mod tests {
         let non_zero = QuotaWindow {
             label: "5-hour limit".to_string(),
             percent_used: Some(12.0),
-            reset_at: None,
+            ..Default::default()
         };
         let quota = quota_with(non_zero, None);
         assert_eq!(prime_available_for(&ToolId::Claude, &quota), Some(true));
     }
 
     #[test]
-    fn claude_usage_recovery_only_handles_auth_or_rate_limit_statuses() {
-        assert!(claude_usage_needs_token_refresh(&anyhow::anyhow!(
-            "HTTP 401"
-        )));
-        assert!(claude_usage_needs_token_refresh(&anyhow::anyhow!(
-            "HTTP 429"
-        )));
-        assert!(!claude_usage_needs_token_refresh(&anyhow::anyhow!(
-            "HTTP 500"
-        )));
-        assert!(!claude_usage_needs_token_refresh(&anyhow::anyhow!(
-            "network timeout"
-        )));
-    }
-
-    #[test]
-    fn claude_usage_recovery_is_cooled_down_per_profile() {
-        let first = format!("profile-{}", uuid::Uuid::new_v4());
-        let second = format!("profile-{}", uuid::Uuid::new_v4());
-        assert!(claim_claude_recovery(&first));
-        assert!(!claim_claude_recovery(&first));
-        assert!(claim_claude_recovery(&second));
-    }
-
-    #[test]
     fn codex_null_reset_without_zero_used_is_unknown() {
         let missing2 = QuotaWindow {
             label: "5-hour limit".to_string(),
-            percent_used: None,
-            reset_at: None,
+            ..Default::default()
         };
         let quota2 = quota_with(missing2, None);
         assert_eq!(prime_available_for(&ToolId::Codex, &quota2), None);
@@ -1646,16 +1353,5 @@ mod tests {
 
         assert_eq!(codex_account_id(&dir).as_deref(), Some("acct_123"));
         let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn reads_jwt_expiry_without_exposing_token_data() {
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"exp":1893456000,"sub":"account"}"#);
-        assert_eq!(
-            jwt_expiry(&format!("header.{payload}.signature")),
-            Some(1_893_456_000)
-        );
-        assert_eq!(jwt_expiry("not-a-jwt"), None);
     }
 }

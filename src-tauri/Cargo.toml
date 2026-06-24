@@ -1,6 +1,6 @@
 [package]
 name = "ai-account-switcher"
-version = "0.5.12"
+version = "0.5.13"
 description = "Desktop account manager for AI coding tools"
 authors = ["Hoang Phan"]
 edition = "2021"

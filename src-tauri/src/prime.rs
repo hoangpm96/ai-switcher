@@ -27,9 +27,22 @@ const CLAUDE_CODE_SYSTEM_PREAMBLE: &str =
 /// Delay used only when a caller explicitly asks one bounded invocation to retry. Durable
 /// scheduled retries are orchestrated by app_state and persisted in prime-runtime.json.
 pub const SEND_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
-/// Confirm-retry policy (D4): after a 2xx send, re-read the live window until `reset_at` moves.
-pub const CONFIRM_MAX_TRIES: u32 = 5;
-pub const CONFIRM_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Claude confirm (D4): after a 2xx send, poll the live window until it proves a freshly anchored
+/// session. Two signals (preferred → fallback):
+///   1. `limits[kind == "session"].is_active == true` with a future `reset_at` — the provider flips
+///      this the moment the new 5h window opens, BEFORE `reset_at` settles to a new value. Fast and
+///      reliable. (D2 only sends when no real window was anchored, so an active session here is the
+///      one our "hi" just opened.)
+///   2. `reset_at` moved to a new future value vs the pre-send baseline — the original signal, kept as
+///      a fallback for payloads that don't carry `is_active`.
+///
+/// Read FIRST, then sleep only if not yet confirmed, so the common "opened instantly" case returns in
+/// one read instead of after a fixed delay. Bounded by a max poll count AND a wall-clock budget (each
+/// read is a ~1s HTTP call) so a confirmation never overruns the scheduler's per-tick proof budget
+/// (`PRIME_PROOF_BUDGET_SECONDS`). On give-up the scheduler's 5-minute retry loop re-confirms.
+pub const CONFIRM_MAX_TRIES: u32 = 8;
+pub const CONFIRM_RETRY_DELAY: Duration = Duration::from_secs(10);
+pub const CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(90);
 /// Codex confirm (D4): after a 2xx send, poll the live window until it reads as a clearly-anchored
 /// real session, tolerating a still-rolling reset or a transient read failure. The poll is bounded by
 /// BOTH a max poll count AND a hard wall-clock budget — each `read_live_five_hour` makes a `curl` call
@@ -102,6 +115,7 @@ pub fn prime_account_with_hook(
         Err(_) => return PrimeOutcome::SkipUnknownState,
     };
     let before_reset = before.reset_at.clone();
+    let before_active = before.is_active;
     let state = quota::classify_five_hour(tool_id, &before);
     match state {
         // A real anchored window is running → don't pile a prime into it. `Anchored` is only
@@ -167,19 +181,73 @@ pub fn prime_account_with_hook(
             None => PrimeOutcome::FailUnconfirmed,
         };
     }
-    for _ in 0..CONFIRM_MAX_TRIES {
-        sleeper(CONFIRM_RETRY_DELAY);
-        if let Ok(window) = quota::read_live_five_hour(tool_id, config_dir) {
-            if let Some(new_reset) = &window.reset_at {
-                if window_moved(before_reset.as_deref(), new_reset) {
-                    return PrimeOutcome::Success {
-                        new_reset_at: new_reset.clone(),
-                    };
-                }
+    match claude_confirm_anchored(config_dir, before_reset.as_deref(), before_active, &mut sleeper) {
+        Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
+        None => PrimeOutcome::FailUnconfirmed,
+    }
+}
+
+/// Poll the Claude 5h window until it proves a freshly anchored session, or the inline budget runs
+/// out. See `CONFIRM_MAX_TRIES` for the two success signals and the read-first rationale. Returns the
+/// new window's `reset_at` on success.
+fn claude_confirm_anchored(
+    config_dir: &Path,
+    baseline_reset_at: Option<&str>,
+    baseline_active: Option<bool>,
+    mut sleeper: impl FnMut(Duration),
+) -> Option<String> {
+    let started = std::time::Instant::now();
+    for poll in 0..CONFIRM_MAX_TRIES {
+        if poll > 0 {
+            // Stop before a sleep that would push us past the wall-clock budget (each read below also
+            // makes an HTTP call), then take one final read after the loop is no longer worth sleeping.
+            if started.elapsed() + CONFIRM_RETRY_DELAY >= CONFIRM_TOTAL_BUDGET {
+                break;
             }
+            sleeper(CONFIRM_RETRY_DELAY);
+        }
+        if let Some(reset_at) = claude_anchored_reset(config_dir, baseline_reset_at, baseline_active)
+        {
+            return Some(reset_at);
+        }
+        if started.elapsed() >= CONFIRM_TOTAL_BUDGET {
+            break;
         }
     }
-    PrimeOutcome::FailUnconfirmed
+    None
+}
+
+/// One read of the Claude window → `Some(reset_at)` if it proves a freshly anchored session.
+fn claude_anchored_reset(
+    config_dir: &Path,
+    baseline_reset_at: Option<&str>,
+    baseline_active: Option<bool>,
+) -> Option<String> {
+    let window = quota::read_live_five_hour(&ToolId::Claude, config_dir).ok()?;
+    let reset_at = window.reset_at?;
+    claude_reset_confirms(baseline_reset_at, baseline_active, &reset_at, window.is_active)
+        .then_some(reset_at)
+}
+
+/// Whether a Claude window read proves a session that THIS prime freshly opened.
+///
+/// Signal 1 — newly active: the session is now active with a future reset AND it was NOT already
+/// active before we sent (`baseline_active != Some(true)`). The transition is what proves our "hi"
+/// opened the window; an already-active baseline with an unmoved reset must NOT count, or clicking
+/// "Prime now" on a still-running window would falsely report a fresh window and persist the old
+/// reset. (D2 already HOLDs a clearly-anchored window upstream; this is defense in depth so the
+/// predicate is correct regardless of caller — e.g. the crash-resume path.)
+/// Signal 2 — reset moved: the reset advanced to a new future value vs the pre-send baseline. This
+/// stands on its own (a moved reset is unambiguous proof) even if `is_active` is absent.
+fn claude_reset_confirms(
+    baseline: Option<&str>,
+    baseline_active: Option<bool>,
+    reset_at: &str,
+    is_active: Option<bool>,
+) -> bool {
+    let newly_active =
+        is_active == Some(true) && baseline_active != Some(true) && is_future(reset_at);
+    newly_active || window_moved(baseline, reset_at)
 }
 
 /// Poll the Codex 5h window until it proves a real anchored session, or the inline budget runs out.
@@ -262,16 +330,13 @@ pub fn confirm_active_session(
 ) -> PrimeOutcome {
     match tool_id {
         ToolId::Claude => {
-            let Ok(window) = quota::read_live_five_hour(tool_id, config_dir) else {
-                return PrimeOutcome::SkipUnknownState;
-            };
-            match window.reset_at {
-                Some(reset_at) if claude_reset_confirms(baseline_reset_at, &reset_at) => {
-                    PrimeOutcome::Success {
-                        new_reset_at: reset_at,
-                    }
-                }
-                _ => PrimeOutcome::FailUnconfirmed,
+            // Same anchored-session poll as the inline D4 path (newly-active session OR a moved
+            // reset). A `Confirming` marker only exists because a send happened, which only happens
+            // after D2 confirmed no window was anchored — so the baseline was inactive. Passing
+            // `Some(false)` lets the newly-active signal count without risking a false positive.
+            match claude_confirm_anchored(config_dir, baseline_reset_at, Some(false), &mut sleeper) {
+                Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
+                None => PrimeOutcome::FailUnconfirmed,
             }
         }
         ToolId::Codex => {
@@ -286,10 +351,6 @@ pub fn confirm_active_session(
         }
         ToolId::Antigravity => PrimeOutcome::SkipUnknownState,
     }
-}
-
-fn claude_reset_confirms(baseline: Option<&str>, candidate: &str) -> bool {
-    is_future(candidate) && baseline.is_none_or(|before| before != candidate)
 }
 
 /// Keeps the Mac awake (no idle sleep) for as long as it is alive, by holding a child
@@ -629,12 +690,14 @@ mod tests {
             label: "5h".into(),
             percent_used: Some(1.0),
             reset_at: Some((now + chrono::Duration::seconds(18000)).to_rfc3339()),
+            is_active: None,
         };
         let anchored = QuotaWindow {
             label: "5h".into(),
             percent_used: Some(1.0),
             // Anchored a while ago → reset is well inside now+5h (verified live: reset−now shrinks).
             reset_at: Some((now + chrono::Duration::seconds(16000)).to_rfc3339()),
+            is_active: None,
         };
         assert_eq!(
             quota::classify_five_hour(&ToolId::Codex, &rolling),
@@ -686,12 +749,61 @@ mod tests {
     }
 
     #[test]
-    fn claude_resume_requires_reset_movement_from_baseline() {
+    fn claude_confirm_accepts_newly_active_session_or_moved_reset() {
         let baseline = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let same = baseline.clone();
         let moved = (chrono::Utc::now() + chrono::Duration::hours(5)).to_rfc3339();
-        assert!(!claude_reset_confirms(Some(&baseline), &baseline));
-        assert!(claude_reset_confirms(Some(&baseline), &moved));
-        assert!(claude_reset_confirms(None, &moved)); // valid empty precheck
+        let past = "2000-01-01T00:00:00Z";
+
+        // Signal 1 (newly active): inactive-before → active-now with a future reset confirms even when
+        // the reset value hasn't changed yet — the case the old reset-must-move check missed.
+        assert!(claude_reset_confirms(
+            Some(&baseline),
+            Some(false),
+            &same,
+            Some(true)
+        ));
+        // Unknown baseline active state also counts as "not already active".
+        assert!(claude_reset_confirms(Some(&baseline), None, &same, Some(true)));
+
+        // P0 GUARD: already-active before + unmoved reset must NOT confirm — otherwise priming a
+        // still-running window would falsely report a fresh one and persist the stale reset.
+        assert!(!claude_reset_confirms(
+            Some(&baseline),
+            Some(true),
+            &same,
+            Some(true)
+        ));
+
+        // Active flag only counts with a future reset (a stale flag on a past reset is not live).
+        assert!(!claude_reset_confirms(None, Some(false), past, Some(true)));
+
+        // Signal 2 (fallback): reset moved to a new future value — stands alone, even if it was
+        // already active before and `is_active` is absent now.
+        assert!(claude_reset_confirms(Some(&baseline), Some(true), &moved, None));
+        assert!(claude_reset_confirms(None, None, &moved, Some(false))); // valid empty precheck
+
+        // Neither signal: inactive/unknown and the reset didn't move → not confirmed.
+        assert!(!claude_reset_confirms(
+            Some(&baseline),
+            Some(false),
+            &same,
+            Some(false)
+        ));
+        assert!(!claude_reset_confirms(Some(&baseline), None, &same, None));
+    }
+
+    #[test]
+    fn claude_confirm_budget_fits_proof_window() {
+        // The whole inline confirm must finish inside the scheduler's per-tick proof budget
+        // (PRIME_PROOF_BUDGET_SECONDS = 150 in app_state), leaving headroom for the HTTP reads.
+        const PROOF_BUDGET: u64 = 150;
+        const READ_LATENCY_HEADROOM: u64 = 20;
+        assert!(
+            CONFIRM_TOTAL_BUDGET.as_secs() + READ_LATENCY_HEADROOM <= PROOF_BUDGET,
+            "Claude confirm budget must fit the scheduler proof window"
+        );
+        assert!(CONFIRM_MAX_TRIES >= 2, "must poll more than once");
     }
 
     #[test]

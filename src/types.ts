@@ -351,7 +351,18 @@ export interface PrimeNowInput {
 }
 
 export interface PrimeNowResult {
-  /** "success" = new window opened; "info" = nothing wrong, no new window yet; "error" = failure. */
+  /**
+   * "success" = new window opened; "info" = nothing wrong, no new window yet; "error" = failure;
+   * "pending" = the prime is running in the background — the final result arrives via the
+   * `prime-now-done` event.
+   */
+  kind: "success" | "info" | "error" | "pending";
+  message: string;
+}
+
+/** Payload of the `prime-now-done` event: the final result of a backgrounded manual prime. */
+export interface PrimeNowDone {
+  accountId: string;
   kind: "success" | "info" | "error";
   message: string;
 }

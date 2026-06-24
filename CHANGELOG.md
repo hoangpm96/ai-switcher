@@ -5,6 +5,38 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.13] - 2026-06-24
+
+### Fixed
+
+- **No more "Please run /login" (401) when switching Claude accounts.** Reading an account's quota
+  no longer refreshes its OAuth token. Since v0.5.12 the app refreshed near-expiry tokens itself and
+  wrote the rotated credential back to the keychain — but OAuth refresh tokens are single-use, so
+  rotating one invalidated the token a live Claude Code session on that account still held, forcing a
+  re-login (the account's stored credential could even be left with an empty refresh token). The app
+  is now strictly read-only for tokens: it reads the current access token and never refreshes,
+  rotates, or writes credentials. Claude Code owns the token lifecycle, so switching accounts can no
+  longer log a session out. The same read-only change applies to Codex (whose ~8-day tokens made the
+  bug rare but possible). Trade-off: an account left unused past its access-token lifetime shows its
+  quota as unavailable until you next open its CLI, which renews the token conflict-free.
+- **"Prime now" returns instantly instead of spinning for up to ~2.5 minutes.** The button used to
+  block while the whole send-and-confirm ran (the confirmation polling alone could sleep that long).
+  It now starts the prime in the background, returns immediately, and reports the final result via a
+  notification when it completes.
+- **Claude prime confirmation is faster and more reliable.** Confirmation now treats the usage
+  endpoint's active-session signal (a window that just transitioned to active) as proof the window
+  opened, instead of waiting for the reset timestamp to change — which the provider can take many
+  minutes to report, occasionally causing a scheduled prime to miss its deadline. It reads first and
+  only sleeps if not yet confirmed, so the common "opened instantly" case returns in about a second.
+  Priming an account whose window is still running correctly reports the existing window rather than a
+  false new one.
+
+### Changed
+
+- **Newly added accounts share memory and chat history immediately.** The shared-store link for an
+  account's transcripts/memory is now ensured on every refresh, so an account that was created but
+  never switched into no longer keeps its memory to itself until the next switch, login, or restart.
+
 ## [0.5.12] - 2026-06-23
 
 ### Fixed

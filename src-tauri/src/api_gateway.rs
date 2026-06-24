@@ -2618,11 +2618,13 @@ mod tests {
                 label: "5-hour limit".to_string(),
                 percent_used: Some(five),
                 reset_at: None,
+                is_active: None,
             },
             weekly: QuotaWindow {
                 label: "Weekly limit".to_string(),
                 percent_used: Some(weekly),
                 reset_at: None,
+                is_active: None,
             },
             models: None,
             plan: None,
