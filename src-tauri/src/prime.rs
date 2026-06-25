@@ -100,8 +100,24 @@ pub fn prime_account_with_hook(
     // at function exit (any return path). No-op when caffeinate is missing (non-macOS / stripped).
     let _awake = CaffeinateGuard::start();
 
-    // D1 — token must be valid.
-    if read_token(tool_id, config_dir).is_none() {
+    // D1 — token must be valid AND not expired. For Claude, renew an expired access token first:
+    // the prime runs at an early-morning hour when no `claude` CLI session is using the account, so
+    // rotating the one-time-use refresh token here is safe (the daytime UI quota path must NOT do
+    // this — see `claude_oauth_token_fresh`). This closes the 2026-06-25 failure where a present-but-
+    // expired token passed D1, then 401'd during the window read / confirm and reported a confusing
+    // "couldn't confirm session". Reads `expiresAt` offline; only hits the token endpoint when stale.
+    if matches!(tool_id, ToolId::Claude) {
+        match quota::ensure_fresh_claude_token(config_dir) {
+            quota::TokenRefresh::Ready => {}
+            quota::TokenRefresh::NoToken => return PrimeOutcome::SkipNoToken,
+            // 429 / transient failure: don't send (would 401), and don't hammer the rate-limit-
+            // sensitive token endpoint. Fail open as retryable so the scheduler's 5-minute loop
+            // re-attempts once the throttle clears.
+            quota::TokenRefresh::RateLimited | quota::TokenRefresh::Failed => {
+                return PrimeOutcome::SkipUnknownState
+            }
+        }
+    } else if read_token(tool_id, config_dir).is_none() {
         return PrimeOutcome::SkipNoToken;
     }
 
@@ -559,7 +575,8 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
 
     let response = match tool_id {
         ToolId::Claude => {
-            // Refreshes via HTTP refresh-token grant if the stored token is near expiry.
+            // The token was already renewed if needed at D1 (`ensure_fresh_claude_token`), so this
+            // is a plain read of the current (fresh) access token.
             let token = quota::claude_oauth_token_fresh(config_dir)
                 .ok_or_else(|| "token".to_string())?;
             let version = quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());

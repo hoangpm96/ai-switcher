@@ -5,6 +5,26 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.15] - 2026-06-25
+
+### Fixed
+
+- **Scheduled morning primes no longer fail when a Claude token has expired.** A prime sends a
+  minimal request to open a fresh 5-hour window, but it ran with whatever access token was stored —
+  and a token that had expired overnight made the prime fail at its deadline with a confusing
+  "couldn't confirm session". The prime now checks the token's expiry **offline** (from the stored
+  `expiresAt`, no network call) and, only when it has expired or is within 10 minutes of expiring,
+  renews it via the OAuth refresh-token grant before sending. A still-valid token is used as-is and
+  never touches the (rate-limit-sensitive) token endpoint.
+
+  This refresh is **scoped to the prime path only**, which runs at a scheduled early-morning hour
+  when no `claude` CLI session is using the account — so rotating the single-use refresh token is
+  safe there. The daytime quota read stays strictly read-only (the v0.5.13 behaviour), so switching
+  accounts still never logs a live session out. If the refresh endpoint rate-limits the request
+  (HTTP 429), the prime backs off and the scheduler retries on its next 5-minute tick rather than
+  hammering the endpoint. The rotated credential is written back to the keychain and read back to
+  confirm it landed before the prime proceeds, so a write that misses can't strand the account.
+
 ## [0.5.14] - 2026-06-24
 
 ### Added
