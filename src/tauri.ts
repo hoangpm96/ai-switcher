@@ -220,6 +220,9 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   if (command === "prime_now") {
     return { kind: "success", message: "Đã mở phiên mới — reset lúc 12:00" } as T;
   }
+  if (command === "refresh_token_now") {
+    return { kind: "success", message: "Token đã sẵn sàng. Đang cập nhật lại quota…" } as T;
+  }
   if (command === "get_auto_prime_log") {
     return "" as T;
   }
@@ -492,6 +495,8 @@ export const api = {
   setAutoExtend: (input: SetAutoExtendInput) => invoke<AppSnapshot>("set_auto_extend", { input }),
   /** On-demand prime; resolves to a short status message (the snapshot refreshes via event). */
   primeNow: (input: PrimeNowInput) => invoke<PrimeNowResult>("prime_now", { input }),
+  /** On-demand Claude OAuth token renewal for an account whose quota read 401'd. */
+  refreshTokenNow: (input: PrimeNowInput) => invoke<PrimeNowResult>("refresh_token_now", { input }),
   getAutoPrimeLog: () => invoke<string>("get_auto_prime_log"),
   getAutoPrimeStats: () => invoke<AutoPrimeDayStat[]>("get_auto_prime_stats"),
   listOrphanAccountDirs: () => invoke<OrphanAccountDir[]>("list_orphan_account_dirs"),

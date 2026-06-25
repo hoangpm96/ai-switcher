@@ -1200,6 +1200,25 @@ button.danger:hover:not(:disabled) {
   font-size: 12.5px;
 }
 
+/* When the quota error carries a "Làm mới token" action it renders as a div with an inner <p> + a
+   linkBtn; keep them stacked tightly and the button's icon aligned with its label. */
+div.quotaError {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+div.quotaError > p {
+  margin: 0;
+}
+
+div.quotaError .linkBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .cardActions {
   display: flex;
   gap: 8px;

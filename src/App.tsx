@@ -148,6 +148,7 @@ export function App() {
   const setError = useCallback((text: string | null) => text && notify(text, "error"), [notify]);
   const [busy, setBusy] = useState<string | null>(null);
   const [refreshingAccounts, setRefreshingAccounts] = useState<Set<string>>(new Set());
+  const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [dialog, setDialog] = useState<"add" | "rename" | "launcher" | "setup" | null>(null);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   const [switchNotice, setSwitchNotice] = useState<string | null>(null);
@@ -360,6 +361,25 @@ export function App() {
       // quota error is surfaced inside account.quota.error — no global toast needed
     } finally {
       setRefreshingAccounts((prev) => {
+        const next = new Set(prev);
+        next.delete(accountId);
+        return next;
+      });
+    }
+  };
+
+  const refreshTokenForAccount = async (toolId: ToolId, accountId: string) => {
+    setRefreshingTokens((prev) => new Set([...prev, accountId]));
+    try {
+      const res = await api.refreshTokenNow({ toolId, accountId });
+      notify(res.message, res.kind as "success" | "info" | "error");
+      // On success the backend already refreshed the tool's quota; pull the fresh value into the
+      // card so the error clears without a manual refresh.
+      if (res.kind === "success") await refreshOneAccount(toolId, accountId);
+    } catch (err) {
+      notify(errorMessage(err), "error");
+    } finally {
+      setRefreshingTokens((prev) => {
         const next = new Set(prev);
         next.delete(accountId);
         return next;
@@ -726,6 +746,8 @@ export function App() {
                     }
                     onRefreshQuota={() => void refreshOneAccount(currentTool.id, account.id)}
                     refreshingQuota={refreshingAccounts.has(account.id)}
+                    onRefreshToken={() => void refreshTokenForAccount(currentTool.id, account.id)}
+                    refreshingToken={refreshingTokens.has(account.id)}
                   />
                 ))
               )}
@@ -1929,6 +1951,8 @@ function AccountCard({
   onDelete,
   onRefreshQuota,
   refreshingQuota,
+  onRefreshToken,
+  refreshingToken,
 }: {
   account: Account;
   tool: ToolStatus;
@@ -1944,6 +1968,8 @@ function AccountCard({
   onDelete: () => void;
   onRefreshQuota: () => void;
   refreshingQuota: boolean;
+  onRefreshToken: () => void;
+  refreshingToken: boolean;
 }) {
   const isAntigravity = tool.id === "antigravity";
   const isApi = !!account.apiProvider;
@@ -2051,7 +2077,14 @@ function AccountCard({
           Model <code>{account.apiProvider!.model}</code>
         </p>
       ) : (
-        <Quota quota={account.quota} />
+        <Quota
+          quota={account.quota}
+          // Offer a manual token renew only for Claude subscription accounts (Codex/API have no
+          // app-refreshable OAuth token). The button itself only appears on an auth-type error.
+          canRefreshToken={tool.id === "claude" && !isApi}
+          onRefreshToken={onRefreshToken}
+          refreshingToken={refreshingToken}
+        />
       )}
 
       {showExtend ? (
@@ -2194,9 +2227,39 @@ function AutoSwitchBar({
   );
 }
 
-function Quota({ quota }: { quota: Account["quota"] }) {
+function Quota({
+  quota,
+  canRefreshToken = false,
+  onRefreshToken,
+  refreshingToken = false,
+}: {
+  quota: Account["quota"];
+  canRefreshToken?: boolean;
+  onRefreshToken?: () => void;
+  refreshingToken?: boolean;
+}) {
   if (!quota) return <p className="quotaError">No quota data yet</p>;
-  if (quota.error) return <p className="quotaError">{quota.error}</p>;
+  if (quota.error) {
+    // A 401/403 quota read means the stored OAuth token expired. For Claude subscription accounts
+    // offer a one-tap renew (safe to click when no CLI session is using the account); other errors
+    // (network, parse) just show the message — renewing wouldn't help.
+    const isAuthError = /\b40[13]\b/.test(quota.error);
+    return (
+      <div className="quotaError">
+        <p>{quota.error}</p>
+        {canRefreshToken && isAuthError && onRefreshToken && (
+          <button
+            className="linkBtn"
+            onClick={onRefreshToken}
+            disabled={refreshingToken}
+            title="Làm mới token đăng nhập (chỉ bấm khi không có phiên Claude Code nào đang chạy trên tài khoản này)"
+          >
+            {refreshingToken ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} Làm mới token
+          </button>
+        )}
+      </div>
+    );
+  }
 
   // Antigravity: quota is reported per model instead of as a single overall window.
   if (quota.models && quota.models.length > 0) {

@@ -224,6 +224,24 @@ async fn prime_now(
     .map_err(|e| e.to_string())?
 }
 
+/// On-demand "Làm mới token": renew a Claude account's expired OAuth token so its quota reads again.
+/// Runs on a blocking worker (the refresh-token grant is a network call) and returns a status
+/// message for a UI toast.
+#[tauri::command]
+async fn refresh_token_now(
+    app: tauri::AppHandle,
+    input: PrimeNowInput,
+) -> Result<models::PrimeNowResult, String> {
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        app2.state::<ManagedState>()
+            .refresh_token_now(input.tool_id, input.account_id, Some(&app2))
+            .map_err(display_error)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn get_auto_prime_log(state: State<'_, ManagedState>) -> String {
     state.auto_prime_log()
@@ -487,6 +505,7 @@ pub fn run() {
             confirm_extend,
             set_auto_extend,
             prime_now,
+            refresh_token_now,
             get_auto_prime_log,
             get_auto_prime_stats,
             list_orphan_account_dirs,

@@ -5,6 +5,19 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.16] - 2026-06-25
+
+### Added
+
+- **"Làm mới token" button on an account whose quota read failed with a 401/403.** When a Claude
+  subscription account's stored OAuth token has expired, its card shows a quota error; you can now
+  renew the token in one tap instead of opening Claude Code. It uses the same safe refresh as the
+  scheduled prime and re-reads the quota immediately afterward. The button appears only on Claude
+  subscription accounts and only on an auth error, and the daytime quota read stays read-only — the
+  refresh runs only when *you* click, since you know no `claude` CLI session is using the account at
+  that moment (rotating the single-use refresh token while a session held it would log it out). If
+  the refresh endpoint rate-limits the request, the toast says to try again shortly.
+
 ## [0.5.15] - 2026-06-25
 
 ### Fixed
