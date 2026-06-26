@@ -402,7 +402,11 @@ pub(crate) enum TokenRefresh {
 /// refresh-token grant when the token actually needs it, so a still-valid token costs nothing and
 /// never touches the (rate-limit-sensitive) token endpoint.
 pub(crate) fn ensure_fresh_claude_token(config_dir: &Path) -> TokenRefresh {
-    let Some(raw) = claude_credentials_blob(config_dir) else {
+    // Read the credential source ONCE here and reuse it for both the offline expiry check and (if
+    // needed) the refresh. Each keychain touch on an item another app owns can raise a macOS prompt,
+    // so collapsing the reads keeps the dialog count to a minimum (and the post-write `-A` flag makes
+    // every subsequent read/write prompt-free).
+    let Some((source, raw)) = claude_credentials_source(config_dir) else {
         return TokenRefresh::NoToken;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -411,7 +415,7 @@ pub(crate) fn ensure_fresh_claude_token(config_dir: &Path) -> TokenRefresh {
     if claude_token_still_valid(&value) {
         return TokenRefresh::Ready;
     }
-    refresh_claude_oauth(config_dir)
+    refresh_claude_oauth(config_dir, source, value)
 }
 
 /// True when the blob's `claudeAiOauth.expiresAt` (epoch ms) is far enough in the future to use for
@@ -438,20 +442,23 @@ fn claude_token_still_valid(value: &serde_json::Value) -> bool {
 /// window is a single keychain write after the HTTP response is already in hand, and the prime runs
 /// at a quiet hour, so this is low-risk but not zero. A write FAILURE (not a crash) is handled: it
 /// returns `Failed` (retryable) without claiming success.
-fn refresh_claude_oauth(config_dir: &Path) -> TokenRefresh {
+fn refresh_claude_oauth(
+    config_dir: &Path,
+    source: ClaudeCredSource,
+    value_before_lock: serde_json::Value,
+) -> TokenRefresh {
     static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let Ok(_guard) = REFRESH_LOCK.get_or_init(|| Mutex::new(())).lock() else {
         return TokenRefresh::Failed;
     };
 
-    let Some((source, raw)) = claude_credentials_source(config_dir) else {
-        return TokenRefresh::NoToken;
-    };
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return TokenRefresh::Failed;
-    };
-    // Double-checked: a racing caller may have refreshed while we waited for the lock, leaving a
-    // token that is no longer near expiry. Skip the redundant (rotation-consuming) grant.
+    // The caller already read+parsed the blob (before taking the lock). Re-read ONCE inside the lock
+    // for the double-check: a racing caller may have refreshed while we waited, leaving a token that
+    // is no longer near expiry — skip the redundant (rotation-consuming) grant. If the re-read fails,
+    // fall back to the caller's pre-lock value rather than touch the keychain again.
+    let mut value = claude_credentials_blob(config_dir)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .unwrap_or(value_before_lock);
     if claude_token_still_valid(&value) {
         return TokenRefresh::Ready;
     }
@@ -610,20 +617,38 @@ fn parse_keychain_account(dump: &str) -> Option<String> {
 fn write_claude_credentials(source: &ClaudeCredSource, blob: &str) -> bool {
     match source {
         ClaudeCredSource::Keychain { service, account } => {
-            let Ok(entry) = keyring::Entry::new(service, account) else {
-                return false;
-            };
             for attempt in 0..3 {
-                // A keychain item is keyed by (service, account). The read path — and Claude Code
-                // itself — looks the credential up by SERVICE only, so if `account` doesn't match the
-                // slot Claude reads, `set_password` would silently create a *different* item and the
-                // grant's rotated token would be lost (account stranded: server-side refresh token is
-                // already spent). Guard against that by reading back BY SERVICE after the write and
-                // confirming the service slot now holds our blob; treat a mismatch as a failure so the
-                // caller reports `Failed` (retryable) instead of a false `Ready`.
-                if entry.set_password(blob).is_ok()
-                    && read_keychain_blob(service).as_deref() == Some(blob)
-                {
+                // Write via `security add-generic-password -U`, NOT the `keyring` crate, for two
+                // reasons:
+                //   1. It is the SAME `security` path used to read the item, so macOS treats read and
+                //      write as one access decision instead of two separate prompts.
+                //   2. `-A` adds the item to the "any application may access without warning" list.
+                //      This app is ad-hoc / linker-signed (no stable Developer ID), so a per-app trust
+                //      entry (`-T`) would be forgotten on every rebuild and re-prompt; `-A` is the only
+                //      durable way to stop the keychain dialog on an unsigned local build. Trade-off:
+                //      any process running as this user can read the item without warning — acceptable
+                //      on a personal machine, and Claude Code keeps reading it exactly as before.
+                // `-U` updates the existing (service, account) item in place rather than creating a
+                // duplicate. We still read back BY SERVICE to confirm the write landed on the slot
+                // Claude reads — a wrong-slot write would otherwise strand the account (its server-side
+                // refresh token is already spent), so a mismatch returns false → caller reports
+                // `Failed` (retryable) instead of a false `Ready`.
+                let wrote = Command::new("security")
+                    .args([
+                        "add-generic-password",
+                        "-U",
+                        "-A",
+                        "-s",
+                        service,
+                        "-a",
+                        account,
+                        "-w",
+                        blob,
+                    ])
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false);
+                if wrote && read_keychain_blob(service).as_deref() == Some(blob) {
                     return true;
                 }
                 if attempt < 2 {

@@ -49,9 +49,17 @@ pub const CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(90);
 /// (up to 20s), so counting sleeps alone undercounts; `CODEX_CONFIRM_TOTAL_BUDGET` caps the real
 /// elapsed time so a confirmation can never overrun the scheduler's per-tick proof budget
 /// (`PRIME_PROOF_BUDGET_SECONDS`). On give-up the scheduler's 5-minute retry loop re-confirms.
-pub const CODEX_CONFIRM_POLL_DELAY: Duration = Duration::from_secs(15);
-pub const CODEX_CONFIRM_MAX_POLLS: u32 = 6;
-pub const CODEX_CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(120);
+///
+/// Codex anchors a window after a single "hi" (verified live: a 1% send anchored in ~26s), but the
+/// `reset_at` snap from rolling → fixed has a HIGHLY variable delay — some sends never settle within
+/// a couple minutes. So we poll DENSELY (every 10s) across the largest budget that still fits the
+/// proof budget, to catch the snap whenever it lands; if a tick gives up, the scheduler's retry loop
+/// re-confirms on the next tick (the real "stretch": confirmation spans several ticks, not one long
+/// inline wait, which the proof budget forbids). Confirmation reads only — it never sends again, so a
+/// longer/denser poll costs no extra quota (the original "hi" already cost its ~1%).
+pub const CODEX_CONFIRM_POLL_DELAY: Duration = Duration::from_secs(10);
+pub const CODEX_CONFIRM_MAX_POLLS: u32 = 12;
+pub const CODEX_CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(125);
 /// Hard cap on how long a prime CLI invocation may run before we kill it (a hung CLI must never
 /// hold the prime worker — see the scheduler's overlap guard).
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(120);

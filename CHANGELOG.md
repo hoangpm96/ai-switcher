@@ -5,6 +5,30 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.17] - 2026-06-27
+
+### Fixed
+
+- **Unattended priming now survives the Mac sleeping between primes.** The pmset wake for the *next*
+  prime was only re-armed on a settings change or an in-flight retry — never after a normal prime
+  batch finished. With the app closed, the wake request stayed frozen at a past time, so pmset held
+  no future wake and the Mac never rose for the next day's prime (the observed failure: a 06:00
+  start, then silence until the app was reopened at night). The scheduler now re-arms the next wake
+  at the end of every prime tick, and since the headless prime daemon runs that tick each minute
+  while awake, the wake for the next prime/defer/retry is always kept current — derived from saved
+  state, so it works with the GUI closed. The wake request is only rewritten when the target time
+  actually changes, so a steady schedule no longer re-runs `pmset` every minute.
+
+- **Codex "Prime now" no longer reports a false failure when the window anchors slowly.** Sending a
+  minimal request opens a fresh Codex 5-hour window, but the reset time settles from "rolling" to a
+  fixed value after a variable delay. Confirmation now polls more densely (every 10s, up to ~125s
+  per tick) and the manual deadline was extended to 12 minutes (≈6 retry rounds), so a slow anchor
+  is recognised instead of timing out — without sending anything heavier (no extra quota).
+
+- **Fewer keychain prompts when renewing a Claude token.** The token refresh now reads and writes the
+  credential through a single `security` path and registers the item for prompt-free access, so a
+  renewal no longer triggers several macOS keychain dialogs in a row.
+
 ## [0.5.16] - 2026-06-25
 
 ### Added

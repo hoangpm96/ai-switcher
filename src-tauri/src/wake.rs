@@ -492,6 +492,11 @@ pub fn uninstall_helper() -> Result<()> {
 
 /// Write the desired wake time into the request file (touching it triggers the daemon). `None`
 /// clears the wake (writes an empty file). Times are formatted in local time for `pmset`.
+///
+/// Skips the write when the file already holds the same value: the helper plist watches this path,
+/// so an identical rewrite would still fire its `pmset cancel + schedule` for an unchanged wake. The
+/// prime daemon now re-arms on every 60s tick, so without this guard a steady-state schedule would
+/// churn privileged `pmset` calls once a minute.
 pub fn write_wake_request(
     store: &Store,
     wake_local: Option<chrono::DateTime<chrono::Local>>,
@@ -500,7 +505,11 @@ pub fn write_wake_request(
         Some(t) => t.format("%m/%d/%y %H:%M:%S").to_string(),
         None => String::new(),
     };
-    std::fs::write(store.wake_request_path(), content).context("writing wake request")?;
+    let path = store.wake_request_path();
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(content.as_str()) {
+        return Ok(()); // unchanged — don't bump mtime / retrigger the helper
+    }
+    std::fs::write(&path, content).context("writing wake request")?;
     Ok(())
 }
 
