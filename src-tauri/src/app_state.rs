@@ -2163,15 +2163,28 @@ impl ManagedState {
                 continue;
             }
 
+            // Per-action trace prefix, built from cloned attempt metadata so the trace closure only
+            // needs an immutable `&self` (for the log append) — no borrow conflict with `before_send`,
+            // which mutates `attempt`/`runtime`. Each prime step appends one line under this prefix so
+            // the activity log records the FULL story of the attempt, not just START → terminal.
+            let trace_prefix = format!(
+                "[{}][attempt={}] {} · account \"{}\" —",
+                prime_source_label(&attempt.source),
+                short_attempt_id(&attempt.attempt_id),
+                job.tool_id.prime_label(),
+                job.account_name,
+            );
+            let trace = |line: &str| self.append_prime_log(&format!("{trace_prefix} {line}"));
             let outcome = if resume_confirmation {
-                crate::prime::confirm_active_session(
+                crate::prime::confirm_active_session_traced(
                     &job.tool_id,
                     &job.config_dir,
                     attempt.baseline_reset_at.as_deref(),
                     std::thread::sleep,
+                    trace,
                 )
             } else {
-                crate::prime::prime_account_with_hook(
+                crate::prime::prime_account_traced(
                     &job.tool_id,
                     &job.config_dir,
                     job.binary.as_deref(),
@@ -2189,6 +2202,7 @@ impl ManagedState {
                             .save_prime_runtime(&runtime)
                             .map_err(|error| format!("persisting prime marker: {error}"))
                     },
+                    trace,
                 )
             };
             match outcome {
@@ -2225,18 +2239,21 @@ impl ManagedState {
                             .attempts
                             .insert(job.account_id.clone(), attempt.clone());
                         let _ = self.store.save_prime_runtime(&runtime);
-                        if attempt.send_attempts == 1 {
-                            self.append_prime_log(&format!(
-                                "[{}][attempt={}] {} · account \"{}\" — PENDING: {}, thử lại lúc {} (deadline {})",
-                                prime_source_label(&attempt.source),
-                                short_attempt_id(&attempt.attempt_id),
-                                job.tool_id.prime_label(),
-                                job.account_name,
-                                retry_reason(&retryable),
-                                local_hhmm_from_iso(&attempt.next_action_at),
-                                local_hhmm_from_iso(&attempt.deadline_at)
-                            ));
-                        }
+                        // Log EVERY retry round (not just the first). The old `send_attempts == 1`
+                        // gate hid all rounds after the first, and hid rounds where the failure was at
+                        // D1 (e.g. a token-refresh 429 — `send_attempts` never reaches 1), making the
+                        // log read START → silence → FAIL. With per-action traces above plus a PENDING
+                        // line per round, the log now shows exactly how many times each step retried.
+                        self.append_prime_log(&format!(
+                            "[{}][attempt={}] {} · account \"{}\" — PENDING: {}, thử lại lúc {} (deadline {})",
+                            prime_source_label(&attempt.source),
+                            short_attempt_id(&attempt.attempt_id),
+                            job.tool_id.prime_label(),
+                            job.account_name,
+                            retry_reason(&retryable),
+                            local_hhmm_from_iso(&attempt.next_action_at),
+                            local_hhmm_from_iso(&attempt.deadline_at)
+                        ));
                         if let Ok(mut data) = self.data.lock() {
                             if let Some(setting) = data.auto_prime.get_mut(&job.account_id) {
                                 setting.last_result = Some("retrying".to_string());
@@ -2481,7 +2498,15 @@ impl ManagedState {
         // a send failure returns quickly and the user can tap again. Confirmation is still
         // provider-aware: Claude polls for a moved reset, while Codex observes the reset twice to
         // distinguish a fixed anchored window from the rolling now+5h placeholder.
-        let outcome = crate::prime::prime_account_with_hook(
+        let trace_prefix = format!(
+            "[{}][attempt={}] {} · account \"{}\" —",
+            prime_source_label(&manual_attempt.source),
+            short_attempt_id(&manual_attempt.attempt_id),
+            job.tool_id.prime_label(),
+            job.account_name,
+        );
+        let trace = |line: &str| self.append_prime_log(&format!("{trace_prefix} {line}"));
+        let outcome = crate::prime::prime_account_traced(
             &job.tool_id,
             &job.config_dir,
             job.binary.as_deref(),
@@ -2499,6 +2524,7 @@ impl ManagedState {
                     .save_prime_runtime(&runtime)
                     .map_err(|error| format!("persisting manual prime marker: {error}"))
             },
+            trace,
         );
         let retryable = !matches!(
             outcome,

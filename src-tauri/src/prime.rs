@@ -94,13 +94,19 @@ pub fn is_prime_eligible(tool_id: &ToolId, has_api_provider: bool) -> bool {
 /// immediately
 /// before the first external send. The scheduler uses it to durably persist `Confirming`,
 /// `baseline_reset_at`, and `last_send_at`; a failed hook aborts the send.
-pub fn prime_account_with_hook(
+/// Run one bounded prime burst, emitting a one-line `trace(...)` at every action (D1 token
+/// check + refresh, D2 window classification, each D3 send attempt, each D4 confirm poll) so the
+/// activity log records the FULL story of an attempt — not just START → terminal. The scheduler
+/// passes a closure that appends each trace line under the attempt's id, making after-the-fact
+/// diagnosis (e.g. "refresh 429 retried 7×" vs "send failed" vs "confirm still rolling") possible.
+pub fn prime_account_traced(
     tool_id: &ToolId,
     config_dir: &Path,
     binary: Option<&Path>,
     send_attempts: u32,
     mut sleeper: impl FnMut(Duration),
     mut before_send: impl FnMut(Option<&str>) -> Result<(), String>,
+    mut trace: impl FnMut(&str),
 ) -> PrimeOutcome {
     // Hold the Mac awake for the whole attempt. A pmset wake only buys a brief awake window before
     // macOS idle-sleeps again; D3's retries (up to 5 × 5') and D4's confirm polls can outlast it,
@@ -115,18 +121,31 @@ pub fn prime_account_with_hook(
     // expired token passed D1, then 401'd during the window read / confirm and reported a confusing
     // "couldn't confirm session". Reads `expiresAt` offline; only hits the token endpoint when stale.
     if matches!(tool_id, ToolId::Claude) {
+        trace("D1 kiểm tra token Claude");
         match quota::ensure_fresh_claude_token(config_dir) {
-            quota::TokenRefresh::Ready => {}
-            quota::TokenRefresh::NoToken => return PrimeOutcome::SkipNoToken,
+            quota::TokenRefresh::Ready => trace("D1 token còn hạn / đã làm mới OK"),
+            quota::TokenRefresh::NoToken => {
+                trace("D1 không có token → SkipNoToken");
+                return PrimeOutcome::SkipNoToken;
+            }
             // 429 / transient failure: don't send (would 401), and don't hammer the rate-limit-
             // sensitive token endpoint. Fail open as retryable so the scheduler's 5-minute loop
             // re-attempts once the throttle clears.
-            quota::TokenRefresh::RateLimited | quota::TokenRefresh::Failed => {
-                return PrimeOutcome::SkipUnknownState
+            quota::TokenRefresh::RateLimited => {
+                trace("D1 token hết hạn, làm mới bị giới hạn (HTTP 429) → đợi tick sau");
+                return PrimeOutcome::SkipUnknownState;
+            }
+            quota::TokenRefresh::Failed => {
+                trace("D1 token hết hạn, làm mới thất bại → đợi tick sau");
+                return PrimeOutcome::SkipUnknownState;
             }
         }
-    } else if read_token(tool_id, config_dir).is_none() {
-        return PrimeOutcome::SkipNoToken;
+    } else {
+        trace("D1 kiểm tra token");
+        if read_token(tool_id, config_dir).is_none() {
+            trace("D1 không có token → SkipNoToken");
+            return PrimeOutcome::SkipNoToken;
+        }
     }
 
     // D2 — if a REAL 5h window is still running, the prime would land inside it → HOLD.
@@ -134,9 +153,13 @@ pub fn prime_account_with_hook(
     // in the terminal, so we only HOLD when the window is DEFINITELY a real anchored one. Codex's
     // `Ambiguous` (reset ≈ now + 5h — rolling for a low-usage account, which never anchors from a
     // bare "hi") falls through to send, matching the terminal's behaviour.
+    trace("D2 đọc trạng thái window hiện tại");
     let before = match quota::read_live_five_hour(tool_id, config_dir) {
         Ok(window) => window,
-        Err(_) => return PrimeOutcome::SkipUnknownState,
+        Err(_) => {
+            trace("D2 đọc window lỗi → SkipUnknownState");
+            return PrimeOutcome::SkipUnknownState;
+        }
     };
     let before_reset = before.reset_at.clone();
     let before_active = before.is_active;
@@ -146,33 +169,45 @@ pub fn prime_account_with_hook(
         // produced from a parseable future reset, so `before_reset` is present.
         quota::WindowState::Anchored => match &before_reset {
             Some(reset_at) => {
+                trace(&format!("D2 window đang chạy (anchored, reset {reset_at}) → HOÃN"));
                 return PrimeOutcome::Hold {
                     reset_at: reset_at.clone(),
-                }
+                };
             }
-            None => return PrimeOutcome::SkipUnknownState,
+            None => {
+                trace("D2 anchored nhưng thiếu reset → SkipUnknownState");
+                return PrimeOutcome::SkipUnknownState;
+            }
         },
         // We can't establish the window state → fail CLOSED: do NOT send blindly. The next
         // scheduled tick retries once the read recovers.
-        quota::WindowState::Unknown => return PrimeOutcome::SkipUnknownState,
+        quota::WindowState::Unknown => {
+            trace("D2 không xác định được window → SkipUnknownState");
+            return PrimeOutcome::SkipUnknownState;
+        }
         // Primeable (ended/no window) or Ambiguous (Codex rolling) → send.
-        quota::WindowState::Primeable | quota::WindowState::Ambiguous => {}
+        quota::WindowState::Primeable => trace("D2 window đã hết/chưa có → gửi hi"),
+        quota::WindowState::Ambiguous => trace("D2 window rolling (Codex) → gửi hi"),
     }
 
     // D3 — send "hi", retrying on failure up to `send_attempts` times.
     if let Err(reason) = before_send(before_reset.as_deref()) {
+        trace(&format!("D3 ghi marker trước gửi lỗi: {reason}"));
         return PrimeOutcome::FailSend { reason };
     }
     let attempts = send_attempts.max(1);
     let mut last_reason = String::new();
     let mut sent = false;
     for attempt in 1..=attempts {
+        trace(&format!("D3 gửi hi (lần {attempt}/{attempts})"));
         match send_hi(tool_id, config_dir, binary) {
             Ok(()) => {
+                trace("D3 gửi hi OK (HTTP 2xx)");
                 sent = true;
                 break;
             }
             Err(reason) => {
+                trace(&format!("D3 gửi hi lỗi: {reason}"));
                 last_reason = reason;
                 if attempt < attempts {
                     sleeper(SEND_RETRY_DELAY);
@@ -181,6 +216,7 @@ pub fn prime_account_with_hook(
         }
     }
     if !sent {
+        trace(&format!("D3 gửi hi thất bại sau {attempts} lần: {last_reason}"));
         return PrimeOutcome::FailSend {
             reason: last_reason,
         };
@@ -199,15 +235,34 @@ pub fn prime_account_with_hook(
     //   - Claude: `reset_at` is a stable anchor, so we confirm the window actually moved to a new
     //     future reset before claiming success. Poll a few times — the provider may take a few
     //     seconds to refresh.
+    trace("D4 bắt đầu xác nhận window mới");
     if matches!(tool_id, ToolId::Codex) {
-        return match codex_confirm_anchored(config_dir, &mut sleeper) {
-            Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
-            None => PrimeOutcome::FailUnconfirmed,
+        return match codex_confirm_anchored(config_dir, &mut sleeper, &mut trace) {
+            Some(new_reset_at) => {
+                trace(&format!("D4 xác nhận OK, reset mới {new_reset_at}"));
+                PrimeOutcome::Success { new_reset_at }
+            }
+            None => {
+                trace("D4 hết budget chưa xác nhận → FailUnconfirmed (tick sau thử lại)");
+                PrimeOutcome::FailUnconfirmed
+            }
         };
     }
-    match claude_confirm_anchored(config_dir, before_reset.as_deref(), before_active, &mut sleeper) {
-        Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
-        None => PrimeOutcome::FailUnconfirmed,
+    match claude_confirm_anchored(
+        config_dir,
+        before_reset.as_deref(),
+        before_active,
+        &mut sleeper,
+        &mut trace,
+    ) {
+        Some(new_reset_at) => {
+            trace(&format!("D4 xác nhận OK, reset mới {new_reset_at}"));
+            PrimeOutcome::Success { new_reset_at }
+        }
+        None => {
+            trace("D4 hết budget chưa xác nhận → FailUnconfirmed (tick sau thử lại)");
+            PrimeOutcome::FailUnconfirmed
+        }
     }
 }
 
@@ -219,6 +274,7 @@ fn claude_confirm_anchored(
     baseline_reset_at: Option<&str>,
     baseline_active: Option<bool>,
     mut sleeper: impl FnMut(Duration),
+    mut trace: impl FnMut(&str),
 ) -> Option<String> {
     let started = std::time::Instant::now();
     for poll in 0..CONFIRM_MAX_TRIES {
@@ -230,10 +286,17 @@ fn claude_confirm_anchored(
             }
             sleeper(CONFIRM_RETRY_DELAY);
         }
+        trace(&format!(
+            "D4 đọc window Claude (poll {}/{}, {}s)",
+            poll + 1,
+            CONFIRM_MAX_TRIES,
+            started.elapsed().as_secs()
+        ));
         if let Some(reset_at) = claude_anchored_reset(config_dir, baseline_reset_at, baseline_active)
         {
             return Some(reset_at);
         }
+        trace("D4 window chưa neo (reset chưa đổi / chưa active)");
         if started.elapsed() >= CONFIRM_TOTAL_BUDGET {
             break;
         }
@@ -293,6 +356,7 @@ fn claude_reset_confirms(
 fn codex_confirm_anchored(
     config_dir: &Path,
     mut sleeper: impl FnMut(Duration),
+    mut trace: impl FnMut(&str),
 ) -> Option<String> {
     let started = std::time::Instant::now();
     let mut previous_epoch: Option<i64> = None;
@@ -305,6 +369,12 @@ fn codex_confirm_anchored(
             }
             sleeper(CODEX_CONFIRM_POLL_DELAY);
         }
+        trace(&format!(
+            "D4 đọc window Codex (poll {}/{}, {}s)",
+            poll + 1,
+            CODEX_CONFIRM_MAX_POLLS,
+            started.elapsed().as_secs()
+        ));
         if let Ok(window) = quota::read_live_five_hour(&ToolId::Codex, config_dir) {
             // Signal 1: clearly anchored (reset far from now+5h).
             if matches!(
@@ -313,6 +383,7 @@ fn codex_confirm_anchored(
             ) {
                 // `Anchored` is only produced from a parseable future reset, so this is present.
                 if let Some(reset_at) = window.reset_at {
+                    trace("D4 Codex window neo rõ (anchored)");
                     return Some(reset_at);
                 }
             }
@@ -324,10 +395,14 @@ fn codex_confirm_anchored(
                 .and_then(codex_reset_epoch_if_future)
             {
                 if previous_epoch == Some(reset_epoch) {
+                    trace("D4 Codex reset cố định 2 lần đọc → đã neo");
                     return window.reset_at;
                 }
+                trace("D4 Codex reset vẫn rolling (đang tăng)");
                 previous_epoch = Some(reset_epoch);
             }
+        } else {
+            trace("D4 đọc window Codex lỗi tạm, thử lại poll sau");
         }
         if started.elapsed() >= CODEX_CONFIRM_TOTAL_BUDGET {
             break;
@@ -346,19 +421,30 @@ fn codex_reset_epoch_if_future(reset_at: &str) -> Option<i64> {
 /// Resume an attempt that may have crashed after its durable `Confirming` marker was written.
 /// This path never sends: it only proves whether a real session is active, preventing a blind
 /// duplicate request after restart.
-pub fn confirm_active_session(
+/// Resume an attempt that may have crashed after its durable `Confirming` marker was written,
+/// emitting a per-poll `trace(...)` line. This path never sends: it only proves whether a real
+/// session is active, preventing a blind duplicate request after restart.
+pub fn confirm_active_session_traced(
     tool_id: &ToolId,
     config_dir: &Path,
     baseline_reset_at: Option<&str>,
     mut sleeper: impl FnMut(Duration),
+    mut trace: impl FnMut(&str),
 ) -> PrimeOutcome {
+    trace("RESUME xác nhận lại session sau khi tiếp tục");
     match tool_id {
         ToolId::Claude => {
             // Same anchored-session poll as the inline D4 path (newly-active session OR a moved
             // reset). A `Confirming` marker only exists because a send happened, which only happens
             // after D2 confirmed no window was anchored — so the baseline was inactive. Passing
             // `Some(false)` lets the newly-active signal count without risking a false positive.
-            match claude_confirm_anchored(config_dir, baseline_reset_at, Some(false), &mut sleeper) {
+            match claude_confirm_anchored(
+                config_dir,
+                baseline_reset_at,
+                Some(false),
+                &mut sleeper,
+                &mut trace,
+            ) {
                 Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
                 None => PrimeOutcome::FailUnconfirmed,
             }
@@ -368,7 +454,7 @@ pub fn confirm_active_session(
             // that wrote the `Confirming` marker. Same anchored-signature poll as the inline D4 path
             // (`baseline_reset_at` is unused for Codex — an anchored reset is proof on its own).
             let _ = baseline_reset_at;
-            match codex_confirm_anchored(config_dir, &mut sleeper) {
+            match codex_confirm_anchored(config_dir, &mut sleeper, &mut trace) {
                 Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
                 None => PrimeOutcome::FailUnconfirmed,
             }

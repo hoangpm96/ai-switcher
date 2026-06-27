@@ -5,6 +5,19 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.18] - 2026-06-27
+
+### Changed
+
+- **Auto-prime now logs every step of each attempt, so a failure shows exactly where it stopped.**
+  The activity log previously recorded only START and the final outcome — a failed prime read
+  START → (silence) → FAIL, with no way to tell whether the token refresh was rate-limited, the send
+  failed, or confirmation was still waiting for the window to anchor. Each attempt now appends a line
+  per action (token check/refresh, window classification, each send try, each confirm poll), and a
+  PENDING line is written for every retry round instead of only the first. Idle/held accounts that
+  have nothing to do still log nothing, so the extra detail only appears for attempts actually doing
+  work.
+
 ## [0.5.17] - 2026-06-27
 
 ### Fixed
