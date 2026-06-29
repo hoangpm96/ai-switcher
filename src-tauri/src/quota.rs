@@ -79,6 +79,14 @@ fn classify_live_quota_error(error: &anyhow::Error) -> LiveQuotaError {
 /// or `~/.claude` for the default account). Claude stores the keychain token by the
 /// hash of this path, so the correct dir must be passed to read each account's quota.
 pub fn read_quota(tool_id: &ToolId, config_dir: &Path) -> QuotaInfo {
+    // While the Mac is awake (this UI/periodic read only runs then), mirror an app-managed DIR
+    // account's keychain token into its `.credentials.json` file if the file is missing/stale. The
+    // file is what an unattended DarkWake prime can read (the keychain is locked then). This only
+    // COPIES the existing token — it never refreshes/rotates — so it respects the read-only UI policy.
+    if matches!(tool_id, ToolId::Claude) {
+        seed_claude_credentials_file(config_dir);
+    }
+
     let result = match tool_id {
         ToolId::Codex => read_codex_quota(config_dir),
         ToolId::Claude => read_claude_quota(config_dir),
@@ -394,6 +402,56 @@ pub(crate) enum TokenRefresh {
     Failed,
 }
 
+/// Mirror an app-managed DIR account's keychain token into its `.credentials.json` file, so an
+/// unattended DarkWake prime (when the login keychain is locked and unreadable) can still read the
+/// token from the file. Best-effort and COPY-ONLY — never refreshes/rotates the token, so it is safe
+/// to call from the read-only UI quota path. No-op for the default `~/.claude` account (left to the
+/// CLI's own keychain lifecycle) and when the keychain isn't currently readable.
+///
+/// Keeps the file fresh by `expiresAt`: the keychain blob is written over the file ONLY when it is
+/// strictly newer (e.g. the user ran `claude` and the CLI rotated the keychain) or the file is
+/// missing. It never overwrites a fresher file (an app file-only refresh can leave the keychain
+/// older — copying that back would strand the account with a dead refresh token).
+fn seed_claude_credentials_file(config_dir: &Path) {
+    if config_dir == home_dir().join(".claude") {
+        return; // default account: keychain-only, never mirror
+    }
+    let suffix = claude_keychain_suffix(config_dir);
+    let Some(keychain_blob) = read_keychain_blob(&format!("Claude Code-credentials-{suffix}")) else {
+        return; // keychain locked/empty (DarkWake) or account uses file already — nothing to mirror
+    };
+    let file = config_dir.join(".credentials.json");
+    let file_blob = read_file_blob(&file);
+    // Identical → nothing to do (avoids disk churn every read).
+    if file_blob.as_deref() == Some(keychain_blob.as_str()) {
+        return;
+    }
+    // Only copy keychain→file when the keychain token is STRICTLY NEWER (or the file is missing /
+    // unparseable). Critical: after an app file-only refresh the keychain may hold an OLDER token; a
+    // blind "copy on differ" would overwrite the fresh file with that stale token, and a later prime
+    // would then send a dead refresh token. Comparing `expiresAt` keeps the newest token authoritative.
+    // (Write-through on refresh normally keeps both equal, so this branch rarely fires — defense in depth.)
+    if let Some(existing) = &file_blob {
+        if blob_expires_at(existing) >= blob_expires_at(&keychain_blob) {
+            return; // file is as-new-or-newer than keychain → keep the file
+        }
+    }
+    let _ = write_file_credentials(&file, &keychain_blob);
+}
+
+/// Parse `claudeAiOauth.expiresAt` (epoch ms) from a credential blob, or 0 if absent/unparseable.
+/// Used to decide which of two stored blobs is newer.
+fn blob_expires_at(blob: &str) -> i64 {
+    serde_json::from_str::<serde_json::Value>(blob)
+        .ok()
+        .and_then(|v| {
+            v.get("claudeAiOauth")
+                .and_then(|o| o.get("expiresAt"))
+                .and_then(serde_json::Value::as_i64)
+        })
+        .unwrap_or(0)
+}
+
 /// Ensure the prime path has a usable Claude access token, renewing it if it has expired (or is
 /// within `CLAUDE_TOKEN_EXPIRY_SKEW_MS` of expiry). This is the prime-only entry point — see
 /// `claude_oauth_token_fresh` for why the UI path must NOT call this.
@@ -413,6 +471,15 @@ pub(crate) fn ensure_fresh_claude_token(config_dir: &Path) -> TokenRefresh {
         return TokenRefresh::Failed;
     };
     if claude_token_still_valid(&value) {
+        // Token is good. If the source resolved to a FILE target that doesn't exist yet (a DIR account
+        // whose token still lives only in the keychain), seed the file now — while the Mac is awake and
+        // the keychain is readable — so a later DarkWake prime can read the token from the file. Best
+        // effort: a failed seed just means the next awake prime retries it.
+        if let ClaudeCredSource::File(path) = &source {
+            if !path.exists() {
+                let _ = write_claude_credentials(&source, &raw);
+            }
+        }
         return TokenRefresh::Ready;
     }
     refresh_claude_oauth(config_dir, source, value)
@@ -538,14 +605,32 @@ fn refresh_claude_oauth(
     let Ok(encoded) = serde_json::to_string(&value) else {
         return TokenRefresh::Failed;
     };
-    if write_claude_credentials(&source, &encoded) {
-        // The freshly written token now backs subsequent reads; drop any cached quota so the prime's
-        // window read uses the new token rather than a 401 cached under the old one.
-        invalidate_claude_cache(config_dir);
-        TokenRefresh::Ready
-    } else {
-        TokenRefresh::Failed
+    if !write_claude_credentials(&source, &encoded) {
+        return TokenRefresh::Failed;
     }
+    // Write-through: when the source of truth is the FILE (a DIR account), ALSO update the keychain so
+    // the two stores never diverge. Without this, the keychain keeps the OLD (now server-side-dead)
+    // refresh token; a later keychain→file seed would clobber the fresh file with it, and the `claude`
+    // CLI (which reads the keychain) would hit a dead refresh token → /login. Best-effort: a keychain
+    // write failure doesn't fail the prime — the file already holds the fresh token and the next awake
+    // seed reconciles via `expiresAt`. Only for DIR accounts; `~/.claude` uses the keychain directly.
+    if let ClaudeCredSource::File(_) = &source {
+        let suffix = claude_keychain_suffix(config_dir);
+        let service = format!("Claude Code-credentials-{suffix}");
+        if read_keychain_blob(&service).is_some() {
+            let account = read_keychain_entry(&service)
+                .map(|(account, _)| account)
+                .unwrap_or_else(crate::tools::current_username);
+            let _ = write_claude_credentials(
+                &ClaudeCredSource::Keychain { service, account },
+                &encoded,
+            );
+        }
+    }
+    // The freshly written token now backs subsequent reads; drop any cached quota so the prime's
+    // window read uses the new token rather than a 401 cached under the old one.
+    invalidate_claude_cache(config_dir);
+    TokenRefresh::Ready
 }
 
 /// Where a Claude credential blob lives, so a refresh can write the rotated blob back to the same
@@ -555,11 +640,32 @@ enum ClaudeCredSource {
     File(PathBuf),
 }
 
-/// Like `claude_credentials_blob` but also returns the source so the caller can write back. Same
-/// lookup order (per-dir keychain → per-dir file → global keychain only for `~/.claude`).
+/// Like `claude_credentials_blob` but also returns the source so the caller can write back.
+///
+/// For an app-managed DIR account the FILE is the preferred source (and write target), so a refresh
+/// keeps the token in the DarkWake-readable file instead of the keychain. If there's no file yet, it
+/// reads the keychain (machine awake) and reports a `File` target so `ensure_fresh_claude_token` can
+/// seed the file from it. The default `~/.claude` account stays keychain-first/keychain-write.
 fn claude_credentials_source(config_dir: &Path) -> Option<(ClaudeCredSource, String)> {
+    let is_dir_account = config_dir != home_dir().join(".claude");
     let suffix = claude_keychain_suffix(config_dir);
     let per_dir_service = format!("Claude Code-credentials-{suffix}");
+    let file = config_dir.join(".credentials.json");
+
+    if is_dir_account {
+        // File first — the DarkWake-safe source of truth for a DIR account.
+        if let Some(blob) = read_file_blob(&file) {
+            return Some((ClaudeCredSource::File(file), blob));
+        }
+        // No file yet: read the keychain (works while awake) but target the FILE, so the next write
+        // seeds it. Once seeded, subsequent reads above take the file branch.
+        if let Some(blob) = read_keychain_blob(&per_dir_service) {
+            return Some((ClaudeCredSource::File(file), blob));
+        }
+        return None;
+    }
+
+    // Default ~/.claude: keychain-first (the user's own CLI profile), file fallback, then global.
     if let Some((account, blob)) = read_keychain_entry(&per_dir_service) {
         return Some((
             ClaudeCredSource::Keychain {
@@ -569,22 +675,17 @@ fn claude_credentials_source(config_dir: &Path) -> Option<(ClaudeCredSource, Str
             blob,
         ));
     }
-
-    let file = config_dir.join(".credentials.json");
     if let Some(blob) = read_file_blob(&file) {
         return Some((ClaudeCredSource::File(file), blob));
     }
-
-    if config_dir == home_dir().join(".claude") {
-        if let Some((account, blob)) = read_keychain_entry("Claude Code-credentials") {
-            return Some((
-                ClaudeCredSource::Keychain {
-                    service: "Claude Code-credentials".to_string(),
-                    account,
-                },
-                blob,
-            ));
-        }
+    if let Some((account, blob)) = read_keychain_entry("Claude Code-credentials") {
+        return Some((
+            ClaudeCredSource::Keychain {
+                service: "Claude Code-credentials".to_string(),
+                account,
+            },
+            blob,
+        ));
     }
     None
 }
@@ -657,23 +758,47 @@ fn write_claude_credentials(source: &ClaudeCredSource, blob: &str) -> bool {
             }
             false
         }
-        ClaudeCredSource::File(path) => {
-            // Match the keychain path's atomicity: write a temp file then rename, preserving perms.
-            let temporary = path.with_extension("json.tmp");
-            if std::fs::write(&temporary, blob).is_err() {
-                return false;
-            }
-            let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-            if std::fs::rename(&temporary, path).is_err() {
-                let _ = std::fs::remove_file(&temporary);
-                return false;
-            }
-            if let Some(permissions) = permissions {
-                let _ = std::fs::set_permissions(path, permissions);
-            }
-            true
-        }
+        ClaudeCredSource::File(path) => write_file_credentials(path, blob),
     }
+}
+
+/// Atomically write a credential blob to a `.credentials.json` file (temp-write + rename), with
+/// owner-only `0600` perms. Preserves existing perms on an overwrite; sets `0600` on a fresh file so
+/// a seeded token isn't world-readable. Used by both the refresh write-back and the keychain→file
+/// seed.
+fn write_file_credentials(path: &Path, blob: &str) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let existing_perms = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+    let temporary = path.with_extension("json.tmp");
+    // Create the temp file with 0600 from the start (mode applied at open, before any bytes land) so
+    // the OAuth token is never briefly world-readable. mode() is masked by umask but 0600 has no group
+    // /other bits to mask, so the result is owner-only regardless of umask.
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary);
+    let Ok(mut f) = opened else {
+        return false;
+    };
+    if f.write_all(blob.as_bytes()).is_err() || f.sync_all().is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return false;
+    }
+    drop(f);
+    if std::fs::rename(&temporary, path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return false;
+    }
+    // Preserve the original file's perms on an overwrite; a fresh file keeps the 0600 set above.
+    if let Some(perms) = existing_perms {
+        let _ = std::fs::set_permissions(path, perms);
+    } else {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    true
 }
 
 /// Claude's keychain suffix for a config dir = `sha256(path)[:8]` (hex).
@@ -696,14 +821,27 @@ pub fn claude_keychain_suffix(config_dir: &Path) -> String {
 /// `~/.claude`: try the old global keychain name. Do NOT fall back to the global one for a profile
 /// dir, to avoid reading the wrong account's token.
 fn claude_credentials_blob(config_dir: &Path) -> Option<String> {
+    // For an app-managed DIR account, read the `.credentials.json` FILE first. The keychain item is
+    // unreadable while the Mac is in DarkWake (woken in the background for a scheduled prime, before
+    // any GUI login unlocks the login keychain) — `security` returns empty, which read as "no token"
+    // and failed the morning primes. The file has no such lock, so seeding the token into it (see
+    // `ensure_fresh_claude_token`) lets a DarkWake prime read it. Falls back to keychain if no file
+    // yet. The default `~/.claude` account is left keychain-first — it's the user's own CLI profile,
+    // which owns its keychain lifecycle and is never primed unattended in the background.
+    let is_dir_account = config_dir != home_dir().join(".claude");
     let suffix = claude_keychain_suffix(config_dir);
+    if is_dir_account {
+        if let Some(blob) = read_file_blob(&config_dir.join(".credentials.json")) {
+            return Some(blob);
+        }
+    }
     if let Some(blob) = read_keychain_blob(&format!("Claude Code-credentials-{suffix}")) {
         return Some(blob);
     }
-    if let Some(blob) = read_file_blob(&config_dir.join(".credentials.json")) {
-        return Some(blob);
-    }
-    if config_dir == home_dir().join(".claude") {
+    if !is_dir_account {
+        if let Some(blob) = read_file_blob(&config_dir.join(".credentials.json")) {
+            return Some(blob);
+        }
         if let Some(blob) = read_keychain_blob("Claude Code-credentials") {
             return Some(blob);
         }
@@ -1379,6 +1517,22 @@ mod tests {
         assert!(claude_token_still_valid(&blob(now_ms + 11 * 60 * 1000)));
         // Missing expiresAt → fail safe (needs renewal).
         assert!(!claude_token_still_valid(&serde_json::json!({ "claudeAiOauth": { "accessToken": "x" } })));
+    }
+
+    #[test]
+    fn blob_expires_at_picks_newer_token() {
+        let blob = |ms: i64| format!(r#"{{"claudeAiOauth":{{"accessToken":"x","expiresAt":{ms}}}}}"#);
+        assert_eq!(blob_expires_at(&blob(1782426533086)), 1782426533086);
+        // Missing expiresAt → 0 (treated as oldest, so a real token always wins).
+        assert_eq!(blob_expires_at(r#"{"claudeAiOauth":{"accessToken":"x"}}"#), 0);
+        // Unparseable → 0.
+        assert_eq!(blob_expires_at("not json"), 0);
+        // The seed's decision: keychain copied to file only when STRICTLY newer.
+        let file = blob(2000);
+        let keychain_older = blob(1000);
+        let keychain_newer = blob(3000);
+        assert!(blob_expires_at(&file) >= blob_expires_at(&keychain_older)); // keep file
+        assert!(blob_expires_at(&file) < blob_expires_at(&keychain_newer)); // copy keychain
     }
 
     #[test]

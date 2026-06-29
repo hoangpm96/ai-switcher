@@ -5,6 +5,21 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.19] - 2026-06-29
+
+### Fixed
+
+- **Scheduled morning primes now work while the Mac is asleep, not only after you open it.** A prime
+  that ran during a background (DarkWake) wake couldn't read the Claude token: it lives in the login
+  keychain, which stays locked until you log in, so the prime saw "no token" and failed until you
+  opened the Mac and unlocked it (the token was only read once you arrived, hours late). For
+  app-managed accounts (those the app created with their own profile folder — not the machine's
+  default `~/.claude`), the app now also keeps the credential in the profile's `.credentials.json`
+  file, which a background prime can read with the keychain still locked. The file is written
+  owner-only and is kept in sync with the keychain: a refresh updates both, and whichever holds the
+  newer token wins, so the two never diverge and a stale copy can't be used. The machine's default
+  account is unchanged — it keeps using the keychain exactly as before.
+
 ## [0.5.18] - 2026-06-27
 
 ### Changed
