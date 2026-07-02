@@ -410,6 +410,32 @@ pub(crate) fn claude_token_state(config_dir: &Path) -> ClaudeTokenState {
     }
 }
 
+/// The stored token's `expiresAt` (epoch ms), offline. `None` when no credential / no `expiresAt`.
+pub(crate) fn claude_token_expiry_ms(config_dir: &Path) -> Option<i64> {
+    claude_credentials_blob(config_dir)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("claudeAiOauth")
+                .and_then(|o| o.get("expiresAt"))
+                .and_then(serde_json::Value::as_i64)
+        })
+}
+
+/// The stored token's `expiresAt` as a local `HH:MM` string, for human-readable log lines (offline).
+/// Returns "?" when no credential / no `expiresAt`.
+pub(crate) fn claude_token_expiry_hhmm(config_dir: &Path) -> String {
+    let Some(ms) = claude_token_expiry_ms(config_dir) else {
+        return "?".to_string();
+    };
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "?".to_string())
+}
+
 /// Whether the account's per-dir keychain item is READABLE right now. Returns false when the login
 /// keychain is locked — which is exactly the DarkWake state (Mac woken in the background before any
 /// GUI login). The prime path uses this as a proxy for "awake enough to renew": renewing a Claude

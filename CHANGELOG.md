@@ -5,6 +5,17 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.21] - 2026-07-02
+
+### Changed
+
+- **Auto-prime log now spells out the token situation and the next step.** Each Claude attempt logs
+  when the token expires (e.g. "token còn hạn tới 11:40"), and when a prime is deferred because the
+  token expired while the Mac was asleep it says so plainly ("keychain đang khóa (máy ngủ) → HOÃN,
+  prime lại khi máy thức") instead of a vague failure. Errors that need you (a login prompt, or an
+  org that disabled OAuth) now carry a one-line hint pointing at the real fix, rather than implying a
+  retry will resolve it.
+
 ## [0.5.20] - 2026-06-30
 
 ### Changed

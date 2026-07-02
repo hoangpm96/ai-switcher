@@ -125,10 +125,13 @@ pub fn prime_account_traced(
     //     TCC-protected folder → no permission popups regardless of who spawned it.
     if matches!(tool_id, ToolId::Claude) {
         trace("D1 kiểm tra token Claude");
+        let exp_hhmm = quota::claude_token_expiry_hhmm(config_dir);
         match quota::claude_token_state(config_dir) {
-            quota::ClaudeTokenState::Valid => trace("D1 token còn hạn"),
+            quota::ClaudeTokenState::Valid => {
+                trace(&format!("D1 token còn hạn (tới {exp_hhmm}) → prime thẳng qua HTTP"))
+            }
             quota::ClaudeTokenState::Missing => {
-                trace("D1 không có token → SkipNoToken");
+                trace("D1 không đọc được token (chưa đăng nhập, hoặc keychain khóa lúc DarkWake) → SkipNoToken");
                 return PrimeOutcome::SkipNoToken;
             }
             quota::ClaudeTokenState::Expired => {
@@ -140,10 +143,14 @@ pub fn prime_account_traced(
                 // whose token expired overnight runs a bit late (when the Mac is unlocked) instead of
                 // the app ever rotating the token itself and logging a live `claude` session out.
                 if !quota::claude_keychain_readable(config_dir) {
-                    trace("D1 token hết hạn nhưng keychain đang khóa (DarkWake) → hoãn tới khi máy thức");
+                    trace(&format!(
+                        "D1 token đã hết hạn ({exp_hhmm}) nhưng keychain đang khóa (máy ngủ/DarkWake) → HOÃN, prime lại khi máy thức (KHÔNG rotate để giữ phiên CLI)"
+                    ));
                     return PrimeOutcome::SkipUnknownState;
                 }
-                trace("D1 token hết hạn → giao Claude CLI tự làm mới + gửi hi (app không rotate)");
+                trace(&format!(
+                    "D1 token đã hết hạn ({exp_hhmm}), keychain đọc được (máy thức) → giao Claude CLI tự làm mới + gửi hi (app không rotate)"
+                ));
                 // Prefer the account's configured binary; fall back to auto-detecting `claude` on PATH
                 // so an account with no explicit binary path can still renew.
                 let resolved = binary
@@ -161,7 +168,10 @@ pub fn prime_account_traced(
                 }
                 trace("D1 chạy claude CLI (refresh + hi trong 1 lần)");
                 if let Err(reason) = send_hi_cli(tool_id, config_dir, binary) {
-                    trace(&format!("D1 CLI lỗi: {reason} → thử lại tick sau"));
+                    // Distinguish user-actionable failures (which retrying can't fix) from transient
+                    // ones, so the log points at the real next step instead of "just retrying".
+                    let hint = claude_cli_error_hint(&reason);
+                    trace(&format!("D1 CLI lỗi: {reason}{hint}"));
                     return PrimeOutcome::FailSend { reason };
                 }
                 // The CLI just refreshed its token into the keychain (and, on a DIR account, deleted
@@ -682,6 +692,20 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
             }
             Err(e) => return Err(format!("CLI: {e}")),
         }
+    }
+}
+
+/// Append a human next-step hint to a Claude CLI error when it's recognisably user-actionable,
+/// so the log says WHAT to do rather than implying a retry will fix it. Empty when it's a plain
+/// transient error (retry is the right move).
+fn claude_cli_error_hint(reason: &str) -> &'static str {
+    let r = reason.to_ascii_lowercase();
+    if r.contains("/login") || r.contains("not logged in") || r.contains("please run") {
+        " → CẦN đăng nhập lại: mở `claude` trên account này rồi /login (retry không tự khỏi)"
+    } else if r.contains("not allowed for this organization") || r.contains("disabled claude") {
+        " → org đã TẮT OAuth cho account này (lỗi phía Anthropic, app không sửa được — hỏi admin org)"
+    } else {
+        " → thử lại tick sau"
     }
 }
 
