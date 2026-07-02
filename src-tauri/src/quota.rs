@@ -5,14 +5,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Anthropic's OAuth token endpoint + the Claude Code public client id, used by the prime path to
-/// renew an expired access token via the refresh-token grant. Verified working at v0.5.12 (commit
-/// 42986ff); kept here because the prime flow now refreshes again (see `refresh_claude_oauth`).
-const CLAUDE_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Treat a token as needing renewal once it is within this skew of `expiresAt`, so a prime never
 /// sends with a token that expires mid-flight (the exact failure mode of the 2026-06-25 morning
 /// primes: token expired during the confirm polls). 10 minutes comfortably covers one prime burst
@@ -378,8 +373,8 @@ pub(crate) fn claude_oauth_token(config_dir: &Path) -> Option<String> {
 /// /login". During normal daytime use a CLI session may well be live, so the UI tolerates a stale
 /// token (surfacing an "open Claude Code to refresh" hint) rather than risk clobbering it.
 ///
-/// The PRIME path is different — it runs at a scheduled early-morning hour when no CLI session is
-/// using the account, so it CAN safely renew. It calls `ensure_fresh_claude_token` instead.
+/// When a token is expired, renewal is delegated to the `claude` CLI itself (see
+/// `claude_token_state` / prime D1) — the app never runs the refresh grant.
 ///
 /// (Kept as a distinct name from `claude_oauth_token` so call sites read intentionally; both now do
 /// the same read-only thing.)
@@ -387,19 +382,54 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path) -> Option<String> {
     claude_oauth_token(config_dir)
 }
 
-/// Outcome of an attempt to renew a Claude access token via the refresh-token grant.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TokenRefresh {
-    /// The stored token was still valid (or freshly renewed): a usable access token is in keychain.
-    Ready,
-    /// The refresh endpoint rate-limited us (HTTP 429). Transient — back off and retry on the next
-    /// scheduler tick rather than hammering the endpoint (which only prolongs the throttle).
-    RateLimited,
-    /// No credentials/refresh token present, or the account is logged out.
-    NoToken,
-    /// The grant failed for another reason (network, 4xx other than 429, malformed response, or the
-    /// keychain write-back failed). Transient from the scheduler's view — it retries.
-    Failed,
+/// Offline classification of an account's stored Claude credential. The app NEVER refreshes or
+/// rotates a Claude token itself — Anthropic's refresh grant rotates the one-time-use refresh token,
+/// and any app-side rotation invalidates the chain a live/overnight `claude` session still holds,
+/// forcing "/login" (the exact failure the app exists to avoid). When a token is `Expired`, the
+/// prime path hands the WHOLE job (refresh + "hi") to the `claude` CLI, whose own refresh mechanism
+/// is what concurrent CLI sessions already share safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeTokenState {
+    /// No credential stored (logged out / never logged in).
+    Missing,
+    /// Access token valid for at least `CLAUDE_TOKEN_EXPIRY_SKEW_MS` more — usable as-is.
+    Valid,
+    /// Present but expired (or about to): only the CLI may renew it.
+    Expired,
+}
+
+/// Classify the stored Claude credential OFFLINE (reads `claudeAiOauth.expiresAt`, no network).
+pub(crate) fn claude_token_state(config_dir: &Path) -> ClaudeTokenState {
+    let Some(raw) = claude_credentials_blob(config_dir) else {
+        return ClaudeTokenState::Missing;
+    };
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) if claude_token_still_valid(&value) => ClaudeTokenState::Valid,
+        Ok(_) => ClaudeTokenState::Expired,
+        Err(_) => ClaudeTokenState::Missing,
+    }
+}
+
+/// Whether the account's per-dir keychain item is READABLE right now. Returns false when the login
+/// keychain is locked — which is exactly the DarkWake state (Mac woken in the background before any
+/// GUI login). The prime path uses this as a proxy for "awake enough to renew": renewing a Claude
+/// token means running the CLI, which reads/writes the keychain; doing that while locked either fails
+/// or lands the fresh token in a still-locked keychain that the confirm read can't see. So when this
+/// is false the prime DEFERS the CLI renewal to a later (awake) tick instead of failing. A DIR
+/// account only; `~/.claude` always reports readable (its own CLI owns that lifecycle).
+pub(crate) fn claude_keychain_readable(config_dir: &Path) -> bool {
+    if config_dir == home_dir().join(".claude") {
+        return true;
+    }
+    let suffix = claude_keychain_suffix(config_dir);
+    read_keychain_blob(&format!("Claude Code-credentials-{suffix}")).is_some()
+}
+
+/// Public wrapper: re-mirror the account's keychain token into its `.credentials.json` file. Called
+/// by the prime path right after the CLI renews the token, so the fresh keychain value is copied
+/// back into the DarkWake-readable file (the CLI deletes the file when it rotates). Copy-only.
+pub(crate) fn reseed_claude_file(config_dir: &Path) {
+    seed_claude_credentials_file(config_dir);
 }
 
 /// Mirror an app-managed DIR account's keychain token into its `.credentials.json` file, so an
@@ -427,10 +457,9 @@ fn seed_claude_credentials_file(config_dir: &Path) {
         return;
     }
     // Only copy keychain→file when the keychain token is STRICTLY NEWER (or the file is missing /
-    // unparseable). Critical: after an app file-only refresh the keychain may hold an OLDER token; a
-    // blind "copy on differ" would overwrite the fresh file with that stale token, and a later prime
-    // would then send a dead refresh token. Comparing `expiresAt` keeps the newest token authoritative.
-    // (Write-through on refresh normally keeps both equal, so this branch rarely fires — defense in depth.)
+    // unparseable) — the newest token stays authoritative. The CLI writes its refreshes to the
+    // keychain, so keychain-newer is the normal direction; guarding by `expiresAt` just makes the
+    // copy safe no matter which store happens to be fresher.
     if let Some(existing) = &file_blob {
         if blob_expires_at(existing) >= blob_expires_at(&keychain_blob) {
             return; // file is as-new-or-newer than keychain → keep the file
@@ -452,39 +481,6 @@ fn blob_expires_at(blob: &str) -> i64 {
         .unwrap_or(0)
 }
 
-/// Ensure the prime path has a usable Claude access token, renewing it if it has expired (or is
-/// within `CLAUDE_TOKEN_EXPIRY_SKEW_MS` of expiry). This is the prime-only entry point — see
-/// `claude_oauth_token_fresh` for why the UI path must NOT call this.
-///
-/// Reads `claudeAiOauth.expiresAt` from the stored blob OFFLINE (no network) and only fires the
-/// refresh-token grant when the token actually needs it, so a still-valid token costs nothing and
-/// never touches the (rate-limit-sensitive) token endpoint.
-pub(crate) fn ensure_fresh_claude_token(config_dir: &Path) -> TokenRefresh {
-    // Read the credential source ONCE here and reuse it for both the offline expiry check and (if
-    // needed) the refresh. Each keychain touch on an item another app owns can raise a macOS prompt,
-    // so collapsing the reads keeps the dialog count to a minimum (and the post-write `-A` flag makes
-    // every subsequent read/write prompt-free).
-    let Some((source, raw)) = claude_credentials_source(config_dir) else {
-        return TokenRefresh::NoToken;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return TokenRefresh::Failed;
-    };
-    if claude_token_still_valid(&value) {
-        // Token is good. If the source resolved to a FILE target that doesn't exist yet (a DIR account
-        // whose token still lives only in the keychain), seed the file now — while the Mac is awake and
-        // the keychain is readable — so a later DarkWake prime can read the token from the file. Best
-        // effort: a failed seed just means the next awake prime retries it.
-        if let ClaudeCredSource::File(path) = &source {
-            if !path.exists() {
-                let _ = write_claude_credentials(&source, &raw);
-            }
-        }
-        return TokenRefresh::Ready;
-    }
-    refresh_claude_oauth(config_dir, source, value)
-}
-
 /// True when the blob's `claudeAiOauth.expiresAt` (epoch ms) is far enough in the future to use for
 /// a full prime burst. A missing/zero `expiresAt` is treated as needing renewal (fail safe).
 fn claude_token_still_valid(value: &serde_json::Value) -> bool {
@@ -495,277 +491,10 @@ fn claude_token_still_valid(value: &serde_json::Value) -> bool {
         .is_some_and(|expiry| expiry > chrono::Utc::now().timestamp_millis() + CLAUDE_TOKEN_EXPIRY_SKEW_MS)
 }
 
-/// Renew the Claude access token via the refresh-token grant and write the rotated blob back to its
-/// source (keychain or per-dir file). One-time-use: this consumes the stored refresh token and
-/// replaces it with the new one, which is why ONLY the prime path (no live CLI session) calls it.
-///
-/// Serialized by a global lock so concurrent callers for the same expired account don't each fire a
-/// grant — the first rotates the token; a racing grant with the now-consumed old token would 400.
-///
-/// Crash window (inherent, unavoidable): the grant fires BEFORE the write-back, and one-time-use
-/// rotation means we can't know the new token without spending the old one. If the process dies
-/// between the grant returning and the keychain write completing, the old refresh token is dead
-/// server-side and the new one was never stored → the account needs a manual `claude` re-login. The
-/// window is a single keychain write after the HTTP response is already in hand, and the prime runs
-/// at a quiet hour, so this is low-risk but not zero. A write FAILURE (not a crash) is handled: it
-/// returns `Failed` (retryable) without claiming success.
-fn refresh_claude_oauth(
-    config_dir: &Path,
-    source: ClaudeCredSource,
-    value_before_lock: serde_json::Value,
-) -> TokenRefresh {
-    static REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let Ok(_guard) = REFRESH_LOCK.get_or_init(|| Mutex::new(())).lock() else {
-        return TokenRefresh::Failed;
-    };
-
-    // The caller already read+parsed the blob (before taking the lock). Re-read ONCE inside the lock
-    // for the double-check: a racing caller may have refreshed while we waited, leaving a token that
-    // is no longer near expiry — skip the redundant (rotation-consuming) grant. If the re-read fails,
-    // fall back to the caller's pre-lock value rather than touch the keychain again.
-    let mut value = claude_credentials_blob(config_dir)
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .unwrap_or(value_before_lock);
-    if claude_token_still_valid(&value) {
-        return TokenRefresh::Ready;
-    }
-    let Some(refresh_token) = value
-        .get("claudeAiOauth")
-        .and_then(|oauth| oauth.get("refreshToken"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-    else {
-        return TokenRefresh::NoToken;
-    };
-
-    let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    else {
-        return TokenRefresh::Failed;
-    };
-    let response = client
-        .post(CLAUDE_OAUTH_TOKEN_URL)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLAUDE_OAUTH_CLIENT_ID,
-        }))
-        .send();
-    let parsed = match response {
-        Ok(resp) => {
-            let status = resp.status();
-            // 429 means we were throttled BEFORE the grant ran, so the refresh token is NOT consumed
-            // — back off and let the scheduler retry, don't hammer the endpoint.
-            if status.as_u16() == 429 {
-                return TokenRefresh::RateLimited;
-            }
-            match resp.error_for_status() {
-                Ok(ok) => ok.json::<serde_json::Value>().ok(),
-                Err(_) => return TokenRefresh::Failed,
-            }
-        }
-        Err(_) => return TokenRefresh::Failed,
-    };
-    let Some(response) = parsed else {
-        return TokenRefresh::Failed;
-    };
-
-    let Some(new_access) = response.get("access_token").and_then(serde_json::Value::as_str) else {
-        return TokenRefresh::Failed;
-    };
-    let Some(oauth) = value
-        .get_mut("claudeAiOauth")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return TokenRefresh::Failed;
-    };
-    oauth.insert(
-        "accessToken".to_string(),
-        serde_json::Value::String(new_access.to_string()),
-    );
-    // The grant rotates the refresh token; persist the new one or the next refresh would 400.
-    if let Some(new_refresh) = response.get("refresh_token").and_then(serde_json::Value::as_str) {
-        oauth.insert(
-            "refreshToken".to_string(),
-            serde_json::Value::String(new_refresh.to_string()),
-        );
-    }
-    // `expires_in` is seconds-from-now; the blob stores `expiresAt` as epoch milliseconds. Recording
-    // it keeps our offline expiry check (`claude_token_still_valid`) accurate for the next prime.
-    if let Some(expires_in) = response.get("expires_in").and_then(serde_json::Value::as_i64) {
-        let expires_at = chrono::Utc::now().timestamp_millis() + expires_in * 1000;
-        oauth.insert(
-            "expiresAt".to_string(),
-            serde_json::Value::Number(expires_at.into()),
-        );
-    }
-
-    let Ok(encoded) = serde_json::to_string(&value) else {
-        return TokenRefresh::Failed;
-    };
-    if !write_claude_credentials(&source, &encoded) {
-        return TokenRefresh::Failed;
-    }
-    // Write-through: when the source of truth is the FILE (a DIR account), ALSO update the keychain so
-    // the two stores never diverge. Without this, the keychain keeps the OLD (now server-side-dead)
-    // refresh token; a later keychain→file seed would clobber the fresh file with it, and the `claude`
-    // CLI (which reads the keychain) would hit a dead refresh token → /login. Best-effort: a keychain
-    // write failure doesn't fail the prime — the file already holds the fresh token and the next awake
-    // seed reconciles via `expiresAt`. Only for DIR accounts; `~/.claude` uses the keychain directly.
-    if let ClaudeCredSource::File(_) = &source {
-        let suffix = claude_keychain_suffix(config_dir);
-        let service = format!("Claude Code-credentials-{suffix}");
-        if read_keychain_blob(&service).is_some() {
-            let account = read_keychain_entry(&service)
-                .map(|(account, _)| account)
-                .unwrap_or_else(crate::tools::current_username);
-            let _ = write_claude_credentials(
-                &ClaudeCredSource::Keychain { service, account },
-                &encoded,
-            );
-        }
-    }
-    // The freshly written token now backs subsequent reads; drop any cached quota so the prime's
-    // window read uses the new token rather than a 401 cached under the old one.
-    invalidate_claude_cache(config_dir);
-    TokenRefresh::Ready
-}
-
-/// Where a Claude credential blob lives, so a refresh can write the rotated blob back to the same
-/// place it was read from.
-enum ClaudeCredSource {
-    Keychain { service: String, account: String },
-    File(PathBuf),
-}
-
-/// Like `claude_credentials_blob` but also returns the source so the caller can write back.
-///
-/// For an app-managed DIR account the FILE is the preferred source (and write target), so a refresh
-/// keeps the token in the DarkWake-readable file instead of the keychain. If there's no file yet, it
-/// reads the keychain (machine awake) and reports a `File` target so `ensure_fresh_claude_token` can
-/// seed the file from it. The default `~/.claude` account stays keychain-first/keychain-write.
-fn claude_credentials_source(config_dir: &Path) -> Option<(ClaudeCredSource, String)> {
-    let is_dir_account = config_dir != home_dir().join(".claude");
-    let suffix = claude_keychain_suffix(config_dir);
-    let per_dir_service = format!("Claude Code-credentials-{suffix}");
-    let file = config_dir.join(".credentials.json");
-
-    if is_dir_account {
-        // File first — the DarkWake-safe source of truth for a DIR account.
-        if let Some(blob) = read_file_blob(&file) {
-            return Some((ClaudeCredSource::File(file), blob));
-        }
-        // No file yet: read the keychain (works while awake) but target the FILE, so the next write
-        // seeds it. Once seeded, subsequent reads above take the file branch.
-        if let Some(blob) = read_keychain_blob(&per_dir_service) {
-            return Some((ClaudeCredSource::File(file), blob));
-        }
-        return None;
-    }
-
-    // Default ~/.claude: keychain-first (the user's own CLI profile), file fallback, then global.
-    if let Some((account, blob)) = read_keychain_entry(&per_dir_service) {
-        return Some((
-            ClaudeCredSource::Keychain {
-                service: per_dir_service,
-                account,
-            },
-            blob,
-        ));
-    }
-    if let Some(blob) = read_file_blob(&file) {
-        return Some((ClaudeCredSource::File(file), blob));
-    }
-    if let Some((account, blob)) = read_keychain_entry("Claude Code-credentials") {
-        return Some((
-            ClaudeCredSource::Keychain {
-                service: "Claude Code-credentials".to_string(),
-                account,
-            },
-            blob,
-        ));
-    }
-    None
-}
-
-/// Read a keychain entry's blob plus its account name (needed to write the same entry back).
-fn read_keychain_entry(service: &str) -> Option<(String, String)> {
-    let blob = read_keychain_blob(service)?;
-    // Attribute dump (no `-w`) prints `"acct"<blob>="<name>"`. Parse it; fall back to the macOS user.
-    let account = Command::new("security")
-        .args(["find-generic-password", "-s", service])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| parse_keychain_account(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_else(crate::tools::current_username);
-    Some((account, blob))
-}
-
-fn parse_keychain_account(dump: &str) -> Option<String> {
-    let line = dump.lines().find(|line| line.contains("\"acct\""))?;
-    // Split on the FIRST `=` only: the account value itself may contain `=` (e.g. an email or a
-    // base64-ish id), and `split('=').nth(1)` would truncate it. `split_once` keeps the rest.
-    let value = line.split_once('=')?.1.trim().trim_matches('"');
-    (!value.is_empty() && value != "<NULL>").then(|| value.to_string())
-}
-
-/// Write a rotated credential blob back to its source. Retries a keychain set a few times to ride
-/// out a transient lock, since a lost write strands the account (its refresh token was rotated
-/// server-side, so the old one no longer works).
-fn write_claude_credentials(source: &ClaudeCredSource, blob: &str) -> bool {
-    match source {
-        ClaudeCredSource::Keychain { service, account } => {
-            for attempt in 0..3 {
-                // Write via `security add-generic-password -U`, NOT the `keyring` crate, for two
-                // reasons:
-                //   1. It is the SAME `security` path used to read the item, so macOS treats read and
-                //      write as one access decision instead of two separate prompts.
-                //   2. `-A` adds the item to the "any application may access without warning" list.
-                //      This app is ad-hoc / linker-signed (no stable Developer ID), so a per-app trust
-                //      entry (`-T`) would be forgotten on every rebuild and re-prompt; `-A` is the only
-                //      durable way to stop the keychain dialog on an unsigned local build. Trade-off:
-                //      any process running as this user can read the item without warning — acceptable
-                //      on a personal machine, and Claude Code keeps reading it exactly as before.
-                // `-U` updates the existing (service, account) item in place rather than creating a
-                // duplicate. We still read back BY SERVICE to confirm the write landed on the slot
-                // Claude reads — a wrong-slot write would otherwise strand the account (its server-side
-                // refresh token is already spent), so a mismatch returns false → caller reports
-                // `Failed` (retryable) instead of a false `Ready`.
-                let wrote = Command::new("security")
-                    .args([
-                        "add-generic-password",
-                        "-U",
-                        "-A",
-                        "-s",
-                        service,
-                        "-a",
-                        account,
-                        "-w",
-                        blob,
-                    ])
-                    .output()
-                    .map(|out| out.status.success())
-                    .unwrap_or(false);
-                if wrote && read_keychain_blob(service).as_deref() == Some(blob) {
-                    return true;
-                }
-                if attempt < 2 {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-            }
-            false
-        }
-        ClaudeCredSource::File(path) => write_file_credentials(path, blob),
-    }
-}
-
 /// Atomically write a credential blob to a `.credentials.json` file (temp-write + rename), with
 /// owner-only `0600` perms. Preserves existing perms on an overwrite; sets `0600` on a fresh file so
-/// a seeded token isn't world-readable. Used by both the refresh write-back and the keychain→file
-/// seed.
+/// a seeded token isn't world-readable. Used by the keychain→file seed — the app's ONLY credential
+/// write; it never writes the keychain (no rotation, no keychain password prompts).
 fn write_file_credentials(path: &Path, blob: &str) -> bool {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -825,7 +554,7 @@ fn claude_credentials_blob(config_dir: &Path) -> Option<String> {
     // unreadable while the Mac is in DarkWake (woken in the background for a scheduled prime, before
     // any GUI login unlocks the login keychain) — `security` returns empty, which read as "no token"
     // and failed the morning primes. The file has no such lock, so seeding the token into it (see
-    // `ensure_fresh_claude_token`) lets a DarkWake prime read it. Falls back to keychain if no file
+    // `seed_claude_credentials_file`) lets a DarkWake prime read it. Falls back to keychain if no file
     // yet. The default `~/.claude` account is left keychain-first — it's the user's own CLI profile,
     // which owns its keychain lifecycle and is never primed unattended in the background.
     let is_dir_account = config_dir != home_dir().join(".claude");
@@ -1535,15 +1264,6 @@ mod tests {
         assert!(blob_expires_at(&file) < blob_expires_at(&keychain_newer)); // copy keychain
     }
 
-    #[test]
-    fn parses_keychain_account_attribute() {
-        let dump = "keychain: \"/Users/me/Library/Keychains/login.keychain-db\"\n    \"acct\"<blob>=\"me@example.com\"\n    \"svce\"<blob>=\"Claude Code-credentials-43cb810f\"";
-        assert_eq!(parse_keychain_account(dump).as_deref(), Some("me@example.com"));
-        // No acct line → None (caller falls back to the macOS username).
-        assert_eq!(parse_keychain_account("keychain: \"login\"\n"), None);
-        // NULL acct → None.
-        assert_eq!(parse_keychain_account("    \"acct\"<blob>=<NULL>"), None);
-    }
 
     #[test]
     fn parses_codex_rate_limits_line() {

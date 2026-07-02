@@ -114,30 +114,78 @@ pub fn prime_account_traced(
     // at function exit (any return path). No-op when caffeinate is missing (non-macOS / stripped).
     let _awake = CaffeinateGuard::start();
 
-    // D1 — token must be valid AND not expired. For Claude, renew an expired access token first:
-    // the prime runs at an early-morning hour when no `claude` CLI session is using the account, so
-    // rotating the one-time-use refresh token here is safe (the daytime UI quota path must NOT do
-    // this — see `claude_oauth_token_fresh`). This closes the 2026-06-25 failure where a present-but-
-    // expired token passed D1, then 401'd during the window read / confirm and reported a confusing
-    // "couldn't confirm session". Reads `expiresAt` offline; only hits the token endpoint when stale.
+    // D1 — token must be present, and for Claude also decides HOW to prime. The app NEVER refreshes
+    // a Claude token itself: Anthropic's grant rotates the one-time-use refresh token, and an
+    // app-side rotation invalidates the chain a live/overnight `claude` session still holds → that
+    // session's next refresh 401s → "/login" (the exact pain this app exists to remove).
+    //   - Valid token  → prime over plain HTTP with the existing token (no rotation, fast path).
+    //   - Expired      → hand the WHOLE job to the `claude` CLI: one `-p hi` run makes the CLI renew
+    //     its own token (its multi-session-safe mechanism) AND sends the "hi" that opens the window.
+    //     The CLI runs with a fake HOME so its Desktop/Documents/Downloads preflight never touches a
+    //     TCC-protected folder → no permission popups regardless of who spawned it.
     if matches!(tool_id, ToolId::Claude) {
         trace("D1 kiểm tra token Claude");
-        match quota::ensure_fresh_claude_token(config_dir) {
-            quota::TokenRefresh::Ready => trace("D1 token còn hạn / đã làm mới OK"),
-            quota::TokenRefresh::NoToken => {
+        match quota::claude_token_state(config_dir) {
+            quota::ClaudeTokenState::Valid => trace("D1 token còn hạn"),
+            quota::ClaudeTokenState::Missing => {
                 trace("D1 không có token → SkipNoToken");
                 return PrimeOutcome::SkipNoToken;
             }
-            // 429 / transient failure: don't send (would 401), and don't hammer the rate-limit-
-            // sensitive token endpoint. Fail open as retryable so the scheduler's 5-minute loop
-            // re-attempts once the throttle clears.
-            quota::TokenRefresh::RateLimited => {
-                trace("D1 token hết hạn, làm mới bị giới hạn (HTTP 429) → đợi tick sau");
-                return PrimeOutcome::SkipUnknownState;
-            }
-            quota::TokenRefresh::Failed => {
-                trace("D1 token hết hạn, làm mới thất bại → đợi tick sau");
-                return PrimeOutcome::SkipUnknownState;
+            quota::ClaudeTokenState::Expired => {
+                // Renewing means running the CLI, which reads/writes the login keychain. During
+                // DarkWake (Mac woken in the background for a scheduled prime, before any GUI login)
+                // the keychain is LOCKED — the CLI would fail, or land the fresh token in a locked
+                // keychain the confirm read can't see, producing a false "couldn't confirm". So DEFER
+                // to a later awake tick rather than fail. This is the deliberate trade-off: a prime
+                // whose token expired overnight runs a bit late (when the Mac is unlocked) instead of
+                // the app ever rotating the token itself and logging a live `claude` session out.
+                if !quota::claude_keychain_readable(config_dir) {
+                    trace("D1 token hết hạn nhưng keychain đang khóa (DarkWake) → hoãn tới khi máy thức");
+                    return PrimeOutcome::SkipUnknownState;
+                }
+                trace("D1 token hết hạn → giao Claude CLI tự làm mới + gửi hi (app không rotate)");
+                // Prefer the account's configured binary; fall back to auto-detecting `claude` on PATH
+                // so an account with no explicit binary path can still renew.
+                let resolved = binary
+                    .map(std::path::Path::to_path_buf)
+                    .or_else(|| crate::tools::command_path("claude"));
+                let Some(binary) = resolved.as_deref() else {
+                    trace("D1 chưa tìm thấy claude CLI → đợi tick sau");
+                    return PrimeOutcome::SkipUnknownState;
+                };
+                // Durable Confirming marker BEFORE the external send, same contract as the HTTP path
+                // (no baseline reset — the expired token can't read the window beforehand).
+                if let Err(reason) = before_send(None) {
+                    trace(&format!("D1 ghi marker trước khi chạy CLI lỗi: {reason}"));
+                    return PrimeOutcome::FailSend { reason };
+                }
+                trace("D1 chạy claude CLI (refresh + hi trong 1 lần)");
+                if let Err(reason) = send_hi_cli(tool_id, config_dir, binary) {
+                    trace(&format!("D1 CLI lỗi: {reason} → thử lại tick sau"));
+                    return PrimeOutcome::FailSend { reason };
+                }
+                // The CLI just refreshed its token into the keychain (and, on a DIR account, deleted
+                // the `.credentials.json` file). Mirror the fresh keychain token back into the file so
+                // the confirm read below — and any later DarkWake prime — can read it. Keychain is
+                // readable here (we gated on that above), so this succeeds.
+                quota::reseed_claude_file(config_dir);
+                quota::invalidate_claude_cache(config_dir);
+                trace("D1 CLI xong (token đã được CLI làm mới, hi đã gửi) → xác nhận window");
+                // Confirm like the resume path: no pre-send baseline; `Some(false)` lets the
+                // newly-active signal count (a send only happens when no window was confirmed
+                // running). Edge: if a window anchored from another device WAS running, this reports
+                // Success with that window's (real, active) reset — informationally correct.
+                return match claude_confirm_anchored(config_dir, None, Some(false), &mut sleeper, &mut trace)
+                {
+                    Some(new_reset_at) => {
+                        trace(&format!("D4 xác nhận OK, reset mới {new_reset_at}"));
+                        PrimeOutcome::Success { new_reset_at }
+                    }
+                    None => {
+                        trace("D4 hết budget chưa xác nhận → FailUnconfirmed (tick sau thử lại)");
+                        PrimeOutcome::FailUnconfirmed
+                    }
+                };
             }
         }
     } else {
@@ -525,6 +573,14 @@ fn uses_cli_for_prime(tool_id: &ToolId) -> bool {
     matches!(tool_id, ToolId::Antigravity)
 }
 
+/// Renew a Claude account's token by running the `claude` CLI once (fake HOME, no popups) — the
+/// CLI's own refresh is the only session-safe way to rotate; the app never runs the grant itself.
+/// Used by the UI "Làm mới token" button. The run also sends one "hi" (that's what makes the CLI
+/// actually refresh — a status check alone doesn't touch the token, verified in v0.5.3).
+pub fn claude_cli_refresh(config_dir: &Path, binary: &Path) -> Result<(), String> {
+    send_hi_cli(&ToolId::Claude, config_dir, binary)
+}
+
 /// Prime by running the account's CLI non-interactively, with the account's config dir in the
 /// environment so the CLI uses the right profile/token. Exit 0 = success.
 fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(), String> {
@@ -539,9 +595,20 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
     command.env("PATH", cli_path(binary));
     match tool_id {
         ToolId::Claude => {
+            // Fake HOME: Claude's startup preflights ~/Desktop, ~/Documents, ~/Downloads and the
+            // media library through Node's os.homedir() (= $HOME). Pointing HOME at an app-owned
+            // empty dir makes every one of those paths land OUTSIDE the TCC-protected folders, so
+            // macOS has nothing to prompt for — no permission popups no matter which process (GUI
+            // app or LaunchDaemon) spawned this. Auth is unaffected: credentials resolve via
+            // CLAUDE_CONFIG_DIR (its .credentials.json / per-dir keychain item), not HOME.
+            // (Verified live 2026-06-30: `HOME=<fake> claude -p hi` authenticates and replies in ~4s
+            // and writes nothing into the fake home.)
+            let fake_home = config_dir.join(".prime-home");
+            let _ = std::fs::create_dir_all(&fake_home);
             command
                 .args(quota::CLAUDE_BACKGROUND_ARGS)
                 .env("CLAUDE_CONFIG_DIR", config_dir)
+                .env("HOME", &fake_home)
                 // A background prime needs auth + one API request only. Safe mode alone still lets
                 // Claude initialise its built-in tool/sandbox layer, which preflights Desktop,
                 // Documents, Downloads and Media Library through macOS TCC. Disable every context
@@ -669,8 +736,9 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
 
     let response = match tool_id {
         ToolId::Claude => {
-            // The token was already renewed if needed at D1 (`ensure_fresh_claude_token`), so this
-            // is a plain read of the current (fresh) access token.
+            // Reached only on the VALID-token fast path (D1 classified the token as usable). An
+            // expired token is handled entirely by the CLI at D1 and never reaches here, so this is
+            // a plain read of the current (still-valid) access token — no refresh.
             let token = quota::claude_oauth_token_fresh(config_dir)
                 .ok_or_else(|| "token".to_string())?;
             let version = quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());

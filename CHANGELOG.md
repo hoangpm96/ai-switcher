@@ -5,6 +5,24 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.20] - 2026-06-30
+
+### Changed
+
+- **The app no longer refreshes Claude tokens itself — switching/priming can never log a CLI session
+  out.** Anthropic's OAuth refresh token is single-use, so when the app rotated it, any live or
+  overnight `claude` session on that account lost its token chain and was forced to `/login` — the
+  opposite of what an account switcher should do. The app now never runs the refresh grant and never
+  writes the keychain. When a scheduled prime finds an expired token it hands the whole job to the
+  account's own `claude` CLI (one background run that refreshes the CLI's own token — the mechanism
+  concurrent CLI sessions already share safely — and sends the priming request). A still-valid token
+  primes directly over HTTP as before. The "Làm mới token" button likewise renews through the CLI.
+- **No more macOS folder-permission popups from background priming.** The `claude` CLI is launched
+  with an app-owned empty HOME directory, so its startup checks for Desktop/Documents/Downloads land
+  outside the protected folders macOS guards — nothing to prompt for — while credentials still load
+  from the account's own config dir. And because the app no longer writes the keychain, it no longer
+  triggers the keychain password prompt either.
+
 ## [0.5.19] - 2026-06-29
 
 ### Fixed

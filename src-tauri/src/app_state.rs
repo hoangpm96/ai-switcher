@@ -2272,20 +2272,19 @@ impl ManagedState {
     }
 
     /// Renew ONE Claude account's OAuth token on demand ("Làm mới token" button) — for when the UI
-    /// shows a quota read error because the stored access token has expired. This is the SAME refresh
-    /// the prime path uses, exposed as an explicit user action: the daytime quota read stays strictly
-    /// read-only (it must never rotate a token a live CLI session might hold), but the user clicking
-    /// this button knows no CLI session is using the account right now, so rotating the single-use
-    /// refresh token is their call to make. After a successful renew the account's tool is refreshed
-    /// so its quota re-reads with the new token. Returns a short message + kind for a UI toast.
+    /// shows a quota read error because the stored access token has expired. The renewal is done by
+    /// running the account's own `claude` CLI once (fake HOME → no folder popups): the CLI's refresh
+    /// is the only session-safe way to rotate the one-time-use refresh token, so the app never runs
+    /// the grant itself and can never invalidate a live/overnight CLI session. After the run the
+    /// account's tool is refreshed so its quota re-reads with the new token.
     pub fn refresh_token_now(
         &self,
         tool_id: ToolId,
         account_id: String,
         app: Option<&AppHandle>,
     ) -> Result<crate::models::PrimeNowResult> {
-        // Resolve the account's config dir under a brief lock; reject non-Claude / API accounts.
-        let config_dir = {
+        // Resolve the account's config dir + CLI path under a brief lock; reject non-Claude / API.
+        let (config_dir, binary) = {
             let data = self
                 .data
                 .lock()
@@ -2301,32 +2300,52 @@ impl ManagedState {
                 anyhow::bail!("Chỉ làm mới được token cho tài khoản Claude đăng nhập subscription");
             }
             let default_dir = resolved_default_config_dir(&data, &account.tool_id);
-            account_config_dir_with_default(&self.store, account, &default_dir)
+            (
+                account_config_dir_with_default(&self.store, account, &default_dir),
+                configured_binary_path(&data, &account.tool_id),
+            )
         };
 
         use crate::models::PrimeNowResult;
-        match crate::quota::ensure_fresh_claude_token(&config_dir) {
-            crate::quota::TokenRefresh::Ready => {
-                // Token is usable (freshly renewed OR it was still valid and the 401 was transient) —
-                // re-read this tool's quota so the card updates. Phrase the toast neutrally: `Ready`
-                // doesn't always mean a rotation happened, so don't claim "đã làm mới" outright.
+        match crate::quota::claude_token_state(&config_dir) {
+            crate::quota::ClaudeTokenState::Missing => {
+                return Ok(PrimeNowResult {
+                    kind: "error".to_string(),
+                    message: "Tài khoản chưa đăng nhập. Mở Claude Code để đăng nhập lại.".to_string(),
+                });
+            }
+            // Token is already usable — don't spawn the CLI (it would send a "hi" that costs ~1% of
+            // the 5h window). Just re-read quota so the card clears a transient 401.
+            crate::quota::ClaudeTokenState::Valid => {
+                let _ = self.refresh_tool(ToolId::Claude, app);
+                return Ok(PrimeNowResult {
+                    kind: "success".to_string(),
+                    message: "Token vẫn còn hạn. Đang cập nhật lại quota…".to_string(),
+                });
+            }
+            crate::quota::ClaudeTokenState::Expired => {}
+        }
+        // Fall back to auto-detecting the `claude` path if the account has no configured binary.
+        let binary = binary.or_else(|| crate::tools::command_path("claude"));
+        let Some(binary) = binary else {
+            return Ok(PrimeNowResult {
+                kind: "error".to_string(),
+                message: "Chưa tìm thấy đường dẫn claude CLI — kiểm tra phần Cài đặt công cụ."
+                    .to_string(),
+            });
+        };
+        match crate::prime::claude_cli_refresh(&config_dir, &binary) {
+            Ok(()) => {
+                // The CLI refreshed its own credential (session-safe) — re-read quota for the card.
                 let _ = self.refresh_tool(ToolId::Claude, app);
                 Ok(PrimeNowResult {
                     kind: "success".to_string(),
-                    message: "Token đã sẵn sàng. Đang cập nhật lại quota…".to_string(),
+                    message: "Đã làm mới token qua Claude CLI. Đang cập nhật lại quota…".to_string(),
                 })
             }
-            crate::quota::TokenRefresh::RateLimited => Ok(PrimeNowResult {
-                kind: "info".to_string(),
-                message: "Máy chủ đang giới hạn yêu cầu (429). Thử lại sau ít phút.".to_string(),
-            }),
-            crate::quota::TokenRefresh::NoToken => Ok(PrimeNowResult {
+            Err(reason) => Ok(PrimeNowResult {
                 kind: "error".to_string(),
-                message: "Tài khoản chưa đăng nhập. Mở Claude Code để đăng nhập lại.".to_string(),
-            }),
-            crate::quota::TokenRefresh::Failed => Ok(PrimeNowResult {
-                kind: "error".to_string(),
-                message: "Làm mới token thất bại. Mở Claude Code để đăng nhập lại.".to_string(),
+                message: format!("Claude CLI lỗi: {reason}. Mở Claude Code để đăng nhập lại nếu lặp lại."),
             }),
         }
     }
