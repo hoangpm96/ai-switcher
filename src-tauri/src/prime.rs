@@ -1,4 +1,4 @@
-//! Auto session prime — send a minimal "hi" to a subscription account so a fresh 5-hour
+//! Auto session prime — send a lightweight request to a subscription account so a fresh 5-hour
 //! window opens, anchoring the reset clock to the user's work rhythm.
 //!
 //! This module owns ONE attempt at priming a single account (the "Scheduled prime" core flow
@@ -32,7 +32,7 @@ pub const SEND_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 ///   1. `limits[kind == "session"].is_active == true` with a future `reset_at` — the provider flips
 ///      this the moment the new 5h window opens, BEFORE `reset_at` settles to a new value. Fast and
 ///      reliable. (D2 only sends when no real window was anchored, so an active session here is the
-///      one our "hi" just opened.)
+///      one our prime request just opened.)
 ///   2. `reset_at` moved to a new future value vs the pre-send baseline — the original signal, kept as
 ///      a fallback for payloads that don't carry `is_active`.
 ///
@@ -50,13 +50,14 @@ pub const CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(90);
 /// elapsed time so a confirmation can never overrun the scheduler's per-tick proof budget
 /// (`PRIME_PROOF_BUDGET_SECONDS`). On give-up the scheduler's 5-minute retry loop re-confirms.
 ///
-/// Codex anchors a window after a single "hi" (verified live: a 1% send anchored in ~26s), but the
-/// `reset_at` snap from rolling → fixed has a HIGHLY variable delay — some sends never settle within
-/// a couple minutes. So we poll DENSELY (every 10s) across the largest budget that still fits the
-/// proof budget, to catch the snap whenever it lands; if a tick gives up, the scheduler's retry loop
-/// re-confirms on the next tick (the real "stretch": confirmation spans several ticks, not one long
-/// inline wait, which the proof budget forbids). Confirmation reads only — it never sends again, so a
-/// longer/denser poll costs no extra quota (the original "hi" already cost its ~1%).
+/// Codex anchors a window after a tiny completed response (verified live: a completed 1% request can
+/// anchor immediately), but the `reset_at` snap from rolling → fixed has a HIGHLY variable delay —
+/// some sends never settle within a couple minutes. So we poll DENSELY (every 10s) across the largest
+/// budget that still fits the proof budget, to catch the snap whenever it lands; if a tick gives up,
+/// the scheduler's retry loop re-confirms on the next tick (the real "stretch": confirmation spans
+/// several ticks, not one long inline wait, which the proof budget forbids). Confirmation reads only
+/// — it never sends again, so a longer/denser poll costs no extra quota (the original request already
+/// cost its ~1%).
 pub const CODEX_CONFIRM_POLL_DELAY: Duration = Duration::from_secs(10);
 pub const CODEX_CONFIRM_MAX_POLLS: u32 = 12;
 pub const CODEX_CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(125);
@@ -120,16 +121,17 @@ pub fn prime_account_traced(
     // session's next refresh 401s → "/login" (the exact pain this app exists to remove).
     //   - Valid token  → prime over plain HTTP with the existing token (no rotation, fast path).
     //   - Expired      → hand the WHOLE job to the `claude` CLI: one `-p hi` run makes the CLI renew
-    //     its own token (its multi-session-safe mechanism) AND sends the "hi" that opens the window.
+    //     its own token (its multi-session-safe mechanism) AND sends the prime request that opens the
+    //     window.
     //     The CLI runs with a fake HOME so its Desktop/Documents/Downloads preflight never touches a
     //     TCC-protected folder → no permission popups regardless of who spawned it.
     if matches!(tool_id, ToolId::Claude) {
         trace("D1 kiểm tra token Claude");
         let exp_hhmm = quota::claude_token_expiry_hhmm(config_dir);
         match quota::claude_token_state(config_dir) {
-            quota::ClaudeTokenState::Valid => {
-                trace(&format!("D1 token còn hạn (tới {exp_hhmm}) → prime thẳng qua HTTP"))
-            }
+            quota::ClaudeTokenState::Valid => trace(&format!(
+                "D1 token còn hạn (tới {exp_hhmm}) → prime thẳng qua HTTP"
+            )),
             quota::ClaudeTokenState::Missing => {
                 trace("D1 không đọc được token (chưa đăng nhập, hoặc keychain khóa lúc DarkWake) → SkipNoToken");
                 return PrimeOutcome::SkipNoToken;
@@ -149,7 +151,7 @@ pub fn prime_account_traced(
                     return PrimeOutcome::SkipUnknownState;
                 }
                 trace(&format!(
-                    "D1 token đã hết hạn ({exp_hhmm}), keychain đọc được (máy thức) → giao Claude CLI tự làm mới + gửi hi (app không rotate)"
+                    "D1 token đã hết hạn ({exp_hhmm}), keychain đọc được (máy thức) → giao Claude CLI tự làm mới + gửi prime request (app không rotate)"
                 ));
                 // Prefer the account's configured binary; fall back to auto-detecting `claude` on PATH
                 // so an account with no explicit binary path can still renew.
@@ -166,7 +168,7 @@ pub fn prime_account_traced(
                     trace(&format!("D1 ghi marker trước khi chạy CLI lỗi: {reason}"));
                     return PrimeOutcome::FailSend { reason };
                 }
-                trace("D1 chạy claude CLI (refresh + hi trong 1 lần)");
+                trace("D1 chạy claude CLI (refresh + prime request trong 1 lần)");
                 if let Err(reason) = send_hi_cli(tool_id, config_dir, binary) {
                     // Distinguish user-actionable failures (which retrying can't fix) from transient
                     // ones, so the log points at the real next step instead of "just retrying".
@@ -185,8 +187,13 @@ pub fn prime_account_traced(
                 // newly-active signal count (a send only happens when no window was confirmed
                 // running). Edge: if a window anchored from another device WAS running, this reports
                 // Success with that window's (real, active) reset — informationally correct.
-                return match claude_confirm_anchored(config_dir, None, Some(false), &mut sleeper, &mut trace)
-                {
+                return match claude_confirm_anchored(
+                    config_dir,
+                    None,
+                    Some(false),
+                    &mut sleeper,
+                    &mut trace,
+                ) {
                     Some(new_reset_at) => {
                         trace(&format!("D4 xác nhận OK, reset mới {new_reset_at}"));
                         PrimeOutcome::Success { new_reset_at }
@@ -207,10 +214,10 @@ pub fn prime_account_traced(
     }
 
     // D2 — if a REAL 5h window is still running, the prime would land inside it → HOLD.
-    // Single-snapshot classification (no probe): sending "hi" is as cheap and harmless as typing it
+    // Single-snapshot classification (no probe): sending a tiny request is as cheap and harmless as typing it
     // in the terminal, so we only HOLD when the window is DEFINITELY a real anchored one. Codex's
     // `Ambiguous` (reset ≈ now + 5h — rolling for a low-usage account, which never anchors from a
-    // bare "hi") falls through to send, matching the terminal's behaviour.
+    // bare prompt) falls through to send, matching the terminal's behaviour.
     trace("D2 đọc trạng thái window hiện tại");
     let before = match quota::read_live_five_hour(tool_id, config_dir) {
         Ok(window) => window,
@@ -227,7 +234,9 @@ pub fn prime_account_traced(
         // produced from a parseable future reset, so `before_reset` is present.
         quota::WindowState::Anchored => match &before_reset {
             Some(reset_at) => {
-                trace(&format!("D2 window đang chạy (anchored, reset {reset_at}) → HOÃN"));
+                trace(&format!(
+                    "D2 window đang chạy (anchored, reset {reset_at}) → HOÃN"
+                ));
                 return PrimeOutcome::Hold {
                     reset_at: reset_at.clone(),
                 };
@@ -244,11 +253,11 @@ pub fn prime_account_traced(
             return PrimeOutcome::SkipUnknownState;
         }
         // Primeable (ended/no window) or Ambiguous (Codex rolling) → send.
-        quota::WindowState::Primeable => trace("D2 window đã hết/chưa có → gửi hi"),
-        quota::WindowState::Ambiguous => trace("D2 window rolling (Codex) → gửi hi"),
+        quota::WindowState::Primeable => trace("D2 window đã hết/chưa có → gửi prime request"),
+        quota::WindowState::Ambiguous => trace("D2 window rolling (Codex) → gửi prime request"),
     }
 
-    // D3 — send "hi", retrying on failure up to `send_attempts` times.
+    // D3 — send the prime request, retrying on failure up to `send_attempts` times.
     if let Err(reason) = before_send(before_reset.as_deref()) {
         trace(&format!("D3 ghi marker trước gửi lỗi: {reason}"));
         return PrimeOutcome::FailSend { reason };
@@ -257,15 +266,15 @@ pub fn prime_account_traced(
     let mut last_reason = String::new();
     let mut sent = false;
     for attempt in 1..=attempts {
-        trace(&format!("D3 gửi hi (lần {attempt}/{attempts})"));
+        trace(&format!("D3 gửi prime request (lần {attempt}/{attempts})"));
         match send_hi(tool_id, config_dir, binary) {
             Ok(()) => {
-                trace("D3 gửi hi OK (HTTP 2xx)");
+                trace("D3 gửi prime request OK (HTTP 2xx + body hoàn tất)");
                 sent = true;
                 break;
             }
             Err(reason) => {
-                trace(&format!("D3 gửi hi lỗi: {reason}"));
+                trace(&format!("D3 gửi prime request lỗi: {reason}"));
                 last_reason = reason;
                 if attempt < attempts {
                     sleeper(SEND_RETRY_DELAY);
@@ -274,7 +283,9 @@ pub fn prime_account_traced(
         }
     }
     if !sent {
-        trace(&format!("D3 gửi hi thất bại sau {attempts} lần: {last_reason}"));
+        trace(&format!(
+            "D3 gửi prime request thất bại sau {attempts} lần: {last_reason}"
+        ));
         return PrimeOutcome::FailSend {
             reason: last_reason,
         };
@@ -283,7 +294,7 @@ pub fn prime_account_traced(
     // D4 — confirm the prime took.
     //
     // Provider-aware:
-    //   - Codex: sending "hi" DOES anchor the 5h window (verified live), but the anchor lands with a
+    //   - Codex: a completed lightweight response anchors the 5h window, but the anchor lands with a
     //     variable delay: the `/wham/usage` reset stays "rolling" (≈ now + 5h, advancing with wall
     //     time) for a moment, then snaps to a FIXED epoch that counts down. We confirm by POLLING the
     //     window until it reads as `Anchored` (reset clearly inside now+5h, i.e. not the rolling
@@ -348,7 +359,8 @@ fn claude_confirm_anchored(
             sleeper(CONFIRM_RETRY_DELAY);
         }
         polls_done += 1;
-        if let Some(reset_at) = claude_anchored_reset(config_dir, baseline_reset_at, baseline_active)
+        if let Some(reset_at) =
+            claude_anchored_reset(config_dir, baseline_reset_at, baseline_active)
         {
             trace(&format!(
                 "D4 window đã neo sau {} lần đọc / {}s",
@@ -377,17 +389,22 @@ fn claude_anchored_reset(
 ) -> Option<String> {
     let window = quota::read_live_five_hour(&ToolId::Claude, config_dir).ok()?;
     let reset_at = window.reset_at?;
-    claude_reset_confirms(baseline_reset_at, baseline_active, &reset_at, window.is_active)
-        .then_some(reset_at)
+    claude_reset_confirms(
+        baseline_reset_at,
+        baseline_active,
+        &reset_at,
+        window.is_active,
+    )
+    .then_some(reset_at)
 }
 
 /// Whether a Claude window read proves a session that THIS prime freshly opened.
 ///
 /// Signal 1 — newly active: the session is now active with a future reset AND it was NOT already
-/// active before we sent (`baseline_active != Some(true)`). The transition is what proves our "hi"
-/// opened the window; an already-active baseline with an unmoved reset must NOT count, or clicking
-/// "Prime now" on a still-running window would falsely report a fresh window and persist the old
-/// reset. (D2 already HOLDs a clearly-anchored window upstream; this is defense in depth so the
+/// active before we sent (`baseline_active != Some(true)`). The transition is what proves our prime
+/// request opened the window; an already-active baseline with an unmoved reset must NOT count, or
+/// clicking "Prime now" on a still-running window would falsely report a fresh window and persist the
+/// old reset. (D2 already HOLDs a clearly-anchored window upstream; this is defense in depth so the
 /// predicate is correct regardless of caller — e.g. the crash-resume path.)
 /// Signal 2 — reset moved: the reset advanced to a new future value vs the pre-send baseline. This
 /// stands on its own (a moved reset is unambiguous proof) even if `is_active` is absent.
@@ -584,7 +601,7 @@ fn read_token(tool_id: &ToolId, config_dir: &Path) -> Option<String> {
     }
 }
 
-/// Send a minimal "hi" to open a fresh window.
+/// Send a lightweight request to open a fresh window.
 ///
 /// Prime directly over HTTP whenever possible. Starting the full Claude/Codex agent runtime for a
 /// one-token background request can still initialise sandbox/tool preflights and trigger macOS TCC
@@ -610,8 +627,8 @@ fn uses_cli_for_prime(tool_id: &ToolId) -> bool {
 
 /// Renew a Claude account's token by running the `claude` CLI once (fake HOME, no popups) — the
 /// CLI's own refresh is the only session-safe way to rotate; the app never runs the grant itself.
-/// Used by the UI "Làm mới token" button. The run also sends one "hi" (that's what makes the CLI
-/// actually refresh — a status check alone doesn't touch the token, verified in v0.5.3).
+/// Used by the UI "Làm mới token" button. The run also sends one tiny prompt (that's what makes the
+/// CLI actually refresh — a status check alone doesn't touch the token, verified in v0.5.3).
 pub fn claude_cli_refresh(config_dir: &Path, binary: &Path) -> Result<(), String> {
     send_hi_cli(&ToolId::Claude, config_dir, binary)
 }
@@ -776,7 +793,13 @@ fn cli_path(binary: &Path) -> OsString {
         .unwrap_or_else(|_| OsString::from("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
-/// POST a minimal "hi" directly. Returns Ok(()) on a 2xx, Err(reason) otherwise.
+/// POST a lightweight request directly. Returns Ok(()) only after the HTTP status is 2xx AND the
+/// response body has been fully consumed.
+///
+/// This matters for Codex because `/backend-api/codex/responses` is SSE. A 2xx response means the
+/// response stream was created; dropping it immediately can cancel the tiny turn before provider
+/// accounting turns it into a real anchored window. Draining the body mirrors a normal completed CLI
+/// turn and avoids false "sent OK" entries that never move `reset_at`.
 fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -788,8 +811,8 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
             // Reached only on the VALID-token fast path (D1 classified the token as usable). An
             // expired token is handled entirely by the CLI at D1 and never reaches here, so this is
             // a plain read of the current (still-valid) access token — no refresh.
-            let token = quota::claude_oauth_token_fresh(config_dir)
-                .ok_or_else(|| "token".to_string())?;
+            let token =
+                quota::claude_oauth_token_fresh(config_dir).ok_or_else(|| "token".to_string())?;
             let version = quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());
             let body = json!({
                 "model": CLAUDE_PRIME_MODEL,
@@ -813,17 +836,7 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
         ToolId::Codex => {
             let token =
                 quota::codex_access_token_fresh(config_dir).ok_or_else(|| "token".to_string())?;
-            let body = json!({
-                "model": CODEX_PRIME_MODEL,
-                "instructions": "You are a helpful coding assistant.",
-                "input": [{
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": "hi"}],
-                }],
-                "store": false,
-                "stream": true,
-            });
+            let body = codex_prime_body();
             let mut request = client
                 .post("https://chatgpt.com/backend-api/codex/responses")
                 .bearer_auth(token)
@@ -842,17 +855,38 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
     };
 
     match response {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                Ok(())
-            } else {
-                Err(format!("HTTP {}", status.as_u16()))
-            }
-        }
+        Ok(resp) => consume_prime_response(resp),
         Err(e) if e.is_timeout() => Err("timeout".to_string()),
         Err(e) => Err(format!("network: {e}")),
     }
+}
+
+fn codex_prime_body() -> serde_json::Value {
+    json!({
+        "model": CODEX_PRIME_MODEL,
+        "instructions": "Reply exactly OK. Do not inspect files or use tools.",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Open a lightweight Codex session window. Reply exactly OK."}],
+        }],
+        "store": false,
+        "stream": true,
+    })
+}
+
+fn consume_prime_response(resp: reqwest::blocking::Response) -> Result<(), String> {
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    resp.bytes().map(|_| ()).map_err(|e| {
+        if e.is_timeout() {
+            "body timeout".to_string()
+        } else {
+            format!("body: {e}")
+        }
+    })
 }
 
 /// `reset_at` (ISO 8601) is strictly after now.
@@ -890,6 +924,41 @@ mod tests {
     fn subscription_primes_bypass_agent_cli() {
         assert!(!uses_cli_for_prime(&ToolId::Codex));
         assert!(!uses_cli_for_prime(&ToolId::Claude));
+    }
+
+    #[test]
+    fn codex_prime_body_is_streamed_and_brief() {
+        let body = codex_prime_body();
+        assert_eq!(
+            body.get("model").and_then(serde_json::Value::as_str),
+            Some(CODEX_PRIME_MODEL)
+        );
+        assert_eq!(
+            body.get("stream").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("store").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(
+            body.get("instructions")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| text.contains("Reply exactly OK")),
+            "prime should request a short completion so draining SSE stays cheap"
+        );
+        let prompt = body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("content"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert!(prompt.contains("Reply exactly OK"));
+        assert!(prompt.len() < 120);
     }
 
     #[test]
@@ -992,7 +1061,12 @@ mod tests {
             Some(true)
         ));
         // Unknown baseline active state also counts as "not already active".
-        assert!(claude_reset_confirms(Some(&baseline), None, &same, Some(true)));
+        assert!(claude_reset_confirms(
+            Some(&baseline),
+            None,
+            &same,
+            Some(true)
+        ));
 
         // P0 GUARD: already-active before + unmoved reset must NOT confirm — otherwise priming a
         // still-running window would falsely report a fresh one and persist the stale reset.
@@ -1008,7 +1082,12 @@ mod tests {
 
         // Signal 2 (fallback): reset moved to a new future value — stands alone, even if it was
         // already active before and `is_active` is absent now.
-        assert!(claude_reset_confirms(Some(&baseline), Some(true), &moved, None));
+        assert!(claude_reset_confirms(
+            Some(&baseline),
+            Some(true),
+            &moved,
+            None
+        ));
         assert!(claude_reset_confirms(None, None, &moved, Some(false))); // valid empty precheck
 
         // Neither signal: inactive/unknown and the reset didn't move → not confirmed.

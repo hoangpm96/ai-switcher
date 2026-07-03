@@ -86,15 +86,15 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a version tag like `v0.5.11` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
+Pushing a version tag like `v0.6.0` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
 
 ```bash
-git tag v0.5.11
-git push origin main v0.5.11
+git tag v0.6.0
+git push origin main v0.6.0
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version history and
-[the v0.5.11 release notes](docs/releases/v0.5.11.md) for the current release.
+[the v0.6.0 release notes](docs/releases/v0.6.0.md) for the current release.
 
 ## License
 

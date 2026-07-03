@@ -2309,11 +2309,12 @@ impl ManagedState {
             crate::quota::ClaudeTokenState::Missing => {
                 return Ok(PrimeNowResult {
                     kind: "error".to_string(),
-                    message: "Tài khoản chưa đăng nhập. Mở Claude Code để đăng nhập lại.".to_string(),
+                    message: "Tài khoản chưa đăng nhập. Mở Claude Code để đăng nhập lại."
+                        .to_string(),
                 });
             }
-            // Token is already usable — don't spawn the CLI (it would send a "hi" that costs ~1% of
-            // the 5h window). Just re-read quota so the card clears a transient 401.
+            // Token is already usable — don't spawn the CLI (it would send a tiny request that costs
+            // quota). Just re-read quota so the card clears a transient 401.
             crate::quota::ClaudeTokenState::Valid => {
                 let _ = self.refresh_tool(ToolId::Claude, app);
                 return Ok(PrimeNowResult {
@@ -2338,12 +2339,15 @@ impl ManagedState {
                 let _ = self.refresh_tool(ToolId::Claude, app);
                 Ok(PrimeNowResult {
                     kind: "success".to_string(),
-                    message: "Đã làm mới token qua Claude CLI. Đang cập nhật lại quota…".to_string(),
+                    message: "Đã làm mới token qua Claude CLI. Đang cập nhật lại quota…"
+                        .to_string(),
                 })
             }
             Err(reason) => Ok(PrimeNowResult {
                 kind: "error".to_string(),
-                message: format!("Claude CLI lỗi: {reason}. Mở Claude Code để đăng nhập lại nếu lặp lại."),
+                message: format!(
+                    "Claude CLI lỗi: {reason}. Mở Claude Code để đăng nhập lại nếu lặp lại."
+                ),
             }),
         }
     }
@@ -2494,9 +2498,9 @@ impl ManagedState {
         self.run_manual_prime(job, runtime, manual_attempt, None)
     }
 
-    /// Blocking core of a manual prime: send "hi" once, confirm, then record the outcome. Returns the
-    /// human-facing result. Split out so `prime_now` can run it on a background thread (GUI) or inline
-    /// (headless). Caller holds the overlap guard + file lock for the duration.
+    /// Blocking core of a manual prime: send one lightweight request, confirm, then record the
+    /// outcome. Returns the human-facing result. Split out so `prime_now` can run it on a background
+    /// thread (GUI) or inline (headless). Caller holds the overlap guard + file lock for the duration.
     fn run_manual_prime(
         &self,
         job: PrimeJob,
@@ -4120,11 +4124,12 @@ const EXTEND_THRESHOLD_MIN: i64 = 30;
 const CATCH_UP_MIN: i64 = 60;
 const PRIME_RETRY_DEADLINE_MIN: i64 = 45;
 const PRIME_RETRY_INTERVAL_MIN: i64 = 5;
-// Codex anchors a fresh window after one "hi", but the `reset_at` snap that confirmation waits for
-// has a highly variable delay — sometimes well past a single 2-minute retry round. A 5-minute manual
-// deadline gave only ~2 confirm ticks and reported a false "couldn't confirm" while the window had in
-// fact opened. 12 minutes (≈6 retry rounds) lets a slow snap land before giving up. The prime runs in
-// the background (the "Prime ngay" button returns immediately), so a longer deadline doesn't block UI.
+// Codex anchors a fresh window after a completed lightweight response, but the `reset_at` snap that
+// confirmation waits for has a highly variable delay — sometimes well past a single 2-minute retry
+// round. A 5-minute manual deadline gave only ~2 confirm ticks and reported a false "couldn't
+// confirm" while the window had in fact opened. 12 minutes (≈6 retry rounds) lets a slow snap land
+// before giving up. The prime runs in the background (the "Prime ngay" button returns immediately),
+// so a longer deadline doesn't block UI.
 const MANUAL_PRIME_DEADLINE_MIN: i64 = 12;
 const MANUAL_PRIME_RETRY_INTERVAL_MIN: i64 = 2;
 const PRIME_PROOF_BUDGET_SECONDS: i64 = 150;
