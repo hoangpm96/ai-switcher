@@ -1285,7 +1285,7 @@ impl ManagedState {
         Ok(crate::wake::prime_daemon_installed())
     }
 
-    /// Read the human-readable auto-prime activity log (newest content at the bottom).
+    /// Read the human-readable auto-prime activity log (newest content at the TOP).
     pub fn auto_prime_log(&self) -> String {
         std::fs::read_to_string(self.store.auto_prime_log_path()).unwrap_or_default()
     }
@@ -1685,37 +1685,35 @@ impl ManagedState {
         }
     }
 
-    /// Append one event line to the auto-prime log. Wording is the brainstorm's exact strings.
+    /// Prepend one event line to the auto-prime log so the NEWEST entry is at the TOP of the file
+    /// (no scrolling to the bottom to see what just happened). The log is small (capped by day), so
+    /// rewriting it on each append is cheap. Written atomically (temp + rename) so a concurrent read
+    /// never sees a half-written file. Wording is the brainstorm's exact strings.
     fn append_prime_log(&self, line: &str) {
-        use std::io::Write;
-        let stamped = format!("[{}] {}\n", local_log_timestamp(), line);
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.store.auto_prime_log_path())
-        {
-            let _ = file.write_all(stamped.as_bytes());
-        }
+        let _ = self.prepend_prime_log_line(line);
     }
 
     /// Terminal finalization may resume after a crash. The terminal marker makes the result log
     /// idempotent without colliding with START/PENDING lines that share the same attempt id.
     fn append_prime_log_once(&self, attempt_id: &str, line: &str) -> Result<()> {
-        use std::io::Write;
         let marker = format!("[terminal={}]", short_attempt_id(attempt_id));
         let existing =
             std::fs::read_to_string(self.store.auto_prime_log_path()).unwrap_or_default();
         if existing.contains(&marker) {
             return Ok(());
         }
+        self.prepend_prime_log_line(line)
+    }
+
+    /// Write `line` (timestamped) at the TOP of the auto-prime log, keeping the rest below it.
+    fn prepend_prime_log_line(&self, line: &str) -> Result<()> {
+        let path = self.store.auto_prime_log_path();
         let stamped = format!("[{}] {}\n", local_log_timestamp(), line);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.store.auto_prime_log_path())
-            .context("opening auto-prime log")?;
-        file.write_all(stamped.as_bytes())
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let temporary = path.with_extension("log.tmp");
+        std::fs::write(&temporary, format!("{stamped}{existing}"))
             .context("writing auto-prime log")?;
+        std::fs::rename(&temporary, &path).context("replacing auto-prime log")?;
         Ok(())
     }
 

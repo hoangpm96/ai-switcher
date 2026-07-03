@@ -5,6 +5,18 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.22] - 2026-07-03
+
+### Changed
+
+- **Auto-prime log now reads newest-first (latest entry at the TOP).** No more scrolling to the
+  bottom to see what just happened — the most recent line, including each attempt's final
+  SUCCESS/FAIL, is at the top of the file.
+- **Far less log noise from Codex confirmation.** A Codex window that stays "rolling" used to log two
+  lines for every one of up to 12 polls per round (hundreds of lines across a 45-minute retry), which
+  buried every other account's result. Each confirm burst now writes a single summary line ("vẫn
+  rolling sau N poll / Ns → chưa neo"), so a failing Codex account no longer drowns out the log.
+
 ## [0.5.21] - 2026-07-02
 
 ### Changed

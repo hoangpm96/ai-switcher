@@ -334,7 +334,10 @@ fn claude_confirm_anchored(
     mut sleeper: impl FnMut(Duration),
     mut trace: impl FnMut(&str),
 ) -> Option<String> {
+    // One summary line at the end, not one per poll (Claude usually anchors in 1–2 polls, but a
+    // failing burst shouldn't spam the log either).
     let started = std::time::Instant::now();
+    let mut polls_done = 0u32;
     for poll in 0..CONFIRM_MAX_TRIES {
         if poll > 0 {
             // Stop before a sleep that would push us past the wall-clock budget (each read below also
@@ -344,21 +347,25 @@ fn claude_confirm_anchored(
             }
             sleeper(CONFIRM_RETRY_DELAY);
         }
-        trace(&format!(
-            "D4 đọc window Claude (poll {}/{}, {}s)",
-            poll + 1,
-            CONFIRM_MAX_TRIES,
-            started.elapsed().as_secs()
-        ));
+        polls_done += 1;
         if let Some(reset_at) = claude_anchored_reset(config_dir, baseline_reset_at, baseline_active)
         {
+            trace(&format!(
+                "D4 window đã neo sau {} lần đọc / {}s",
+                polls_done,
+                started.elapsed().as_secs()
+            ));
             return Some(reset_at);
         }
-        trace("D4 window chưa neo (reset chưa đổi / chưa active)");
         if started.elapsed() >= CONFIRM_TOTAL_BUDGET {
             break;
         }
     }
+    trace(&format!(
+        "D4 window chưa neo sau {} lần đọc / {}s (reset chưa đổi / chưa active)",
+        polls_done,
+        started.elapsed().as_secs()
+    ));
     None
 }
 
@@ -416,8 +423,13 @@ fn codex_confirm_anchored(
     mut sleeper: impl FnMut(Duration),
     mut trace: impl FnMut(&str),
 ) -> Option<String> {
+    // Consolidated logging: one summary line at the end, not two per poll — a full rolling burst is
+    // 12 polls, and the old per-poll "đọc window"/"vẫn rolling" pair flooded the log (a failed Codex
+    // account alone produced hundreds of lines and drowned out everything else).
     let started = std::time::Instant::now();
     let mut previous_epoch: Option<i64> = None;
+    let mut polls_done = 0u32;
+    let mut read_errors = 0u32;
     for poll in 0..CODEX_CONFIRM_MAX_POLLS {
         if poll > 0 {
             // Stop before a sleep that would push us past the wall-clock budget. Each read below also
@@ -427,12 +439,7 @@ fn codex_confirm_anchored(
             }
             sleeper(CODEX_CONFIRM_POLL_DELAY);
         }
-        trace(&format!(
-            "D4 đọc window Codex (poll {}/{}, {}s)",
-            poll + 1,
-            CODEX_CONFIRM_MAX_POLLS,
-            started.elapsed().as_secs()
-        ));
+        polls_done += 1;
         if let Ok(window) = quota::read_live_five_hour(&ToolId::Codex, config_dir) {
             // Signal 1: clearly anchored (reset far from now+5h).
             if matches!(
@@ -441,7 +448,11 @@ fn codex_confirm_anchored(
             ) {
                 // `Anchored` is only produced from a parseable future reset, so this is present.
                 if let Some(reset_at) = window.reset_at {
-                    trace("D4 Codex window neo rõ (anchored)");
+                    trace(&format!(
+                        "D4 Codex neo rõ (anchored) sau {} poll / {}s",
+                        polls_done,
+                        started.elapsed().as_secs()
+                    ));
                     return Some(reset_at);
                 }
             }
@@ -453,19 +464,33 @@ fn codex_confirm_anchored(
                 .and_then(codex_reset_epoch_if_future)
             {
                 if previous_epoch == Some(reset_epoch) {
-                    trace("D4 Codex reset cố định 2 lần đọc → đã neo");
+                    trace(&format!(
+                        "D4 Codex reset cố định 2 lần đọc → đã neo (sau {} poll / {}s)",
+                        polls_done,
+                        started.elapsed().as_secs()
+                    ));
                     return window.reset_at;
                 }
-                trace("D4 Codex reset vẫn rolling (đang tăng)");
                 previous_epoch = Some(reset_epoch);
             }
         } else {
-            trace("D4 đọc window Codex lỗi tạm, thử lại poll sau");
+            read_errors += 1;
         }
         if started.elapsed() >= CODEX_CONFIRM_TOTAL_BUDGET {
             break;
         }
     }
+    let err_note = if read_errors > 0 {
+        format!(", {read_errors} lần đọc lỗi tạm")
+    } else {
+        String::new()
+    };
+    trace(&format!(
+        "D4 Codex window vẫn rolling sau {} poll / {}s{} → chưa neo (tick sau thử lại)",
+        polls_done,
+        started.elapsed().as_secs(),
+        err_note
+    ));
     None
 }
 
