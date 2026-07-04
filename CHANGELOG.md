@@ -5,6 +5,24 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-07-05
+
+### Added
+
+- **Codex usage-limit reset credits are now visible per account.** The app reads Codex's live reset
+  credit summary and, when available, the detailed reset-credit list with expiry timestamps. Each
+  Codex subscription account card shows a compact reset-credit action in the bottom icon row; click
+  it to open a modal with the number of available resets and each credit's expiry. Accounts with no
+  reset credits show `0 available` instead of silently hiding the state. API/proxy accounts still
+  omit this because they do not expose provider quota/reset-credit data.
+
+### Changed
+
+- **Codex quota refresh now preserves existing quota behavior while enriching the snapshot.** The
+  reset-credit detail request is best-effort: if Codex returns only the summary count, or the detail
+  endpoint is temporarily unavailable, the normal 5-hour/weekly quota read still succeeds and the UI
+  falls back to the data it has.
+
 ## [0.6.0] - 2026-07-03
 
 ### Fixed

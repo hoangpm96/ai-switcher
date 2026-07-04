@@ -1195,6 +1195,103 @@ button.danger:hover:not(:disabled) {
   font-size: 11px;
 }
 
+.resetCreditsButton {
+  color: var(--text-2);
+  overflow: visible;
+  position: relative;
+}
+
+.resetCreditsBadge {
+  align-items: center;
+  background: var(--accent);
+  border: 1px solid var(--surface);
+  border-radius: 999px;
+  color: #fff;
+  display: inline-flex;
+  font-size: 9.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  height: 15px;
+  justify-content: center;
+  min-width: 15px;
+  padding: 0 4px;
+  position: absolute;
+  right: -5px;
+  top: -5px;
+}
+
+.resetCreditsModal {
+  width: min(520px, calc(100vw - 48px));
+}
+
+.modalCloseBtn {
+  align-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-2);
+  cursor: pointer;
+  display: inline-flex;
+  height: 30px;
+  justify-content: center;
+  padding: 0;
+  width: 30px;
+}
+
+.modalCloseBtn:hover {
+  border-color: var(--line-strong);
+  color: var(--text);
+}
+
+.resetCreditModalRows {
+  display: grid;
+  gap: 8px;
+}
+
+.resetCreditModalRow {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 10px 12px;
+}
+
+.resetCreditModalRow div {
+  min-width: 0;
+}
+
+.resetCreditModalRow strong {
+  color: var(--text);
+  display: block;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resetCreditModalRow small {
+  color: var(--text-3);
+  display: block;
+  font-size: 11.5px;
+  margin-top: 3px;
+}
+
+.resetCreditModalRow span {
+  color: var(--text-2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.resetCreditsEmpty {
+  color: var(--text-3);
+  font-size: 12.5px;
+  margin: 0;
+}
+
 .quotaError {
   color: var(--text-3);
   font-size: 12.5px;

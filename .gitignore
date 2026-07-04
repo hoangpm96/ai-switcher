@@ -13,7 +13,9 @@ src-tauri/gen
 .codex/
 
 # BA / internal docs
-docs/
+docs/*
+!docs/releases/
+!docs/releases/*.md
 review.md
 
 # Local scratch / test debris (never publish)

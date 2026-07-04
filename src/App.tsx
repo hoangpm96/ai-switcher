@@ -48,6 +48,7 @@ import type {
   AppSnapshot,
   AutoPrimeSetting,
   PrimeAttemptStatus,
+  RateLimitResetCredits,
   BinaryCandidate,
   ConfigCandidate,
   CreateApiGatewayKeyInput,
@@ -2141,6 +2142,9 @@ function AccountCard({
             {refreshingQuota ? <Loader2 className="spin" /> : <RefreshCw />}
           </button>
         )}
+        {!isApi && account.quota?.rateLimitResetCredits && (
+          <ResetCredits credits={account.quota.rateLimitResetCredits} />
+        )}
         {tool.id !== "antigravity" && !account.isDefault && !isVirtualApi && (
           <button
             className="iconButton"
@@ -2279,6 +2283,83 @@ function Quota({
       <QuotaBar label="Weekly limit" percent={quota.weekly.percentUsed} resetAt={quota.weekly.resetAt} />
     </div>
   );
+}
+
+function ResetCredits({ credits }: { credits?: RateLimitResetCredits | null }) {
+  const [open, setOpen] = useState(false);
+  if (!credits) return null;
+
+  const available = credits.credits.filter((credit) => credit.status === "available");
+  const rows = available.length > 0 ? available : credits.credits;
+  const emptyMessage = credits.availableCount > 0 ? "Expiry details unavailable" : "No usage limit resets available";
+
+  return (
+    <>
+      <button
+        type="button"
+        className="iconButton resetCreditsButton"
+        onClick={() => setOpen(true)}
+        title={`Usage limit resets: ${credits.availableCount} available`}
+        aria-label={`Usage limit resets: ${credits.availableCount} available`}
+      >
+        <RotateCcw />
+        <span className="resetCreditsBadge">{credits.availableCount}</span>
+      </button>
+
+      {open && (
+        <div className="modalBackdrop" role="presentation" onMouseDown={() => setOpen(false)}>
+          <section className="modal resetCreditsModal" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="modalTitleRow">
+              <div>
+                <h2>Usage limit resets</h2>
+                <p className="modalSub">{credits.availableCount} reset(s) available</p>
+              </div>
+              <button type="button" className="modalCloseBtn" onClick={() => setOpen(false)} title="Close">
+                <X size={15} />
+              </button>
+            </div>
+
+            {rows.length > 0 ? (
+              <div className="resetCreditModalRows">
+                {rows.map((credit, index) => (
+                  <div
+                    className="resetCreditModalRow"
+                    key={`${credit.expiresAt ?? credit.grantedAt ?? credit.status}-${index}`}
+                  >
+                    <div>
+                      <strong>{credit.title || resetCreditLabel(credit.resetType)}</strong>
+                      <small>{resetCreditStatusLabel(credit.status)}</small>
+                    </div>
+                    <span>{credit.expiresAt ? formatTime(credit.expiresAt) : "No expiry"}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="resetCreditsEmpty">{emptyMessage}</p>
+            )}
+
+            <div className="modalActions">
+              <button type="button" onClick={() => setOpen(false)}>
+                Close
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+    </>
+  );
+}
+
+function resetCreditLabel(resetType?: string | null) {
+  if (resetType === "codex_rate_limits") return "Full reset";
+  return "Usage reset";
+}
+
+function resetCreditStatusLabel(status: string) {
+  if (status === "available") return "Available";
+  if (status === "redeemed") return "Redeemed";
+  if (status === "expired") return "Expired";
+  return status || "Unknown";
 }
 
 function QuotaBar({ label, percent, resetAt }: { label: string; percent: number | null; resetAt: string | null }) {

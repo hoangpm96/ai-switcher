@@ -311,6 +311,30 @@ pub struct QuotaWindow {
     pub is_active: Option<bool>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitResetCredit {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeemed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitResetCredits {
+    pub available_count: u32,
+    #[serde(default)]
+    pub credits: Vec<RateLimitResetCredit>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaInfo {
@@ -324,6 +348,10 @@ pub struct QuotaInfo {
     /// None when the API doesn't report one. Shown as a small badge next to the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// Codex usage-limit reset credits. The live usage endpoint reports only the count; the
+    /// detail endpoint also reports each credit's grant and expiry timestamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_reset_credits: Option<RateLimitResetCredits>,
     /// Whether the user can open a fresh 5h window right now ("Prime ngay").
     ///
     /// Provider-aware because the two endpoints report `reset_at` differently:
@@ -354,6 +382,7 @@ impl QuotaInfo {
             },
             models: None,
             plan: None,
+            rate_limit_reset_credits: None,
             prime_available: None,
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             error: Some(message.into()),

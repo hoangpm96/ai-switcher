@@ -1,4 +1,4 @@
-use crate::models::{QuotaInfo, QuotaWindow, ToolId};
+use crate::models::{QuotaInfo, QuotaWindow, RateLimitResetCredit, RateLimitResetCredits, ToolId};
 use crate::tools::home_dir;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -296,6 +296,7 @@ fn quota_from_claude_usage(value: &serde_json::Value) -> Result<QuotaInfo> {
         weekly,
         models: None,
         plan: claude_plan(value),
+        rate_limit_reset_credits: None,
         // Overwritten centrally by `read_quota` via `prime_available_for`.
         prime_available: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -870,6 +871,7 @@ fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo>
         },
         models: Some(models),
         plan,
+        rate_limit_reset_credits: None,
         // Antigravity can't prime; `prime_available_for` returns None for it anyway.
         prime_available: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -961,7 +963,11 @@ fn read_codex_usage_endpoint(config_dir: &Path) -> Result<QuotaInfo> {
     )?;
     let value: serde_json::Value =
         serde_json::from_str(&body).context("Codex usage response is not JSON")?;
-    quota_from_codex_endpoint(&value)
+    let mut quota = quota_from_codex_endpoint(&value)?;
+    if let Ok(details) = read_codex_reset_credit_details(config_dir, &token) {
+        quota.rate_limit_reset_credits = Some(details);
+    }
+    Ok(quota)
 }
 
 /// Returns the account's current Codex access token from `auth.json`, WITHOUT refreshing it.
@@ -1049,11 +1055,101 @@ fn quota_from_codex_endpoint(value: &serde_json::Value) -> Result<QuotaInfo> {
             .get("plan_type")
             .and_then(serde_json::Value::as_str)
             .and_then(pretty_plan),
+        rate_limit_reset_credits: codex_reset_credit_summary(value),
         // Overwritten centrally by `read_quota` via `prime_available_for`.
         prime_available: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
+}
+
+fn read_codex_reset_credit_details(
+    config_dir: &Path,
+    token: &str,
+) -> Result<RateLimitResetCredits> {
+    let authorization = format!("Bearer {token}");
+    let account_id = codex_account_id(config_dir);
+    let mut headers = vec![
+        ("Authorization", authorization.as_str()),
+        ("Accept", "application/json"),
+        ("OpenAI-Beta", "codex-1"),
+        ("originator", "Codex Desktop"),
+    ];
+    if let Some(account_id) = account_id.as_deref() {
+        headers.push(("ChatGPT-Account-ID", account_id));
+    }
+    let body = curl_get(
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+        &headers,
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("Codex reset-credit response is not JSON")?;
+    codex_reset_credit_details(&value)
+}
+
+fn codex_reset_credit_summary(value: &serde_json::Value) -> Option<RateLimitResetCredits> {
+    let available_count = value
+        .get("rate_limit_reset_credits")?
+        .get("available_count")?
+        .as_u64()
+        .map(u64_to_u32)?;
+    Some(RateLimitResetCredits {
+        available_count,
+        credits: Vec::new(),
+    })
+}
+
+fn codex_reset_credit_details(value: &serde_json::Value) -> Result<RateLimitResetCredits> {
+    let has_available_count = value.get("available_count").is_some();
+    let has_credits = value.get("credits").is_some();
+    if !has_available_count && !has_credits {
+        anyhow::bail!("Codex reset-credit response is missing credits");
+    }
+    let credits = value
+        .get("credits")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| RateLimitResetCredit {
+                    status: json_string(item, "status").unwrap_or_else(|| "unknown".to_string()),
+                    reset_type: json_string(item, "reset_type"),
+                    granted_at: json_string(item, "granted_at"),
+                    expires_at: json_string(item, "expires_at"),
+                    redeemed_at: json_string(item, "redeemed_at"),
+                    title: json_string(item, "title"),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let available_count = value
+        .get("available_count")
+        .and_then(serde_json::Value::as_u64)
+        .map(u64_to_u32)
+        .unwrap_or_else(|| {
+            credits
+                .iter()
+                .filter(|credit| credit.status == "available")
+                .count()
+                .min(u32::MAX as usize) as u32
+        });
+
+    Ok(RateLimitResetCredits {
+        available_count,
+        credits,
+    })
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(ToString::to_string)
+}
+
+fn u64_to_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
 }
 
 /// Scans the rollout files (newest first) and returns the most recent `rate_limits`
@@ -1185,6 +1281,7 @@ fn quota_from_codex_rate_limits(limits: &serde_json::Value) -> Result<QuotaInfo>
             .get("plan_type")
             .and_then(serde_json::Value::as_str)
             .and_then(pretty_plan),
+        rate_limit_reset_credits: None,
         // Overwritten centrally by `read_quota` via `prime_available_for`.
         prime_available: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -1371,6 +1468,7 @@ mod tests {
             },
             models: None,
             plan: None,
+            rate_limit_reset_credits: None,
             prime_available: None,
             updated_at: None,
             error: error.map(str::to_string),
@@ -1525,7 +1623,7 @@ mod tests {
 
     #[test]
     fn parses_codex_wham_usage() {
-        let body = r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_at":1780229541},"secondary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_at":1780816341}}}"#;
+        let body = r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_at":1780229541},"secondary_window":{"used_percent":0,"limit_window_seconds":604800,"reset_at":1780816341}},"rate_limit_reset_credits":{"available_count":3}}"#;
         let value: serde_json::Value = serde_json::from_str(body).unwrap();
         let quota = quota_from_codex_endpoint(&value).unwrap();
         assert_eq!(quota.five_hour.percent_used, Some(1.0));
@@ -1533,6 +1631,28 @@ mod tests {
         assert!(quota.five_hour.reset_at.is_some());
         assert!(quota.weekly.reset_at.is_some());
         assert_eq!(quota.plan.as_deref(), Some("Plus"));
+        assert_eq!(
+            quota
+                .rate_limit_reset_credits
+                .as_ref()
+                .map(|credits| credits.available_count),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn parses_codex_reset_credit_details() {
+        let body = r#"{"credits":[{"id":"RateLimitResetCredit_1","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-06-18T00:05:36.180874Z","expires_at":"2026-07-18T00:05:36.180874Z","redeemed_at":null,"title":"Full reset (Weekly + 5 hr)"},{"id":"RateLimitResetCredit_2","reset_type":"codex_rate_limits","status":"redeemed","granted_at":"2026-06-19T00:05:36.180874Z","expires_at":"2026-07-19T00:05:36.180874Z","redeemed_at":"2026-06-20T00:05:36.180874Z","title":"Full reset (Weekly + 5 hr)"}],"available_count":1,"total_earned_count":0}"#;
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let credits = codex_reset_credit_details(&value).unwrap();
+        assert_eq!(credits.available_count, 1);
+        assert_eq!(credits.credits.len(), 2);
+        assert_eq!(credits.credits[0].status, "available");
+        assert_eq!(
+            credits.credits[0].expires_at.as_deref(),
+            Some("2026-07-18T00:05:36.180874Z")
+        );
+        assert_eq!(credits.credits[1].status, "redeemed");
     }
 
     #[test]

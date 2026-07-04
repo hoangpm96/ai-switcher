@@ -9,6 +9,20 @@ export interface QuotaWindow {
   resetAt: string | null;
 }
 
+export interface RateLimitResetCredit {
+  status: string;
+  resetType?: string | null;
+  grantedAt?: string | null;
+  expiresAt?: string | null;
+  redeemedAt?: string | null;
+  title?: string | null;
+}
+
+export interface RateLimitResetCredits {
+  availableCount: number;
+  credits: RateLimitResetCredit[];
+}
+
 export interface QuotaInfo {
   fiveHour: QuotaWindow;
   weekly: QuotaWindow;
@@ -16,6 +30,8 @@ export interface QuotaInfo {
   models?: QuotaWindow[] | null;
   /** Subscription plan label (e.g. "Plus", "Pro", "Max"). Absent when the API omits it. */
   plan?: string | null;
+  /** Codex usage-limit reset credits, including expiry rows when the detail endpoint is available. */
+  rateLimitResetCredits?: RateLimitResetCredits | null;
   /**
    * Whether "Prime ngay" should be offered: true = can open a fresh 5h window now (window ended,
    * or — for Codex — the reset is rolling/unanchored). Absent/undefined = unknown (read error /

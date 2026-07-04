@@ -16,7 +16,7 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 
 - **One window for every tool.** Log in, switch, rename, and remove accounts per tool.
 - **Menu-bar quick switch.** A tray icon in the macOS menu bar lists your Claude & Codex accounts (with quota % and plan) so you can switch without opening the window. Closing the window hides the app to the tray; it keeps polling quota in the background.
-- **Quota at a glance.** Reads 5-hour / weekly usage for Claude & Codex and per-model quota for Antigravity, and shows your **subscription plan** (Plus / Pro / Max) when the API reports it.
+- **Quota at a glance.** Reads 5-hour / weekly usage for Claude & Codex and per-model quota for Antigravity, shows your **subscription plan** (Plus / Pro / Max) when the API reports it, and exposes Codex usage-limit reset credits in a per-account modal.
 - **Per-tool auto-switch.** Configure separately for Claude and Codex — the bare command falls back to another account when the active one nears its quota.
 - **Usage & cost tab.** Token usage and estimated cost per tool, plus an aggregated **All** view across tools, charted over a selectable date range.
 - **Local API gateway.** Expose Claude/Codex subscription accounts through a local OpenAI/Anthropic-compatible server with API keys, model combos, fallback rotation, cooldown handling, and gateway usage tracking.
@@ -44,6 +44,7 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 - **Prime ngay (on demand).** When the provider reports that an account has no active five-hour window, the card shows a manual prime button. After clicking it, the UI first says that the request was sent and is awaiting confirmation; it says a session opened only after the reset state is verified. If the provider cannot prove a new fixed window, the app reports that clearly instead of claiming success.
 - **On-demand extend:** when a window is about to end (≤30 min) the app prompts on the account to open the next one the instant the current ends; a per-account toggle can do this automatically without asking, deferring to your scheduled anchor time when that falls inside the upcoming window.
 - Quota for every account (including the machine default) is read live from the provider, so the displayed usage and reset time stay current and a refresh always reflects the real state.
+- **Codex usage-limit reset credits.** Codex account cards show a small reset-credit icon in the bottom action row when the provider reports reset-credit data. Click it to see how many resets remain and, when available, each reset credit's expiry time. Accounts with no available credits still show `0 available`; API/proxy accounts do not expose this provider quota data.
 
 #### Prime and quota troubleshooting
 
@@ -86,15 +87,15 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a version tag like `v0.6.0` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
+Pushing a version tag like `v0.6.1` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
 
 ```bash
-git tag v0.6.0
-git push origin main v0.6.0
+git tag v0.6.1
+git push origin main v0.6.1
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version history and
-[the v0.6.0 release notes](docs/releases/v0.6.0.md) for the current release.
+[the v0.6.1 release notes](docs/releases/v0.6.1.md) for the current release.
 
 ## License
 

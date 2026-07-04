@@ -14,6 +14,7 @@ import type {
   OrphanAccountDir,
   PrimeNowInput,
   PrimeNowResult,
+  RateLimitResetCredits,
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
   SetAutoExtendInput,
@@ -29,12 +30,45 @@ import type {
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 
-const quota = (five: number | null, week: number | null, error: string | null = null) => ({
+const quota = (
+  five: number | null,
+  week: number | null,
+  error: string | null = null,
+  rateLimitResetCredits?: RateLimitResetCredits,
+) => ({
   fiveHour: { label: "5-hour limit", percentUsed: five, resetAt: "2026-05-31T15:30:00Z" },
   weekly: { label: "Weekly limit", percentUsed: week, resetAt: "2026-06-02T00:00:00Z" },
+  rateLimitResetCredits,
   updatedAt: "2026-05-31T08:00:00Z",
   error,
 });
+
+const demoResetCredits: RateLimitResetCredits = {
+  availableCount: 3,
+  credits: [
+    {
+      status: "available",
+      resetType: "codex_rate_limits",
+      title: "Full reset (Weekly + 5 hr)",
+      grantedAt: "2026-06-18T00:05:36Z",
+      expiresAt: "2026-07-18T00:05:36Z",
+    },
+    {
+      status: "available",
+      resetType: "codex_rate_limits",
+      title: "Full reset (Weekly + 5 hr)",
+      grantedAt: "2026-06-26T23:02:11Z",
+      expiresAt: "2026-07-26T23:02:11Z",
+    },
+    {
+      status: "available",
+      resetType: "codex_rate_limits",
+      title: "Full reset (Weekly + 5 hr)",
+      grantedAt: "2026-07-01T19:46:23Z",
+      expiresAt: "2026-07-31T19:46:23Z",
+    },
+  ],
+};
 
 const demoSnapshot: AppSnapshot = {
   disclaimerAccepted: false,
@@ -118,7 +152,7 @@ const demoSnapshot: AppSnapshot = {
         {
           id: "default-codex", toolId: "codex", name: "Machine default", state: "idle",
           fingerprint: "default", createdAt: "2026-05-18T10:00:00Z", updatedAt: "2026-05-31T08:00:00Z",
-          lastUsedAt: null, quota: quota(40, 55), launcherCommand: null, isDefault: true,
+          lastUsedAt: null, quota: quota(40, 55, null, demoResetCredits), launcherCommand: null, isDefault: true,
         },
         {
           id: "x2", toolId: "codex", name: "Pro 6x", state: "needs-login", fingerprint: "profile:x2",
