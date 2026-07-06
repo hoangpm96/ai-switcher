@@ -654,7 +654,10 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
             // app or LaunchDaemon) spawned this. Auth is unaffected: credentials resolve via
             // CLAUDE_CONFIG_DIR (its .credentials.json / per-dir keychain item), not HOME.
             // (Verified live 2026-06-30: `HOME=<fake> claude -p hi` authenticates and replies in ~4s
-            // and writes nothing into the fake home.)
+            // and writes nothing into the fake home.) Also use the fake home as cwd: Claude 2.1.201
+            // still spawns `git` for cwd/git-status prompt sections before a request, and when the
+            // GUI app is responsible for that child process macOS can show a SystemPolicy folder
+            // prompt that stalls the CLI until our timeout.
             let fake_home = config_dir.join(".prime-home");
             let _ = std::fs::create_dir_all(&fake_home);
             command
@@ -666,7 +669,7 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
                 // Documents, Downloads and Media Library through macOS TCC. Disable every context
                 // and tool source explicitly so the child remains an API-only OAuth invocation.
                 .env("CLAUDE_CODE_SAFE_MODE", "1")
-                .current_dir(config_dir);
+                .current_dir(&fake_home);
         }
         ToolId::Codex => {
             command

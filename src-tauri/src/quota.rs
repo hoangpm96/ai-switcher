@@ -17,8 +17,9 @@ const CLAUDE_TOKEN_EXPIRY_SKEW_MS: i64 = 10 * 60 * 1000;
 /// Claude invocation used for background OAuth refreshes and primes.
 ///
 /// `--safe-mode` disables customisations, but Claude 2.1.x can still initialise its built-in
-/// tool/sandbox layer and preflight macOS protected folders. Disabling every tool and context
-/// source keeps this an API-only request while preserving OAuth/Keychain refresh behaviour.
+/// tool/sandbox layer and preflight macOS protected folders. Disabling every tool, context source,
+/// and dynamic cwd/git prompt section keeps this an API-only request while preserving
+/// OAuth/Keychain refresh behaviour.
 pub(crate) const CLAUDE_BACKGROUND_ARGS: &[&str] = &[
     "-p",
     "hi",
@@ -26,6 +27,7 @@ pub(crate) const CLAUDE_BACKGROUND_ARGS: &[&str] = &[
     "1",
     "--no-session-persistence",
     "--safe-mode",
+    "--exclude-dynamic-system-prompt-sections",
     "--setting-sources",
     "",
     "--strict-mcp-config",
@@ -1334,6 +1336,7 @@ mod tests {
         let args = CLAUDE_BACKGROUND_ARGS.join(" ");
         for required in [
             "--safe-mode",
+            "--exclude-dynamic-system-prompt-sections",
             "--setting-sources",
             "--strict-mcp-config",
             "--tools",

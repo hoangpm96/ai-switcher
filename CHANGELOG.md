@@ -5,6 +5,18 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-07-06
+
+### Fixed
+
+- **Claude scheduled auto-prime no longer stalls behind macOS folder-permission prompts.** Claude
+  Code 2.1.201 can spawn `git` during startup to build dynamic cwd/git-status prompt context even
+  for a one-message background prime. When the GUI app is responsible for that child process, macOS
+  may show a `SystemPolicyAllFiles` permission prompt and leave the CLI hanging until the scheduler's
+  timeout. Background Claude primes now exclude dynamic prompt sections and run from the app-owned
+  `.prime-home` directory while keeping `CLAUDE_CONFIG_DIR` pointed at the selected account, so the
+  token refresh/prime request can complete without touching protected user folders.
+
 ## [0.6.1] - 2026-07-05
 
 ### Added
