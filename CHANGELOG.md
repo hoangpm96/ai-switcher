@@ -5,6 +5,21 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-07-07
+
+### Fixed
+
+- **Claude scheduled auto-prime no longer triggers macOS folder-permission prompts.** v0.6.2 excluded
+  dynamic prompt sections from Claude's background invocation, but that flag only moves cwd/git-status
+  context out of the system prompt — it does not skip collecting it. Claude Code still ran `git
+  remote`/`git ls-files` against the current directory on every invocation, including a plain `-p hi`
+  background prime. Live TCC logs confirmed macOS attributes that `git` child process's
+  `SystemPolicyAllFiles` preflight to the spawning app, producing the folder-permission popup and
+  stalling the CLI until the scheduler's timeout killed it. Background Claude primes now shadow `git`
+  on the child's `PATH` with a no-op stand-in, so the real `git` binary never runs and there is nothing
+  for macOS to prompt for. Verified live: the CLI still authenticates and completes normally, in
+  seconds instead of stalling for the full timeout.
+
 ## [0.6.2] - 2026-07-06
 
 ### Fixed

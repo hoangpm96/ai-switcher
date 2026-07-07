@@ -633,18 +633,52 @@ pub fn claude_cli_refresh(config_dir: &Path, binary: &Path) -> Result<(), String
     send_hi_cli(&ToolId::Claude, config_dir, binary)
 }
 
+/// Name of the shim executable that shadows `git` on the PATH we build for a background Claude
+/// invocation. Kept as a constant so the creator and the PATH builder agree on the filename.
+const GIT_SHIM_NAME: &str = "git";
+/// A shim that does nothing but fail like "not a git repository" — cheap, deterministic, and never
+/// touches the filesystem outside its own exit code.
+const GIT_SHIM_SCRIPT: &str = "#!/bin/sh\nexit 128\n";
+
+/// Create (if missing) a directory containing a fake `git` executable and return its path. Putting
+/// this directory FIRST on a spawned Claude CLI's PATH makes every `git` lookup resolve to the shim
+/// instead of the real binary, so the child never launches an actual `git` process.
+///
+/// Why this exists: Claude Code runs `git remote`/`git ls-files` to build cwd context for its system
+/// prompt on every invocation, including a plain `-p hi` background prime — `--exclude-dynamic-system-
+/// prompt-sections` only moves that content out of the system prompt, it does NOT skip collecting it
+/// (verified live 2026-07-07). When the real `git` binary is the one that runs, macOS attributes its
+/// `kTCCServiceSystemPolicyAllFiles` preflight to the spawning app (confirmed via `log show
+/// --predicate 'subsystem == "com.apple.TCC"'`: `responsible=...AI Account Switcher.app`,
+/// `accessing=com.apple.git`), producing the folder-permission popup and stalling the CLI until our
+/// timeout kills it. Shadowing `git` with a shim that exits immediately removes the TCC-relevant
+/// process entirely — Claude just sees "not a git repo" and moves on in seconds (verified live: CLI
+/// still authenticates and answers normally with the shim in place).
+fn ensure_git_shim_dir(config_dir: &Path) -> Option<std::path::PathBuf> {
+    let shim_dir = config_dir.join(".prime-shim");
+    std::fs::create_dir_all(&shim_dir).ok()?;
+    let shim_path = shim_dir.join(GIT_SHIM_NAME);
+    // Idempotent: only (re)write when missing or stale, so a prime tick that runs every few minutes
+    // doesn't churn the filesystem for no reason.
+    let needs_write = std::fs::read_to_string(&shim_path)
+        .map(|existing| existing != GIT_SHIM_SCRIPT)
+        .unwrap_or(true);
+    if needs_write {
+        std::fs::write(&shim_path, GIT_SHIM_SCRIPT).ok()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755));
+    }
+    Some(shim_dir)
+}
+
 /// Prime by running the account's CLI non-interactively, with the account's config dir in the
 /// environment so the CLI uses the right profile/token. Exit 0 = success.
 fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(), String> {
     use std::process::Command;
     let mut command = Command::new(binary);
-    // Finder/Dock apps and LaunchDaemons commonly inherit only
-    // `/usr/bin:/bin:/usr/sbin:/sbin`. npm-installed CLIs are scripts with an
-    // `#!/usr/bin/env node` shebang, so spawning the configured `codex` path can
-    // succeed while the script itself exits 127 because `env` cannot find Node.
-    // Supply the same deterministic install locations used by tool detection,
-    // while preserving any useful entries inherited from the user's session.
-    command.env("PATH", cli_path(binary));
     match tool_id {
         ToolId::Claude => {
             // Fake HOME: Claude's startup preflights ~/Desktop, ~/Documents, ~/Downloads and the
@@ -654,13 +688,19 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
             // app or LaunchDaemon) spawned this. Auth is unaffected: credentials resolve via
             // CLAUDE_CONFIG_DIR (its .credentials.json / per-dir keychain item), not HOME.
             // (Verified live 2026-06-30: `HOME=<fake> claude -p hi` authenticates and replies in ~4s
-            // and writes nothing into the fake home.) Also use the fake home as cwd: Claude 2.1.201
-            // still spawns `git` for cwd/git-status prompt sections before a request, and when the
-            // GUI app is responsible for that child process macOS can show a SystemPolicy folder
-            // prompt that stalls the CLI until our timeout.
+            // and writes nothing into the fake home.) Also use the fake home as cwd so a real repo's
+            // git state is never in play either.
             let fake_home = config_dir.join(".prime-home");
             let _ = std::fs::create_dir_all(&fake_home);
+            // Shadow `git` on PATH (see `ensure_git_shim_dir`) — fake HOME alone isn't enough because
+            // Claude still runs `git remote`/`git ls-files` against cwd regardless of HOME, and that's
+            // the process macOS attributes the folder-permission prompt to.
+            let mut priority_dirs = Vec::new();
+            if let Some(shim_dir) = ensure_git_shim_dir(config_dir) {
+                priority_dirs.push(shim_dir);
+            }
             command
+                .env("PATH", cli_path_with_priority_dirs(binary, &priority_dirs))
                 .args(quota::CLAUDE_BACKGROUND_ARGS)
                 .env("CLAUDE_CONFIG_DIR", config_dir)
                 .env("HOME", &fake_home)
@@ -672,7 +712,14 @@ fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(),
                 .current_dir(&fake_home);
         }
         ToolId::Codex => {
+            // Finder/Dock apps and LaunchDaemons commonly inherit only
+            // `/usr/bin:/bin:/usr/sbin:/sbin`. npm-installed CLIs are scripts with an
+            // `#!/usr/bin/env node` shebang, so spawning the configured `codex` path can
+            // succeed while the script itself exits 127 because `env` cannot find Node.
+            // Supply the same deterministic install locations used by tool detection,
+            // while preserving any useful entries inherited from the user's session.
             command
+                .env("PATH", cli_path(binary))
                 .args([
                     "exec",
                     "--skip-git-repo-check",
@@ -770,6 +817,14 @@ fn concise_cli_error(stderr: &str) -> String {
 }
 
 fn cli_path(binary: &Path) -> OsString {
+    cli_path_with_priority_dirs(binary, &[])
+}
+
+/// Build the PATH for a spawned CLI, with `priority_dirs` searched FIRST — before the binary's own
+/// directory, the common install locations, and the inherited PATH. Used to shadow a real executable
+/// (e.g. `git`) with a shim so the child never resolves the real one, regardless of what else is on
+/// PATH.
+fn cli_path_with_priority_dirs(binary: &Path, priority_dirs: &[std::path::PathBuf]) -> OsString {
     use std::collections::HashSet;
 
     let mut paths = Vec::new();
@@ -780,6 +835,9 @@ fn cli_path(binary: &Path) -> OsString {
         }
     };
 
+    for path in priority_dirs {
+        push(path.clone());
+    }
     if let Some(parent) = binary.parent() {
         push(parent.to_path_buf());
     }
@@ -1124,6 +1182,57 @@ mod tests {
         assert!(entries.contains(&PathBuf::from("/opt/homebrew/bin")));
         assert!(entries.contains(&PathBuf::from("/usr/local/bin")));
         assert!(entries.contains(&PathBuf::from("/usr/bin")));
+    }
+
+    #[test]
+    fn cli_path_puts_priority_dirs_before_everything_else() {
+        let priority = vec![PathBuf::from("/fake/shim/dir")];
+        let path = cli_path_with_priority_dirs(Path::new("/Users/test/.local/bin/claude"), &priority);
+        let entries = std::env::split_paths(&path).collect::<Vec<PathBuf>>();
+        assert_eq!(entries.first(), Some(&PathBuf::from("/fake/shim/dir")));
+        // The real /usr/bin (where the system git lives) must still be present — just after the
+        // shim dir — so everything else the CLI needs to resolve on PATH keeps working.
+        assert!(entries.contains(&PathBuf::from("/usr/bin")));
+    }
+
+    #[test]
+    fn cli_path_without_priority_dirs_matches_plain_cli_path() {
+        let binary = Path::new("/Users/test/.local/bin/claude");
+        let plain = cli_path(binary);
+        let via_helper = cli_path_with_priority_dirs(binary, &[]);
+        assert_eq!(plain, via_helper);
+    }
+
+    #[test]
+    fn git_shim_dir_contains_an_executable_git_that_exits_nonzero() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ai-switcher-git-shim-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let shim_dir = ensure_git_shim_dir(&tmp).expect("shim dir should be created");
+        let shim_path = shim_dir.join(GIT_SHIM_NAME);
+        assert!(shim_path.is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&shim_path).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "shim must be executable");
+
+            let status = std::process::Command::new(&shim_path)
+                .status()
+                .expect("shim should run");
+            assert!(!status.success(), "shim must exit non-zero like a missing git repo");
+        }
+
+        // Calling again must not error and must keep returning the same directory (idempotent).
+        let shim_dir_again = ensure_git_shim_dir(&tmp).expect("second call should also succeed");
+        assert_eq!(shim_dir, shim_dir_again);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
