@@ -35,7 +35,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./tauri";
 import { UsageView } from "./UsageView";
-import { AutoSessionView } from "./AutoSessionView";
 import logoUrl from "./assets/logo.svg";
 import type {
   Account,
@@ -46,8 +45,6 @@ import type {
   ApiRotationStrategy,
   ApiUsageReport,
   AppSnapshot,
-  AutoPrimeSetting,
-  PrimeAttemptStatus,
   RateLimitResetCredits,
   BinaryCandidate,
   ConfigCandidate,
@@ -63,23 +60,6 @@ import type {
   ToolId,
   ToolStatus,
 } from "./types";
-
-function primeAttemptSourceLabel(source: PrimeAttemptStatus["source"]): string {
-  switch (source) {
-    case "schedule":
-      return "Lịch";
-    case "autoExtend":
-      return "Tự gia hạn";
-    case "userExtend":
-      return "Gia hạn";
-    case "manual":
-      return "Prime ngay";
-    case "scheduleAutoExtend":
-      return "Lịch + tự gia hạn";
-    case "scheduleUserExtend":
-      return "Lịch + gia hạn";
-  }
-}
 
 /** Host shown on an API account card (best-effort parse of the gateway URL). */
 function gatewayHost(baseUrl: string) {
@@ -105,8 +85,6 @@ const emptySnapshot: AppSnapshot = {
   autoSwitch: false,
   autoSwitchThreshold: 100,
   autoSwitchSettings: {},
-  autoPrime: {},
-  primeAttempts: {},
   toolSetups: {},
   apiGateway: {
     config: {
@@ -129,7 +107,7 @@ const emptySnapshot: AppSnapshot = {
 export function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
   const [selectedTool, setSelectedTool] = useState<ToolId>("claude");
-  const [view, setView] = useState<"accounts" | "api" | "usage" | "auto" | "settings">("accounts");
+  const [view, setView] = useState<"accounts" | "api" | "usage" | "settings">("accounts");
   // One unified notification channel for the whole app: success + error both render as a
   // top-right toast (see the Toasts renderer). `notify` is the single entry point.
   const [toasts, setToasts] = useState<
@@ -260,27 +238,18 @@ export function App() {
     };
   }, []);
 
-  // Auto session prime updated a schedule / reminded to extend / primed → re-pull the snapshot.
-  useEffect(() => {
-    const unlisten = listen("auto-prime-changed", () => {
-      void load();
-    });
-    return () => {
-      void unlisten.then((fn) => fn());
-    };
-  }, [load]);
-
-  // A backgrounded "Prime ngay" finished → clear its spinner and toast the final result.
+  // A backgrounded "Prime ngay" finished → clear its spinner, toast the final result, and refresh.
   useEffect(() => {
     const unlisten = listen<PrimeNowDone>("prime-now-done", (event) => {
       const { accountId, kind, message } = event.payload;
       setBusy((current) => (current === `prime:${accountId}` ? null : current));
       notify(message, kind);
+      void load();
     });
     return () => {
       void unlisten.then((fn) => fn());
     };
-  }, [notify]);
+  }, [load, notify]);
 
   useEffect(() => {
     if (!snapshot.disclaimerAccepted || dialog) return;
@@ -496,16 +465,6 @@ export function App() {
               <small>Token &amp; cost</small>
             </button>
             <button
-              className={`toolTab ${view === "auto" ? "selected" : ""}`}
-              onClick={() => setView("auto")}
-            >
-              <span className="usageTabLabel">
-                <AlarmClock />
-                Auto Session
-              </span>
-              <small>Neo mốc reset 5h</small>
-            </button>
-            <button
               className={`toolTab ${view === "settings" ? "selected" : ""}`}
               onClick={() => setView("settings")}
             >
@@ -534,10 +493,6 @@ export function App() {
         </aside>
 
         {view === "usage" && <UsageView />}
-
-        {view === "auto" && (
-          <AutoSessionView snapshot={snapshot} setSnapshot={setSnapshot} notify={notify} />
-        )}
 
         {view === "api" && (
           <ApiGatewayView
@@ -694,17 +649,6 @@ export function App() {
                     account={account}
                     tool={currentTool}
                     busy={busy}
-                    autoPrime={snapshot.autoPrime[account.id] ?? null}
-                    primeAttempt={snapshot.primeAttempts[account.id] ?? null}
-                    onExtend={(accept) =>
-                      run("extend", () =>
-                        api.confirmExtend({
-                          toolId: currentTool.id,
-                          accountId: account.id,
-                          accept,
-                        }),
-                      )
-                    }
                     onPrimeNow={async () => {
                       setBusy(`prime:${account.id}`);
                       setError(null);
@@ -845,6 +789,48 @@ function SettingsView({
   onAutoSwitchChange: (toolId: ToolId, enabled: boolean, threshold: number) => void;
 }) {
   const cliTools = snapshot.tools.filter((tool) => tool.id !== "antigravity");
+  const [wakeHelperInstalled, setWakeHelperInstalled] = useState(false);
+  const [wakeHelperBusy, setWakeHelperBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .wakeHelperStatus()
+      .then((installed) => {
+        if (!cancelled) setWakeHelperInstalled(installed);
+      })
+      .catch(() => {
+        if (!cancelled) setWakeHelperInstalled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const removeWakeHelper = async () => {
+    setWakeHelperBusy(true);
+    try {
+      const removed = await api.uninstallWakeHelper();
+      setWakeHelperInstalled(false);
+      notify(
+        removed ? "Đã gỡ daemon auto-prime cũ." : "Không còn daemon auto-prime cũ.",
+        removed ? "success" : "info",
+      );
+    } catch (err) {
+      notify(errorMessage(err), "error");
+    } finally {
+      setWakeHelperBusy(false);
+    }
+  };
+
+  const openPrimeLog = async () => {
+    try {
+      await api.openAutoPrimeLog();
+    } catch (err) {
+      notify(errorMessage(err), "error");
+    }
+  };
+
   return (
     <section className="panel">
       <div className="panelHead">
@@ -890,6 +876,36 @@ function SettingsView({
               />
             );
           })}
+        </div>
+
+        <div className="settingsSection">
+          <div className="settingsSectionHead">
+            <AlarmClock />
+            <div>
+              <strong>Prime</strong>
+              <small>Log hoạt động prime thủ công và dọn phần cũ nếu còn.</small>
+            </div>
+          </div>
+          <div className="wakeRow">
+            <div className="wakeText">
+              <strong>Nhật ký prime</strong>
+              <span className="muted">Mở file log hoạt động prime.</span>
+            </div>
+            <button className="linkBtn" onClick={() => void openPrimeLog()}>
+              Mở log prime
+            </button>
+          </div>
+          {wakeHelperInstalled && (
+            <div className="wakeRow">
+              <div className="wakeText">
+                <strong>Còn daemon auto-prime cũ trên máy (tính năng đã bỏ)</strong>
+                <span className="muted">Gỡ daemon cũ nếu không còn dùng tính năng auto-prime.</span>
+              </div>
+              <button onClick={() => void removeWakeHelper()} disabled={wakeHelperBusy}>
+                {wakeHelperBusy ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />} Gỡ daemon cũ
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="settingsSection">
@@ -1941,9 +1957,6 @@ function AccountCard({
   account,
   tool,
   busy,
-  autoPrime,
-  primeAttempt,
-  onExtend,
   onPrimeNow,
   onSwitch,
   onRename,
@@ -1958,9 +1971,6 @@ function AccountCard({
   account: Account;
   tool: ToolStatus;
   busy: string | null;
-  autoPrime: AutoPrimeSetting | null;
-  primeAttempt: PrimeAttemptStatus | null;
-  onExtend: (accept: boolean) => void;
   onPrimeNow: () => void;
   onSwitch: () => void;
   onRename: () => void;
@@ -1979,53 +1989,15 @@ function AccountCard({
   const exhausted = account.state === "exhausted";
   const needsLogin = account.state === "needs-login";
 
-  // Auto session prime status shown on the card (subscription Claude/Codex only).
   const canPrime = (tool.id === "claude" || tool.id === "codex") && !isApi;
-  const primeOn = !!autoPrime?.enabled;
-  const resetAt = account.quota?.fiveHour.resetAt ?? null;
-  const minsToReset = resetAt ? Math.round((Date.parse(resetAt) - Date.now()) / 60000) : null;
-  // Offer "extend" when the window is about to end (still has time left, ≤30'), the reminder is for
-  // THIS exact window (reset_at match — so it never lingers onto the next window), the user hasn't
-  // already accepted, and hasn't dismissed it. `minsToReset > 0`: once the window hits 0/expired we
-  // stop offering — that window is gone; a fresh one earns its own reminder from the poller.
-  const showExtend =
-    canPrime &&
-    !!autoPrime?.extendRemindedReset &&
-    autoPrime.extendRemindedReset === resetAt &&
-    !autoPrime.extendRequested &&
-    autoPrime.extendDismissedReset !== resetAt &&
-    minsToReset !== null &&
-    minsToReset > 0 &&
-    minsToReset <= 30;
-  const autoStatus = (() => {
-    if (!canPrime) return null;
-    if (primeAttempt) {
-      const deadline = new Date(primeAttempt.deadlineAt).toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      });
-      return `${primeAttemptSourceLabel(primeAttempt.source)} · đã gửi yêu cầu prime, đang xác nhận · thử tới ${deadline}`;
-    }
-    if (!primeOn) return null;
-    if (autoPrime?.extendRequested) return "Sẽ mở phiên mới khi phiên cũ hết";
-    if (autoPrime?.lastResult === "success") return `Auto ${autoPrime.time} · đã prime`;
-    return `Auto ${autoPrime?.time}`;
-  })();
   // "Prime ngay": let the user open a new 5h window on demand, for the case where there's no live
   // window and they don't want to drop to a terminal to send a message. The backend decides this
   // (provider-aware `primeAvailable`) — the UI must NOT recompute from `resetAt`: a Codex reset_at
   // can be in the future yet rolling/unanchored (no real window), and a Claude `resetAt === null`
   // can mean "fully ended" (offer) rather than "unknown" (hide). `primeAvailable === true` means
   // ended-or-unanchored; undefined means unknown/read-error → hide. Still hidden when login is
-  // needed or an extend is already armed (that opens the window itself). The backend's D2 stays
-  // the real guard; this just shows the button at the right time.
-  const showPrimeNow =
-    canPrime &&
-    account.quota?.primeAvailable === true &&
-    !needsLogin &&
-    !autoPrime?.extendRequested &&
-    !primeAttempt;
+  // needed. The backend's D2 stays the real guard; this just shows the button at the right time.
+  const showPrimeNow = canPrime && account.quota?.primeAvailable === true && !needsLogin;
   const primingNow = busy === `prime:${account.id}`;
 
   return (
@@ -2086,24 +2058,6 @@ function AccountCard({
           onRefreshToken={onRefreshToken}
           refreshingToken={refreshingToken}
         />
-      )}
-
-      {showExtend ? (
-        // One quiet inline line, not a banner with two buttons: "Phiên còn 20' · Gia hạn". Clicking
-        // "Gia hạn" arms the extend; doing nothing just lets the window end (no dismiss button — not
-        // acting IS the decline). Keeps the card calm even when several accounts end at once.
-        <div className="autoStatusLine extendLine">
-          <AlarmClock size={13} /> Phiên còn {minsToReset}′ ·{" "}
-          <button className="linkBtn" onClick={() => onExtend(true)} disabled={busy !== null}>
-            Gia hạn
-          </button>
-        </div>
-      ) : (
-        autoStatus && (
-          <div className="autoStatusLine">
-            <AlarmClock size={13} /> {autoStatus}
-          </div>
-        )
       )}
 
       {showPrimeNow && (
@@ -2245,8 +2199,10 @@ function Quota({
   if (!quota) return <p className="quotaError">No quota data yet</p>;
   if (quota.error) {
     // A 401/403 quota read means the stored OAuth token expired. For Claude subscription accounts
-    // offer a one-tap renew (safe to click when no CLI session is using the account); other errors
-    // (network, parse) just show the message — renewing wouldn't help.
+    // offer a re-check: safe to click any time — it never spawns the CLI to auto-refresh anymore
+    // (that used to invalidate a live `claude` session elsewhere, forcing a manual /login — verified
+    // live 2026-07-08/09). It just re-reads the token: clears a transient 401, or tells you to log in
+    // yourself if the token is genuinely expired. Other errors (network, parse) just show the message.
     const isAuthError = /\b40[13]\b/.test(quota.error);
     return (
       <div className="quotaError">
@@ -2256,7 +2212,7 @@ function Quota({
             className="linkBtn"
             onClick={onRefreshToken}
             disabled={refreshingToken}
-            title="Làm mới token đăng nhập (chỉ bấm khi không có phiên Claude Code nào đang chạy trên tài khoản này)"
+            title="Kiểm tra lại token đăng nhập (không tự làm mới — nếu hết hạn thật, cần mở claude và đăng nhập lại thủ công)"
           >
             {refreshingToken ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} Làm mới token
           </button>

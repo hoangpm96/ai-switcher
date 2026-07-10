@@ -1,7 +1,4 @@
-use crate::models::{
-    Account, AccountState, ApiGatewayConfig, AutoPrimeSetting, AutoSwitchSetting,
-    PrimeRuntimeState, ToolId, ToolSetup,
-};
+use crate::models::{Account, AccountState, ApiGatewayConfig, AutoSwitchSetting, ToolId, ToolSetup};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -23,10 +20,6 @@ pub struct StoredState {
     /// Per-tool auto-switch settings. Claude/Codex are independent; Antigravity is not supported.
     #[serde(default)]
     pub auto_switch_settings: BTreeMap<String, AutoSwitchSetting>,
-    /// Per-account "auto session prime" schedules, keyed by account id. Only subscription
-    /// (OAuth) Claude/Codex accounts are eligible — API-proxy accounts have no 5h window.
-    #[serde(default)]
-    pub auto_prime: BTreeMap<String, AutoPrimeSetting>,
     /// Resolved CLI binary/config dirs per tool. Missing = detect on startup / ask user.
     #[serde(default)]
     pub tool_setups: BTreeMap<String, ToolSetup>,
@@ -47,7 +40,6 @@ impl Default for StoredState {
             auto_switch: false,
             auto_switch_threshold: default_threshold(),
             auto_switch_settings: BTreeMap::new(),
-            auto_prime: BTreeMap::new(),
             tool_setups: BTreeMap::new(),
             api_gateway: ApiGatewayConfig::default(),
         }
@@ -66,7 +58,13 @@ impl Store {
         let root = dirs.data_local_dir().to_path_buf();
         fs::create_dir_all(root.join("accounts"))?;
         fs::create_dir_all(root.join("backups"))?;
-        fs::create_dir_all(root.join("prime-claims"))?;
+        // Best-effort cleanup of files the removed auto-session-prime feature left behind. Deleting
+        // `wake-request.txt` also makes a still-installed legacy wake-helper daemon cancel any pmset
+        // wake it had armed (its WatchPaths script clears the previous wake when the file goes away).
+        for stale in ["prime-runtime.json", "prime.lock", "wake-request.txt"] {
+            let _ = fs::remove_file(root.join(stale));
+        }
+        let _ = fs::remove_dir_all(root.join("prime-claims"));
         Ok(Self { root })
     }
 
@@ -90,67 +88,10 @@ impl Store {
         self.root.join("api_usage.json")
     }
 
-    /// Human-readable activity log for auto session priming (one line per event).
+    /// Human-readable activity log for "Prime ngay" attempts (one line per event). The filename is
+    /// kept from the removed auto-prime feature so the user's existing log history stays in place.
     pub fn auto_prime_log_path(&self) -> PathBuf {
         self.root.join("auto-prime.log")
-    }
-
-    pub fn prime_runtime_path(&self) -> PathBuf {
-        self.root.join("prime-runtime.json")
-    }
-
-    /// Advisory cross-process lock used to serialize GUI and headless prime batches.
-    pub fn prime_lock_path(&self) -> PathBuf {
-        self.root.join("prime.lock")
-    }
-
-    pub fn prime_claim_path(&self, key: &str) -> PathBuf {
-        use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(key.as_bytes());
-        self.root
-            .join("prime-claims")
-            .join(format!("{digest:x}.claim"))
-    }
-
-    /// Remove old, unreferenced claim markers. Claims intentionally survive terminal attempts to
-    /// protect against stale cross-process state, but they need not accumulate forever.
-    pub fn gc_prime_claims(&self, runtime: &PrimeRuntimeState) {
-        let referenced: std::collections::BTreeSet<PathBuf> = runtime
-            .attempts
-            .values()
-            .filter_map(|attempt| attempt.claim_key.as_deref())
-            .map(|key| self.prime_claim_path(key))
-            .collect();
-        let Ok(entries) = fs::read_dir(self.root.join("prime-claims")) else {
-            return;
-        };
-        let max_age = std::time::Duration::from_secs(48 * 60 * 60);
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if referenced.contains(&path) {
-                continue;
-            }
-            let old = entry
-                .metadata()
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > max_age);
-            if old {
-                let _ = fs::remove_file(path);
-            }
-        }
-    }
-
-    /// The root data dir (used to place the pmset wake helper's request/script files).
-    pub fn root_dir(&self) -> &std::path::Path {
-        &self.root
-    }
-
-    /// File the app writes the next desired wake time into; the root LaunchDaemon helper watches
-    /// it and runs `pmset schedule wake`. Lives in the data dir so the unprivileged app can write it.
-    pub fn wake_request_path(&self) -> PathBuf {
-        self.root.join("wake-request.txt")
     }
 
     /// The tool's accounts root (`accounts/<tool>/`), holding one dir per profile account.
@@ -188,28 +129,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn load_prime_runtime(&self) -> Result<PrimeRuntimeState> {
-        let path = self.prime_runtime_path();
-        if !path.exists() {
-            return Ok(PrimeRuntimeState::default());
-        }
-        let text = fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&text)?)
-    }
-
-    pub fn save_prime_runtime(&self, runtime: &PrimeRuntimeState) -> Result<()> {
-        let path = self.prime_runtime_path();
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(runtime)?)?;
-        fs::rename(tmp, path)?;
-        Ok(())
-    }
-
     #[cfg(test)]
     pub fn for_test(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(root.join("accounts"))?;
         fs::create_dir_all(root.join("backups"))?;
-        fs::create_dir_all(root.join("prime-claims"))?;
         Ok(Self { root })
     }
 }
@@ -231,59 +154,5 @@ pub fn normalize_account_states(
         } else {
             account.state.clone()
         };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::{PendingPrimeAttempt, PrimeAttemptPhase, PrimeRuntimeState};
-
-    #[test]
-    fn prime_runtime_round_trips_atomically() {
-        let root = std::env::temp_dir().join(format!(
-            "ai-switcher-prime-runtime-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let store = Store::for_test(root.clone()).unwrap();
-        let mut runtime = PrimeRuntimeState::default();
-        runtime.attempts.insert(
-            "account-1".to_string(),
-            PendingPrimeAttempt {
-                version: 1,
-                account_id: "account-1".to_string(),
-                tool_id: ToolId::Codex,
-                attempt_id: "attempt-1".to_string(),
-                source: crate::models::PrimeAttemptSource::Schedule,
-                consumes_scheduled_slot: true,
-                resolves_extend: false,
-                manual: false,
-                scheduled_date: Some("2026-06-20".to_string()),
-                scheduled_time: Some("07:00".to_string()),
-                anchor_at: "2026-06-20T00:00:00Z".to_string(),
-                deadline_at: "2026-06-20T00:45:00Z".to_string(),
-                phase: PrimeAttemptPhase::WaitingRetry,
-                next_action_at: "2026-06-20T00:05:00Z".to_string(),
-                send_attempts: 1,
-                last_send_at: Some("2026-06-20T00:00:00Z".to_string()),
-                baseline_reset_at: None,
-                last_observation: None,
-                last_error: Some("rolling".to_string()),
-                claim_key: Some("scheduled|account-1|2026-06-20|07:00".to_string()),
-                terminal_outcome: None,
-            },
-        );
-        store.save_prime_runtime(&runtime).unwrap();
-        let loaded = store.load_prime_runtime().unwrap();
-        assert_eq!(loaded.attempts.len(), 1);
-        assert_eq!(
-            loaded.attempts["account-1"].phase,
-            PrimeAttemptPhase::WaitingRetry
-        );
-        assert!(!store
-            .prime_runtime_path()
-            .with_extension("json.tmp")
-            .exists());
-        let _ = std::fs::remove_dir_all(root);
     }
 }

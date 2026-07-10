@@ -14,35 +14,6 @@ use std::time::{Duration, Instant};
 /// (send + up to 45' of scheduler retries) with margin.
 const CLAUDE_TOKEN_EXPIRY_SKEW_MS: i64 = 10 * 60 * 1000;
 
-/// Claude invocation used for background OAuth refreshes and primes.
-///
-/// `--safe-mode` disables customisations, but Claude 2.1.x can still initialise its built-in
-/// tool/sandbox layer and preflight macOS protected folders. Disabling every tool, context source,
-/// and dynamic cwd/git prompt section keeps this an API-only request while preserving
-/// OAuth/Keychain refresh behaviour.
-pub(crate) const CLAUDE_BACKGROUND_ARGS: &[&str] = &[
-    "-p",
-    "hi",
-    "--max-turns",
-    "1",
-    "--no-session-persistence",
-    "--safe-mode",
-    "--exclude-dynamic-system-prompt-sections",
-    "--setting-sources",
-    "",
-    "--strict-mcp-config",
-    "--mcp-config",
-    "{\"mcpServers\":{}}",
-    "--tools",
-    "",
-    "--disable-slash-commands",
-    "--no-chrome",
-    "--permission-mode",
-    "dontAsk",
-    "--prompt-suggestions",
-    "false",
-];
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LiveQuotaError {
     RateLimited,
@@ -437,28 +408,6 @@ pub(crate) fn claude_token_expiry_hhmm(config_dir: &Path) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| "?".to_string())
-}
-
-/// Whether the account's per-dir keychain item is READABLE right now. Returns false when the login
-/// keychain is locked — which is exactly the DarkWake state (Mac woken in the background before any
-/// GUI login). The prime path uses this as a proxy for "awake enough to renew": renewing a Claude
-/// token means running the CLI, which reads/writes the keychain; doing that while locked either fails
-/// or lands the fresh token in a still-locked keychain that the confirm read can't see. So when this
-/// is false the prime DEFERS the CLI renewal to a later (awake) tick instead of failing. A DIR
-/// account only; `~/.claude` always reports readable (its own CLI owns that lifecycle).
-pub(crate) fn claude_keychain_readable(config_dir: &Path) -> bool {
-    if config_dir == home_dir().join(".claude") {
-        return true;
-    }
-    let suffix = claude_keychain_suffix(config_dir);
-    read_keychain_blob(&format!("Claude Code-credentials-{suffix}")).is_some()
-}
-
-/// Public wrapper: re-mirror the account's keychain token into its `.credentials.json` file. Called
-/// by the prime path right after the CLI renews the token, so the fresh keychain value is copied
-/// back into the DarkWake-readable file (the CLI deletes the file when it rotates). Copy-only.
-pub(crate) fn reseed_claude_file(config_dir: &Path) {
-    seed_claude_credentials_file(config_dir);
 }
 
 /// Mirror an app-managed DIR account's keychain token into its `.credentials.json` file, so an
@@ -1330,30 +1279,6 @@ fn pretty_plan(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn claude_background_invocation_disables_context_and_tools() {
-        let args = CLAUDE_BACKGROUND_ARGS.join(" ");
-        for required in [
-            "--safe-mode",
-            "--exclude-dynamic-system-prompt-sections",
-            "--setting-sources",
-            "--strict-mcp-config",
-            "--tools",
-            "--disable-slash-commands",
-            "--no-chrome",
-            "--permission-mode dontAsk",
-            "--no-session-persistence",
-        ] {
-            assert!(args.contains(required), "missing hardened flag: {required}");
-        }
-        assert!(CLAUDE_BACKGROUND_ARGS
-            .windows(2)
-            .any(|pair| pair == ["--tools", ""]));
-        assert!(CLAUDE_BACKGROUND_ARGS
-            .windows(2)
-            .any(|pair| pair == ["--setting-sources", ""]));
-    }
 
     #[test]
     fn claude_token_validity_uses_offline_expiry_with_skew() {

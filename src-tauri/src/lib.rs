@@ -16,8 +16,7 @@ use models::{
     AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, RenameAccountInput, SaveApiGatewayComboInput,
-    ConfirmExtendInput, PrimeNowInput, SetApiGatewayAccountInput, SetAutoExtendInput,
-    SetAutoPrimeAllInput, SetAutoPrimeInput, SetLauncherInput, SetToolSetupInput,
+    PrimeNowInput, SetApiGatewayAccountInput, SetLauncherInput, SetToolSetupInput,
     StartApiGatewayInput, SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
@@ -167,46 +166,6 @@ fn set_auto_switch_setting(
         .map_err(display_error)
 }
 
-#[tauri::command]
-fn set_auto_prime(
-    state: State<'_, ManagedState>,
-    input: SetAutoPrimeInput,
-) -> Result<AppSnapshot, String> {
-    state
-        .set_auto_prime(input.tool_id, input.account_id, input.enabled, input.time)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-fn set_auto_prime_all(
-    state: State<'_, ManagedState>,
-    input: SetAutoPrimeAllInput,
-) -> Result<AppSnapshot, String> {
-    state
-        .set_auto_prime_all(input.time, input.enabled)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-fn confirm_extend(
-    state: State<'_, ManagedState>,
-    input: ConfirmExtendInput,
-) -> Result<AppSnapshot, String> {
-    state
-        .confirm_extend(input.tool_id, input.account_id, input.accept)
-        .map_err(display_error)
-}
-
-#[tauri::command]
-fn set_auto_extend(
-    state: State<'_, ManagedState>,
-    input: SetAutoExtendInput,
-) -> Result<AppSnapshot, String> {
-    state
-        .set_auto_extend(input.tool_id, input.account_id, input.enabled)
-        .map_err(display_error)
-}
-
 /// On-demand "Prime ngay": open a fresh 5h window for one account right now. Runs on a blocking
 /// worker (the prime can take tens of seconds) and returns a short status message for a UI toast.
 #[tauri::command]
@@ -242,16 +201,6 @@ async fn refresh_token_now(
     .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
-fn get_auto_prime_log(state: State<'_, ManagedState>) -> String {
-    state.auto_prime_log()
-}
-
-#[tauri::command]
-fn get_auto_prime_stats(state: State<'_, ManagedState>) -> Vec<models::AutoPrimeDayStat> {
-    state.auto_prime_stats(14)
-}
-
 /// List leftover profile directories from deleted accounts (read-only; surfaces size + in-use).
 #[tauri::command]
 fn list_orphan_account_dirs(
@@ -273,38 +222,19 @@ fn delete_orphan_account_dir(
         .map_err(display_error)
 }
 
-/// Whether the pmset wake helper LaunchDaemon is installed (so the Mac can wake itself to prime).
+/// Whether leftover auto-prime LaunchDaemons (from the removed auto session feature) are still
+/// installed on this Mac — the UI offers a one-tap cleanup when true.
 #[tauri::command]
 fn wake_helper_status() -> bool {
-    wake::helper_installed()
+    wake::legacy_daemons_installed()
 }
 
-/// Install the root LaunchDaemon (one admin prompt) + write the first wake request.
-#[tauri::command]
-fn install_wake_helper(state: State<'_, ManagedState>) -> Result<bool, String> {
-    wake::install_helper(&state.store).map_err(|e| e.to_string())?;
-    state.update_wake_schedule();
-    Ok(true)
-}
-
-/// Remove the root LaunchDaemon (one admin prompt).
+/// Remove every leftover auto-prime LaunchDaemon (one admin prompt). Returns the resulting
+/// installed state (false = clean).
 #[tauri::command]
 fn uninstall_wake_helper() -> Result<bool, String> {
-    wake::uninstall_helper().map_err(|e| e.to_string())?;
-    Ok(false)
-}
-
-/// Whether "prime while the Mac is asleep" is on (the prime LaunchDaemon is installed).
-#[tauri::command]
-fn prime_daemon_status() -> bool {
-    wake::prime_daemon_installed()
-}
-
-/// Toggle "prime while the Mac is asleep". Installing/removing the prime daemon is privileged (one
-/// admin prompt). Returns the resulting installed state so the UI reflects what actually happened.
-#[tauri::command]
-fn set_prime_while_asleep(state: State<'_, ManagedState>, enabled: bool) -> Result<bool, String> {
-    state.set_prime_while_asleep(enabled).map_err(display_error)
+    wake::uninstall_legacy_daemons().map_err(|e| e.to_string())?;
+    Ok(wake::legacy_daemons_installed())
 }
 
 #[tauri::command]
@@ -459,16 +389,13 @@ fn create_virtual_api_account(
 }
 
 pub fn run() {
-    // Headless prime mode: invoked by the user-scoped prime LaunchDaemon after a pmset wake.
-    // macOS can suspend the GUI app during DarkWake, so the
-    // in-app scheduler can't run then — this path is a plain process the daemon launches: load state,
-    // prime everything due (late=true so a just-woken anchor counts), then exit. NO Tauri window,
-    // tray, or background loop. A cross-process lock serializes this with the GUI scheduler.
+    // Legacy stub: older versions installed a LaunchDaemon that launches this binary with
+    // `--prime-headless` every 60 seconds. The auto session prime feature is removed, but until
+    // the user runs the daemon cleanup (Settings) that daemon may still fire — exit immediately
+    // instead of falling through to the GUI (which would pop the main window once a minute via
+    // the single-instance plugin).
     if std::env::args().any(|a| a == "--prime-headless") {
-        match ManagedState::new_headless() {
-            Ok(state) => state.run_due_primes(None, true),
-            Err(e) => eprintln!("[prime-headless] state init failed: {e}"),
-        }
+        eprintln!("[prime-headless] auto session prime đã bị gỡ khỏi app; hãy mở app → Settings → gỡ daemon cũ.");
         return;
     }
 
@@ -500,23 +427,14 @@ pub fn run() {
             antigravity_new_login,
             set_auto_switch,
             set_auto_switch_setting,
-            set_auto_prime,
-            set_auto_prime_all,
-            confirm_extend,
-            set_auto_extend,
             prime_now,
             refresh_token_now,
-            get_auto_prime_log,
-            get_auto_prime_stats,
             list_orphan_account_dirs,
             delete_orphan_account_dir,
             open_auto_prime_log,
             open_auto_prime_log_folder,
             wake_helper_status,
-            install_wake_helper,
             uninstall_wake_helper,
-            prime_daemon_status,
-            set_prime_while_asleep,
             detect_tool_setup,
             validate_tool_setup,
             set_tool_setup,
@@ -547,9 +465,6 @@ pub fn run() {
                 for tool_id in [ToolId::Claude, ToolId::Codex] {
                     let _ = state.refresh_tool(tool_id, Some(&handle));
                 }
-                // Auto-prime mechanism 2: after refreshing quota, prompt to extend any window
-                // that's about to end (and log "no response" for ones that ended unacknowledged).
-                state.check_extend_reminders(Some(&handle));
                 // Keep the token-usage cache warm and nudge any open Usage tab to refetch
                 // (with whatever range the user has selected).
                 let _ = state.usage_report(0);
@@ -558,30 +473,6 @@ pub fn run() {
                 tray::rebuild(&handle);
             });
 
-            // Auto session prime scheduler. On startup, catch up any prime time already passed
-            // today that hasn't run (machine was asleep/app was closed) → "primed muộn". Then
-            // tick every minute: prime accounts whose time has arrived (once/day per time).
-            // NOTE (milestone 1): this only fires while the machine is awake / app is running.
-            // pmset wake (Mac waking itself) is a later milestone.
-            let prime_handle = app.handle().clone();
-            std::thread::spawn(move || {
-                // Brief delay so first quota refresh / login recheck can settle.
-                std::thread::sleep(std::time::Duration::from_secs(20));
-                // Each batch runs on its own detached thread so a slow attempt (send retries can
-                // block for minutes) never delays the next tick; `run_due_primes` self-guards
-                // against overlapping batches.
-                let startup = prime_handle.clone();
-                std::thread::spawn(move || {
-                    startup.state::<ManagedState>().run_due_primes(Some(&startup), true);
-                });
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
-                    let tick = prime_handle.clone();
-                    std::thread::spawn(move || {
-                        tick.state::<ManagedState>().run_due_primes(Some(&tick), false);
-                    });
-                }
-            });
             Ok(())
         })
         .on_window_event(|window, event| {

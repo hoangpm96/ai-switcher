@@ -9,17 +9,12 @@ import type {
   CreateApiGatewayKeyInput,
   CreateApiGatewayKeyResult,
   CreateVirtualApiAccountInput,
-  AutoPrimeDayStat,
-  ConfirmExtendInput,
   OrphanAccountDir,
   PrimeNowInput,
   PrimeNowResult,
   RateLimitResetCredits,
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
-  SetAutoExtendInput,
-  SetAutoPrimeAllInput,
-  SetAutoPrimeInput,
   SetLauncherInput,
   SetToolSetupInput,
   StartApiGatewayInput,
@@ -78,11 +73,6 @@ const demoSnapshot: AppSnapshot = {
     claude: { enabled: false, threshold: 100 },
     codex: { enabled: true, threshold: 95 },
   },
-  autoPrime: {
-    claude: { enabled: false, time: "07:30" },
-    codex: { enabled: false, time: "08:00" },
-  },
-  primeAttempts: {},
   toolSetups: {
     claude: {
       binaryPath: "/Users/demo/.local/bin/claude",
@@ -248,7 +238,7 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   }
 
   await new Promise((resolve) => window.setTimeout(resolve, 120));
-  if (command === "load_snapshot" || command === "refresh_tool" || command === "set_auto_prime" || command === "set_auto_prime_all" || command === "confirm_extend" || command === "set_auto_extend") {
+  if (command === "load_snapshot" || command === "refresh_tool") {
     return structuredClone(demoSnapshot) as T;
   }
   if (command === "prime_now") {
@@ -256,12 +246,6 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   }
   if (command === "refresh_token_now") {
     return { kind: "success", message: "Token đã sẵn sàng. Đang cập nhật lại quota…" } as T;
-  }
-  if (command === "get_auto_prime_log") {
-    return "" as T;
-  }
-  if (command === "get_auto_prime_stats") {
-    return [] as T;
   }
   if (command === "list_orphan_account_dirs") {
     return [] as T;
@@ -274,15 +258,6 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   }
   if (command === "wake_helper_status" || command === "uninstall_wake_helper") {
     return false as T;
-  }
-  if (command === "install_wake_helper") {
-    return true as T;
-  }
-  if (command === "prime_daemon_status") {
-    return false as T;
-  }
-  if (command === "set_prime_while_asleep") {
-    return ((args as { enabled?: boolean } | undefined)?.enabled ?? false) as T;
   }
   if (command === "get_usage") {
     return structuredClone(demoUsage) as T;
@@ -522,26 +497,15 @@ export const api = {
   refreshApiGatewayModels: () => invoke<AppSnapshot>("refresh_api_gateway_models"),
   createVirtualApiAccount: (toolId: ToolId, model?: string) =>
     invoke<AppSnapshot>("create_virtual_api_account", { input: { toolId, model: model ?? null } }),
-  setAutoPrime: (input: SetAutoPrimeInput) => invoke<AppSnapshot>("set_auto_prime", { input }),
-  setAutoPrimeAll: (input: SetAutoPrimeAllInput) =>
-    invoke<AppSnapshot>("set_auto_prime_all", { input }),
-  confirmExtend: (input: ConfirmExtendInput) => invoke<AppSnapshot>("confirm_extend", { input }),
-  setAutoExtend: (input: SetAutoExtendInput) => invoke<AppSnapshot>("set_auto_extend", { input }),
   /** On-demand prime; resolves to a short status message (the snapshot refreshes via event). */
   primeNow: (input: PrimeNowInput) => invoke<PrimeNowResult>("prime_now", { input }),
   /** On-demand Claude OAuth token renewal for an account whose quota read 401'd. */
   refreshTokenNow: (input: PrimeNowInput) => invoke<PrimeNowResult>("refresh_token_now", { input }),
-  getAutoPrimeLog: () => invoke<string>("get_auto_prime_log"),
-  getAutoPrimeStats: () => invoke<AutoPrimeDayStat[]>("get_auto_prime_stats"),
   listOrphanAccountDirs: () => invoke<OrphanAccountDir[]>("list_orphan_account_dirs"),
   deleteOrphanAccountDir: (toolId: ToolId, id: string) =>
     invoke<void>("delete_orphan_account_dir", { toolId, id }),
   openAutoPrimeLog: () => invoke<void>("open_auto_prime_log"),
   openAutoPrimeLogFolder: () => invoke<void>("open_auto_prime_log_folder"),
   wakeHelperStatus: () => invoke<boolean>("wake_helper_status"),
-  installWakeHelper: () => invoke<boolean>("install_wake_helper"),
   uninstallWakeHelper: () => invoke<boolean>("uninstall_wake_helper"),
-  primeDaemonStatus: () => invoke<boolean>("prime_daemon_status"),
-  setPrimeWhileAsleep: (enabled: boolean) =>
-    invoke<boolean>("set_prime_while_asleep", { enabled }),
 };

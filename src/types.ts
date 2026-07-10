@@ -85,33 +85,8 @@ export interface AppSnapshot {
   autoSwitch: boolean;
   autoSwitchThreshold: number;
   autoSwitchSettings: Record<string, AutoSwitchSetting>;
-  autoPrime: Record<string, AutoPrimeSetting>;
-  primeAttempts: Record<string, PrimeAttemptStatus>;
   toolSetups: Record<string, ToolSetup>;
   apiGateway: ApiGatewaySnapshot;
-}
-
-export type PrimeAttemptPhase =
-  | "precheck"
-  | "needSend"
-  | "confirming"
-  | "waitingRetry"
-  | "finalizing";
-export type PrimeAttemptSource =
-  | "schedule"
-  | "autoExtend"
-  | "userExtend"
-  | "manual"
-  | "scheduleAutoExtend"
-  | "scheduleUserExtend";
-
-export interface PrimeAttemptStatus {
-  phase: PrimeAttemptPhase;
-  deadlineAt: string;
-  nextActionAt: string;
-  attempts: number;
-  source: PrimeAttemptSource;
-  lastError?: string | null;
 }
 
 export type ApiGatewayServerState = "stopped" | "running" | "errored";
@@ -207,39 +182,6 @@ export interface AutoSwitchSetting {
   threshold: number;
 }
 
-export interface AutoPrimeSetting {
-  enabled: boolean;
-  /** Daily prime time, "HH:MM" 24h, machine local time. */
-  time: string;
-  lastPrimedDate?: string | null;
-  lastPrimedTime?: string | null;
-  /** "success" | "failed" | "skip" | "hold" */
-  lastResult?: string | null;
-  lastAttemptAt?: string | null;
-  lastTerminalAttemptId?: string | null;
-  /** User accepted "extend?" — prime once the current window ends. */
-  extendRequested?: boolean;
-  /** reset_at the user was last reminded for (so the "extend?" button shows). */
-  extendRemindedReset?: string | null;
-  /** Auto-extend without asking (default false = ask each time). */
-  autoExtend?: boolean;
-  /** reset_at the scheduler is deferring this account until (held; old window still active). */
-  deferredUntil?: string | null;
-  /** reset_at the user dismissed the "extend?" prompt for (UI hides the button). */
-  extendDismissedReset?: string | null;
-  /** Local date "YYYY-MM-DD" this schedule first runs; undefined = eligible today. Set to tomorrow
-   *  when the time is set/enabled after today's anchor already passed, so the first prime is next. */
-  activeFrom?: string;
-}
-
-export interface AutoPrimeDayStat {
-  date: string;
-  success: number;
-  failed: number;
-  hold: number;
-  skip: number;
-}
-
 export type DetectionSource = "env" | "default" | "path" | "appManaged" | "manual" | "fallback";
 
 export interface ToolSetup {
@@ -331,34 +273,6 @@ export interface SetLauncherInput {
   toolId: ToolId;
   accountId: string;
   name: string;
-}
-
-export interface SetAutoPrimeInput {
-  toolId: ToolId;
-  accountId: string;
-  enabled: boolean;
-  /** "HH:MM" 24h local time. */
-  time: string;
-}
-
-export interface SetAutoPrimeAllInput {
-  /** "HH:MM" 24h applied to every prime-eligible (subscription) account. */
-  time: string;
-  enabled: boolean;
-}
-
-export interface ConfirmExtendInput {
-  toolId: ToolId;
-  accountId: string;
-  /** true = accept "extend?", false = dismiss. */
-  accept: boolean;
-}
-
-export interface SetAutoExtendInput {
-  toolId: ToolId;
-  accountId: string;
-  /** true = auto-extend without asking; false = ask each time (default). */
-  enabled: boolean;
 }
 
 export interface PrimeNowInput {

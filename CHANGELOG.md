@@ -5,6 +5,36 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-10
+
+### Removed
+
+- **Scheduled auto session prime is gone.** The daily prime scheduler, the "extend the session"
+  reminders/auto-extend, the "Auto Session" tab, and the macOS wake daemons (pmset wake helper +
+  headless prime daemon) have all been removed. Every incident this app spent months chasing —
+  folder-permission popups, DarkWake keychain failures, and worst of all a background token refresh
+  that logged a live `claude` terminal session out and forced a manual `/login` — came from those
+  unattended background paths. Verified live 2026-07-08/09 that even letting the `claude` CLI refresh
+  its own token in the background is not multi-session-safe: it can still evict an interactive session
+  on the same account. So the app no longer runs any scheduled or background prime, and never spawns
+  a CLI or rotates a token on its own.
+
+### Changed
+
+- **"Prime ngay" is now the only priming path, and it is deliberately minimal.** Pressing it opens a
+  fresh 5-hour window on demand with a single plain HTTP request using the account's existing token:
+  it can never rotate a token or disturb a running CLI session. It runs one attempt (send once,
+  confirm briefly) with no background retries — if it doesn't confirm, press it again. An expired
+  token is reported as "open `claude` and log in yourself," never auto-refreshed.
+- **"Làm mới token" only re-checks the token now.** It clears a transient 401 if the token is still
+  valid, and otherwise tells you to log in manually — it never spawns the CLI to refresh.
+
+### Migration
+
+- If you had the auto-prime wake daemons installed, open the app → **Settings**: when leftover
+  daemons are detected you'll see a one-tap **"Gỡ daemon cũ"** button that removes them (one admin
+  prompt). The app also clears any stale pmset wake and prime bookkeeping on first launch.
+
 ## [0.6.3] - 2026-07-07
 
 ### Fixed

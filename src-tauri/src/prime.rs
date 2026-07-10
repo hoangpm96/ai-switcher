@@ -1,9 +1,11 @@
-//! Auto session prime — send a lightweight request to a subscription account so a fresh 5-hour
-//! window opens, anchoring the reset clock to the user's work rhythm.
+//! "Prime ngay" — send one lightweight HTTP request to a subscription account so a fresh 5-hour
+//! window opens right now, on the user's demand. One bounded attempt per button press: check the
+//! token, classify the current window, send once, then poll briefly to confirm the new window.
 //!
-//! This module owns ONE attempt at priming a single account (the "Scheduled prime" core flow
-//! in docs/account-switcher/brainstorms/auto-session-prime.md, decision points D1–D4). The
-//! scheduler in `app_state` decides *when* to call it and records the outcome.
+//! The old auto session prime (daily scheduler, extend reminders, pmset wake daemons) was removed —
+//! its background paths were the source of every /login + folder-permission incident. This module
+//! deliberately has NO background retries and NEVER spawns a CLI: everything is plain HTTP with the
+//! account's existing token, so it cannot rotate a token or invalidate a live `claude` session.
 //!
 //! Verified upstream facts (see the prototype `scripts/session-prime-today.sh`):
 //!   - Claude: POST /v1/messages with the Claude Code system preamble, model haiku.
@@ -14,7 +16,6 @@
 use crate::models::ToolId;
 use crate::quota;
 use serde_json::json;
-use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
@@ -24,9 +25,6 @@ const CODEX_PRIME_MODEL: &str = "gpt-5.5";
 const CLAUDE_CODE_SYSTEM_PREAMBLE: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Delay used only when a caller explicitly asks one bounded invocation to retry. Durable
-/// scheduled retries are orchestrated by app_state and persisted in prime-runtime.json.
-pub const SEND_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 /// Claude confirm (D4): after a 2xx send, poll the live window until it proves a freshly anchored
 /// session. Two signals (preferred → fallback):
 ///   1. `limits[kind == "session"].is_active == true` with a future `reset_at` — the provider flips
@@ -38,34 +36,25 @@ pub const SEND_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 ///
 /// Read FIRST, then sleep only if not yet confirmed, so the common "opened instantly" case returns in
 /// one read instead of after a fixed delay. Bounded by a max poll count AND a wall-clock budget (each
-/// read is a ~1s HTTP call) so a confirmation never overruns the scheduler's per-tick proof budget
-/// (`PRIME_PROOF_BUDGET_SECONDS`). On give-up the scheduler's 5-minute retry loop re-confirms.
+/// read is a ~1s HTTP call) so the backgrounded button press finishes in bounded time.
 pub const CONFIRM_MAX_TRIES: u32 = 8;
 pub const CONFIRM_RETRY_DELAY: Duration = Duration::from_secs(10);
 pub const CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(90);
 /// Codex confirm (D4): after a 2xx send, poll the live window until it reads as a clearly-anchored
-/// real session, tolerating a still-rolling reset or a transient read failure. The poll is bounded by
-/// BOTH a max poll count AND a hard wall-clock budget — each `read_live_five_hour` makes a `curl` call
-/// (up to 20s), so counting sleeps alone undercounts; `CODEX_CONFIRM_TOTAL_BUDGET` caps the real
-/// elapsed time so a confirmation can never overrun the scheduler's per-tick proof budget
-/// (`PRIME_PROOF_BUDGET_SECONDS`). On give-up the scheduler's 5-minute retry loop re-confirms.
+/// real session, tolerating a still-rolling reset or a transient read failure. Bounded by BOTH a max
+/// poll count AND a hard wall-clock budget — each `read_live_five_hour` makes a `curl` call (up to
+/// 20s), so counting sleeps alone undercounts.
 ///
 /// Codex anchors a window after a tiny completed response (verified live: a completed 1% request can
 /// anchor immediately), but the `reset_at` snap from rolling → fixed has a HIGHLY variable delay —
-/// some sends never settle within a couple minutes. So we poll DENSELY (every 10s) across the largest
-/// budget that still fits the proof budget, to catch the snap whenever it lands; if a tick gives up,
-/// the scheduler's retry loop re-confirms on the next tick (the real "stretch": confirmation spans
-/// several ticks, not one long inline wait, which the proof budget forbids). Confirmation reads only
-/// — it never sends again, so a longer/denser poll costs no extra quota (the original request already
-/// cost its ~1%).
+/// some sends never settle within a couple minutes. So we poll DENSELY (every 10s). If the budget
+/// runs out unconfirmed, the send itself may still have anchored the window — the UI message tells
+/// the user to re-check rather than claiming failure.
 pub const CODEX_CONFIRM_POLL_DELAY: Duration = Duration::from_secs(10);
 pub const CODEX_CONFIRM_MAX_POLLS: u32 = 12;
 pub const CODEX_CONFIRM_TOTAL_BUDGET: Duration = Duration::from_secs(125);
-/// Hard cap on how long a prime CLI invocation may run before we kill it (a hung CLI must never
-/// hold the prime worker — see the scheduler's overlap guard).
-pub const CLI_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The outcome of one prime attempt, mapped to the brainstorm's log wording by the caller.
+/// The outcome of one prime attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrimeOutcome {
     /// Sent + confirmed the 5h window moved to a new reset. Carries the new `reset_at` (ISO).
@@ -75,13 +64,11 @@ pub enum PrimeOutcome {
     /// Account has no valid token (expired / logged out).
     SkipNoToken,
     /// Couldn't establish the current window state (read error / unparseable / inconclusive data),
-    /// so we did NOT send — failing closed rather than priming into an unknown window. Transient;
-    /// the next scheduled tick retries.
+    /// so we did NOT send — failing closed rather than priming into an unknown window.
     SkipUnknownState,
-    /// The bounded send burst failed. The persisted scheduler decides whether the deadline permits
-    /// another burst.
+    /// The send failed (network / HTTP error).
     FailSend { reason: String },
-    /// Send was OK but the window never moved after `CONFIRM_MAX_TRIES`.
+    /// Send was OK but the window never confirmed within the poll budget.
     FailUnconfirmed,
 }
 
@@ -91,40 +78,28 @@ pub fn is_prime_eligible(tool_id: &ToolId, has_api_provider: bool) -> bool {
     !has_api_provider && matches!(tool_id, ToolId::Claude | ToolId::Codex)
 }
 
-/// Run one bounded prime burst. The crash-safety hook is invoked after precheck succeeds and
-/// immediately
-/// before the first external send. The scheduler uses it to durably persist `Confirming`,
-/// `baseline_reset_at`, and `last_send_at`; a failed hook aborts the send.
-/// Run one bounded prime burst, emitting a one-line `trace(...)` at every action (D1 token
-/// check + refresh, D2 window classification, each D3 send attempt, each D4 confirm poll) so the
-/// activity log records the FULL story of an attempt — not just START → terminal. The scheduler
-/// passes a closure that appends each trace line under the attempt's id, making after-the-fact
-/// diagnosis (e.g. "refresh 429 retried 7×" vs "send failed" vs "confirm still rolling") possible.
+/// Run ONE bounded prime attempt (send once, confirm with a bounded poll), emitting a one-line
+/// `trace(...)` at every action (D1 token check, D2 window classification, D3 send, D4 confirm) so
+/// the activity log records the full story of the attempt.
 pub fn prime_account_traced(
     tool_id: &ToolId,
     config_dir: &Path,
-    binary: Option<&Path>,
-    send_attempts: u32,
     mut sleeper: impl FnMut(Duration),
-    mut before_send: impl FnMut(Option<&str>) -> Result<(), String>,
     mut trace: impl FnMut(&str),
 ) -> PrimeOutcome {
-    // Hold the Mac awake for the whole attempt. A pmset wake only buys a brief awake window before
-    // macOS idle-sleeps again; D3's retries (up to 5 × 5') and D4's confirm polls can outlast it,
-    // and a prime that started right after a pmset wake must not be cut off by a re-sleep. Dropped
-    // at function exit (any return path). No-op when caffeinate is missing (non-macOS / stripped).
+    // Hold the Mac awake for the whole attempt (the confirm poll can run ~2 minutes) so an
+    // idle-sleep can't cut it off. Dropped at function exit (any return path). No-op when
+    // caffeinate is missing (non-macOS / stripped).
     let _awake = CaffeinateGuard::start();
 
-    // D1 — token must be present, and for Claude also decides HOW to prime. The app NEVER refreshes
-    // a Claude token itself: Anthropic's grant rotates the one-time-use refresh token, and an
-    // app-side rotation invalidates the chain a live/overnight `claude` session still holds → that
-    // session's next refresh 401s → "/login" (the exact pain this app exists to remove).
-    //   - Valid token  → prime over plain HTTP with the existing token (no rotation, fast path).
-    //   - Expired      → hand the WHOLE job to the `claude` CLI: one `-p hi` run makes the CLI renew
-    //     its own token (its multi-session-safe mechanism) AND sends the prime request that opens the
-    //     window.
-    //     The CLI runs with a fake HOME so its Desktop/Documents/Downloads preflight never touches a
-    //     TCC-protected folder → no permission popups regardless of who spawned it.
+    // D1 — token must be present AND unexpired. The app NEVER refreshes a Claude token itself —
+    // neither directly nor by spawning the `claude` CLI to do it. Anthropic's grant rotates the
+    // one-time-use refresh token, and ANY rotation (app-side or CLI-side) invalidates the chain a
+    // live/overnight `claude` session still holds → that session's next refresh 401s → "/login" (the
+    // exact pain this app exists to remove). Verified live 2026-07-08/09: even the CLI's own
+    // background refresh is NOT multi-session-safe. So an expired token is always a SkipNoToken:
+    // the user opens that account's `claude` CLI themselves (interactively, the one thing proven
+    // safe) and presses the button again.
     if matches!(tool_id, ToolId::Claude) {
         trace("D1 kiểm tra token Claude");
         let exp_hhmm = quota::claude_token_expiry_hhmm(config_dir);
@@ -133,76 +108,14 @@ pub fn prime_account_traced(
                 "D1 token còn hạn (tới {exp_hhmm}) → prime thẳng qua HTTP"
             )),
             quota::ClaudeTokenState::Missing => {
-                trace("D1 không đọc được token (chưa đăng nhập, hoặc keychain khóa lúc DarkWake) → SkipNoToken");
+                trace("D1 không đọc được token (chưa đăng nhập) → SkipNoToken");
                 return PrimeOutcome::SkipNoToken;
             }
             quota::ClaudeTokenState::Expired => {
-                // Renewing means running the CLI, which reads/writes the login keychain. During
-                // DarkWake (Mac woken in the background for a scheduled prime, before any GUI login)
-                // the keychain is LOCKED — the CLI would fail, or land the fresh token in a locked
-                // keychain the confirm read can't see, producing a false "couldn't confirm". So DEFER
-                // to a later awake tick rather than fail. This is the deliberate trade-off: a prime
-                // whose token expired overnight runs a bit late (when the Mac is unlocked) instead of
-                // the app ever rotating the token itself and logging a live `claude` session out.
-                if !quota::claude_keychain_readable(config_dir) {
-                    trace(&format!(
-                        "D1 token đã hết hạn ({exp_hhmm}) nhưng keychain đang khóa (máy ngủ/DarkWake) → HOÃN, prime lại khi máy thức (KHÔNG rotate để giữ phiên CLI)"
-                    ));
-                    return PrimeOutcome::SkipUnknownState;
-                }
                 trace(&format!(
-                    "D1 token đã hết hạn ({exp_hhmm}), keychain đọc được (máy thức) → giao Claude CLI tự làm mới + gửi prime request (app không rotate)"
+                    "D1 token đã hết hạn ({exp_hhmm}) → SkipNoToken (KHÔNG tự làm mới — mở `claude` trên account này để đăng nhập lại rồi bấm lại)"
                 ));
-                // Prefer the account's configured binary; fall back to auto-detecting `claude` on PATH
-                // so an account with no explicit binary path can still renew.
-                let resolved = binary
-                    .map(std::path::Path::to_path_buf)
-                    .or_else(|| crate::tools::command_path("claude"));
-                let Some(binary) = resolved.as_deref() else {
-                    trace("D1 chưa tìm thấy claude CLI → đợi tick sau");
-                    return PrimeOutcome::SkipUnknownState;
-                };
-                // Durable Confirming marker BEFORE the external send, same contract as the HTTP path
-                // (no baseline reset — the expired token can't read the window beforehand).
-                if let Err(reason) = before_send(None) {
-                    trace(&format!("D1 ghi marker trước khi chạy CLI lỗi: {reason}"));
-                    return PrimeOutcome::FailSend { reason };
-                }
-                trace("D1 chạy claude CLI (refresh + prime request trong 1 lần)");
-                if let Err(reason) = send_hi_cli(tool_id, config_dir, binary) {
-                    // Distinguish user-actionable failures (which retrying can't fix) from transient
-                    // ones, so the log points at the real next step instead of "just retrying".
-                    let hint = claude_cli_error_hint(&reason);
-                    trace(&format!("D1 CLI lỗi: {reason}{hint}"));
-                    return PrimeOutcome::FailSend { reason };
-                }
-                // The CLI just refreshed its token into the keychain (and, on a DIR account, deleted
-                // the `.credentials.json` file). Mirror the fresh keychain token back into the file so
-                // the confirm read below — and any later DarkWake prime — can read it. Keychain is
-                // readable here (we gated on that above), so this succeeds.
-                quota::reseed_claude_file(config_dir);
-                quota::invalidate_claude_cache(config_dir);
-                trace("D1 CLI xong (token đã được CLI làm mới, hi đã gửi) → xác nhận window");
-                // Confirm like the resume path: no pre-send baseline; `Some(false)` lets the
-                // newly-active signal count (a send only happens when no window was confirmed
-                // running). Edge: if a window anchored from another device WAS running, this reports
-                // Success with that window's (real, active) reset — informationally correct.
-                return match claude_confirm_anchored(
-                    config_dir,
-                    None,
-                    Some(false),
-                    &mut sleeper,
-                    &mut trace,
-                ) {
-                    Some(new_reset_at) => {
-                        trace(&format!("D4 xác nhận OK, reset mới {new_reset_at}"));
-                        PrimeOutcome::Success { new_reset_at }
-                    }
-                    None => {
-                        trace("D4 hết budget chưa xác nhận → FailUnconfirmed (tick sau thử lại)");
-                        PrimeOutcome::FailUnconfirmed
-                    }
-                };
+                return PrimeOutcome::SkipNoToken;
             }
         }
     } else {
@@ -246,8 +159,7 @@ pub fn prime_account_traced(
                 return PrimeOutcome::SkipUnknownState;
             }
         },
-        // We can't establish the window state → fail CLOSED: do NOT send blindly. The next
-        // scheduled tick retries once the read recovers.
+        // We can't establish the window state → fail CLOSED: do NOT send blindly.
         quota::WindowState::Unknown => {
             trace("D2 không xác định được window → SkipUnknownState");
             return PrimeOutcome::SkipUnknownState;
@@ -257,39 +169,14 @@ pub fn prime_account_traced(
         quota::WindowState::Ambiguous => trace("D2 window rolling (Codex) → gửi prime request"),
     }
 
-    // D3 — send the prime request, retrying on failure up to `send_attempts` times.
-    if let Err(reason) = before_send(before_reset.as_deref()) {
-        trace(&format!("D3 ghi marker trước gửi lỗi: {reason}"));
+    // D3 — send the prime request ONCE. No retry burst: this is a user-triggered button; a failure
+    // returns quickly and the user can simply tap again.
+    trace("D3 gửi prime request");
+    if let Err(reason) = send_hi_http(tool_id, config_dir) {
+        trace(&format!("D3 gửi prime request lỗi: {reason}"));
         return PrimeOutcome::FailSend { reason };
     }
-    let attempts = send_attempts.max(1);
-    let mut last_reason = String::new();
-    let mut sent = false;
-    for attempt in 1..=attempts {
-        trace(&format!("D3 gửi prime request (lần {attempt}/{attempts})"));
-        match send_hi(tool_id, config_dir, binary) {
-            Ok(()) => {
-                trace("D3 gửi prime request OK (HTTP 2xx + body hoàn tất)");
-                sent = true;
-                break;
-            }
-            Err(reason) => {
-                trace(&format!("D3 gửi prime request lỗi: {reason}"));
-                last_reason = reason;
-                if attempt < attempts {
-                    sleeper(SEND_RETRY_DELAY);
-                }
-            }
-        }
-    }
-    if !sent {
-        trace(&format!(
-            "D3 gửi prime request thất bại sau {attempts} lần: {last_reason}"
-        ));
-        return PrimeOutcome::FailSend {
-            reason: last_reason,
-        };
-    }
+    trace("D3 gửi prime request OK (HTTP 2xx + body hoàn tất)");
 
     // D4 — confirm the prime took.
     //
@@ -299,8 +186,7 @@ pub fn prime_account_traced(
     //     time) for a moment, then snaps to a FIXED epoch that counts down. We confirm by POLLING the
     //     window until it reads as `Anchored` (reset clearly inside now+5h, i.e. not the rolling
     //     signature). This is robust to both a slow anchor and a transient read failure — a failed
-    //     read just retries on the next poll instead of aborting the whole confirmation (the old
-    //     two-observation drift proof reported FAIL whenever one of its two reads slipped).
+    //     read just retries on the next poll instead of aborting the whole confirmation.
     //   - Claude: `reset_at` is a stable anchor, so we confirm the window actually moved to a new
     //     future reset before claiming success. Poll a few times — the provider may take a few
     //     seconds to refresh.
@@ -312,7 +198,7 @@ pub fn prime_account_traced(
                 PrimeOutcome::Success { new_reset_at }
             }
             None => {
-                trace("D4 hết budget chưa xác nhận → FailUnconfirmed (tick sau thử lại)");
+                trace("D4 hết budget chưa xác nhận → FailUnconfirmed");
                 PrimeOutcome::FailUnconfirmed
             }
         };
@@ -329,7 +215,7 @@ pub fn prime_account_traced(
             PrimeOutcome::Success { new_reset_at }
         }
         None => {
-            trace("D4 hết budget chưa xác nhận → FailUnconfirmed (tick sau thử lại)");
+            trace("D4 hết budget chưa xác nhận → FailUnconfirmed");
             PrimeOutcome::FailUnconfirmed
         }
     }
@@ -405,7 +291,7 @@ fn claude_anchored_reset(
 /// request opened the window; an already-active baseline with an unmoved reset must NOT count, or
 /// clicking "Prime now" on a still-running window would falsely report a fresh window and persist the
 /// old reset. (D2 already HOLDs a clearly-anchored window upstream; this is defense in depth so the
-/// predicate is correct regardless of caller — e.g. the crash-resume path.)
+/// predicate is correct regardless of caller.)
 /// Signal 2 — reset moved: the reset advanced to a new future value vs the pre-send baseline. This
 /// stands on its own (a moved reset is unambiguous proof) even if `is_active` is absent.
 fn claude_reset_confirms(
@@ -433,16 +319,14 @@ fn claude_reset_confirms(
 ///      anchored it" case in ~one poll interval instead of waiting the full 90s for signal (1).
 ///
 /// A rolling window or a transient read failure simply keeps polling. Bounded by BOTH a max poll
-/// count and a hard wall-clock budget (each read costs up to a 20s curl), staying inside the
-/// scheduler's per-tick proof budget; on give-up the scheduler's 5-minute retry loop re-confirms.
+/// count and a hard wall-clock budget (each read costs up to a 20s curl).
 fn codex_confirm_anchored(
     config_dir: &Path,
     mut sleeper: impl FnMut(Duration),
     mut trace: impl FnMut(&str),
 ) -> Option<String> {
     // Consolidated logging: one summary line at the end, not two per poll — a full rolling burst is
-    // 12 polls, and the old per-poll "đọc window"/"vẫn rolling" pair flooded the log (a failed Codex
-    // account alone produced hundreds of lines and drowned out everything else).
+    // 12 polls, and the old per-poll "đọc window"/"vẫn rolling" pair flooded the log.
     let started = std::time::Instant::now();
     let mut previous_epoch: Option<i64> = None;
     let mut polls_done = 0u32;
@@ -503,7 +387,7 @@ fn codex_confirm_anchored(
         String::new()
     };
     trace(&format!(
-        "D4 Codex window vẫn rolling sau {} poll / {}s{} → chưa neo (tick sau thử lại)",
+        "D4 Codex window vẫn rolling sau {} poll / {}s{} → chưa neo",
         polls_done,
         started.elapsed().as_secs(),
         err_note
@@ -516,51 +400,6 @@ fn codex_confirm_anchored(
 fn codex_reset_epoch_if_future(reset_at: &str) -> Option<i64> {
     let reset = chrono::DateTime::parse_from_rfc3339(reset_at).ok()?;
     (reset > chrono::Utc::now()).then(|| reset.timestamp())
-}
-
-/// Resume an attempt that may have crashed after its durable `Confirming` marker was written.
-/// This path never sends: it only proves whether a real session is active, preventing a blind
-/// duplicate request after restart.
-/// Resume an attempt that may have crashed after its durable `Confirming` marker was written,
-/// emitting a per-poll `trace(...)` line. This path never sends: it only proves whether a real
-/// session is active, preventing a blind duplicate request after restart.
-pub fn confirm_active_session_traced(
-    tool_id: &ToolId,
-    config_dir: &Path,
-    baseline_reset_at: Option<&str>,
-    mut sleeper: impl FnMut(Duration),
-    mut trace: impl FnMut(&str),
-) -> PrimeOutcome {
-    trace("RESUME xác nhận lại session sau khi tiếp tục");
-    match tool_id {
-        ToolId::Claude => {
-            // Same anchored-session poll as the inline D4 path (newly-active session OR a moved
-            // reset). A `Confirming` marker only exists because a send happened, which only happens
-            // after D2 confirmed no window was anchored — so the baseline was inactive. Passing
-            // `Some(false)` lets the newly-active signal count without risking a false positive.
-            match claude_confirm_anchored(
-                config_dir,
-                baseline_reset_at,
-                Some(false),
-                &mut sleeper,
-                &mut trace,
-            ) {
-                Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
-                None => PrimeOutcome::FailUnconfirmed,
-            }
-        }
-        ToolId::Codex => {
-            // Resume never re-sends: it only checks whether the window has anchored since the send
-            // that wrote the `Confirming` marker. Same anchored-signature poll as the inline D4 path
-            // (`baseline_reset_at` is unused for Codex — an anchored reset is proof on its own).
-            let _ = baseline_reset_at;
-            match codex_confirm_anchored(config_dir, &mut sleeper, &mut trace) {
-                Some(new_reset_at) => PrimeOutcome::Success { new_reset_at },
-                None => PrimeOutcome::FailUnconfirmed,
-            }
-        }
-        ToolId::Antigravity => PrimeOutcome::SkipUnknownState,
-    }
 }
 
 /// Keeps the Mac awake (no idle sleep) for as long as it is alive, by holding a child
@@ -601,259 +440,6 @@ fn read_token(tool_id: &ToolId, config_dir: &Path) -> Option<String> {
     }
 }
 
-/// Send a lightweight request to open a fresh window.
-///
-/// Prime directly over HTTP whenever possible. Starting the full Claude/Codex agent runtime for a
-/// one-token background request can still initialise sandbox/tool preflights and trigger macOS TCC
-/// prompts attributed to this app.
-fn send_hi(tool_id: &ToolId, config_dir: &Path, binary: Option<&Path>) -> Result<(), String> {
-    if !uses_cli_for_prime(tool_id) {
-        return send_hi_http(tool_id, config_dir);
-    }
-    if let Some(binary) = binary {
-        match send_hi_cli(tool_id, config_dir, binary) {
-            Ok(()) => return Ok(()),
-            // CLI binary exists but the run failed (not a "missing binary"): surface that error
-            // rather than silently masking it with an HTTP attempt that shares the same auth.
-            Err(reason) => return Err(reason),
-        }
-    }
-    send_hi_http(tool_id, config_dir)
-}
-
-fn uses_cli_for_prime(tool_id: &ToolId) -> bool {
-    matches!(tool_id, ToolId::Antigravity)
-}
-
-/// Renew a Claude account's token by running the `claude` CLI once (fake HOME, no popups) — the
-/// CLI's own refresh is the only session-safe way to rotate; the app never runs the grant itself.
-/// Used by the UI "Làm mới token" button. The run also sends one tiny prompt (that's what makes the
-/// CLI actually refresh — a status check alone doesn't touch the token, verified in v0.5.3).
-pub fn claude_cli_refresh(config_dir: &Path, binary: &Path) -> Result<(), String> {
-    send_hi_cli(&ToolId::Claude, config_dir, binary)
-}
-
-/// Name of the shim executable that shadows `git` on the PATH we build for a background Claude
-/// invocation. Kept as a constant so the creator and the PATH builder agree on the filename.
-const GIT_SHIM_NAME: &str = "git";
-/// A shim that does nothing but fail like "not a git repository" — cheap, deterministic, and never
-/// touches the filesystem outside its own exit code.
-const GIT_SHIM_SCRIPT: &str = "#!/bin/sh\nexit 128\n";
-
-/// Create (if missing) a directory containing a fake `git` executable and return its path. Putting
-/// this directory FIRST on a spawned Claude CLI's PATH makes every `git` lookup resolve to the shim
-/// instead of the real binary, so the child never launches an actual `git` process.
-///
-/// Why this exists: Claude Code runs `git remote`/`git ls-files` to build cwd context for its system
-/// prompt on every invocation, including a plain `-p hi` background prime — `--exclude-dynamic-system-
-/// prompt-sections` only moves that content out of the system prompt, it does NOT skip collecting it
-/// (verified live 2026-07-07). When the real `git` binary is the one that runs, macOS attributes its
-/// `kTCCServiceSystemPolicyAllFiles` preflight to the spawning app (confirmed via `log show
-/// --predicate 'subsystem == "com.apple.TCC"'`: `responsible=...AI Account Switcher.app`,
-/// `accessing=com.apple.git`), producing the folder-permission popup and stalling the CLI until our
-/// timeout kills it. Shadowing `git` with a shim that exits immediately removes the TCC-relevant
-/// process entirely — Claude just sees "not a git repo" and moves on in seconds (verified live: CLI
-/// still authenticates and answers normally with the shim in place).
-fn ensure_git_shim_dir(config_dir: &Path) -> Option<std::path::PathBuf> {
-    let shim_dir = config_dir.join(".prime-shim");
-    std::fs::create_dir_all(&shim_dir).ok()?;
-    let shim_path = shim_dir.join(GIT_SHIM_NAME);
-    // Idempotent: only (re)write when missing or stale, so a prime tick that runs every few minutes
-    // doesn't churn the filesystem for no reason.
-    let needs_write = std::fs::read_to_string(&shim_path)
-        .map(|existing| existing != GIT_SHIM_SCRIPT)
-        .unwrap_or(true);
-    if needs_write {
-        std::fs::write(&shim_path, GIT_SHIM_SCRIPT).ok()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755));
-    }
-    Some(shim_dir)
-}
-
-/// Prime by running the account's CLI non-interactively, with the account's config dir in the
-/// environment so the CLI uses the right profile/token. Exit 0 = success.
-fn send_hi_cli(tool_id: &ToolId, config_dir: &Path, binary: &Path) -> Result<(), String> {
-    use std::process::Command;
-    let mut command = Command::new(binary);
-    match tool_id {
-        ToolId::Claude => {
-            // Fake HOME: Claude's startup preflights ~/Desktop, ~/Documents, ~/Downloads and the
-            // media library through Node's os.homedir() (= $HOME). Pointing HOME at an app-owned
-            // empty dir makes every one of those paths land OUTSIDE the TCC-protected folders, so
-            // macOS has nothing to prompt for — no permission popups no matter which process (GUI
-            // app or LaunchDaemon) spawned this. Auth is unaffected: credentials resolve via
-            // CLAUDE_CONFIG_DIR (its .credentials.json / per-dir keychain item), not HOME.
-            // (Verified live 2026-06-30: `HOME=<fake> claude -p hi` authenticates and replies in ~4s
-            // and writes nothing into the fake home.) Also use the fake home as cwd so a real repo's
-            // git state is never in play either.
-            let fake_home = config_dir.join(".prime-home");
-            let _ = std::fs::create_dir_all(&fake_home);
-            // Shadow `git` on PATH (see `ensure_git_shim_dir`) — fake HOME alone isn't enough because
-            // Claude still runs `git remote`/`git ls-files` against cwd regardless of HOME, and that's
-            // the process macOS attributes the folder-permission prompt to.
-            let mut priority_dirs = Vec::new();
-            if let Some(shim_dir) = ensure_git_shim_dir(config_dir) {
-                priority_dirs.push(shim_dir);
-            }
-            command
-                .env("PATH", cli_path_with_priority_dirs(binary, &priority_dirs))
-                .args(quota::CLAUDE_BACKGROUND_ARGS)
-                .env("CLAUDE_CONFIG_DIR", config_dir)
-                .env("HOME", &fake_home)
-                // A background prime needs auth + one API request only. Safe mode alone still lets
-                // Claude initialise its built-in tool/sandbox layer, which preflights Desktop,
-                // Documents, Downloads and Media Library through macOS TCC. Disable every context
-                // and tool source explicitly so the child remains an API-only OAuth invocation.
-                .env("CLAUDE_CODE_SAFE_MODE", "1")
-                .current_dir(&fake_home);
-        }
-        ToolId::Codex => {
-            // Finder/Dock apps and LaunchDaemons commonly inherit only
-            // `/usr/bin:/bin:/usr/sbin:/sbin`. npm-installed CLIs are scripts with an
-            // `#!/usr/bin/env node` shebang, so spawning the configured `codex` path can
-            // succeed while the script itself exits 127 because `env` cannot find Node.
-            // Supply the same deterministic install locations used by tool detection,
-            // while preserving any useful entries inherited from the user's session.
-            command
-                .env("PATH", cli_path(binary))
-                .args([
-                    "exec",
-                    "--skip-git-repo-check",
-                    "--ephemeral",
-                    "--ignore-user-config",
-                    "--ignore-rules",
-                    "--sandbox",
-                    "read-only",
-                    "hi",
-                ])
-                .env("CODEX_HOME", config_dir)
-                // The GUI process normally starts with `/` as cwd. `codex exec` rejects that as an
-                // untrusted non-repository unless explicitly allowed. Use the account profile as a
-                // harmless read-only working root and do not persist the one-message session.
-                .current_dir(config_dir);
-        }
-        ToolId::Antigravity => return Err("antigravity unsupported".to_string()),
-    }
-    // Don't inherit a TTY. stdout is irrelevant, but retain stderr so failures are diagnosable
-    // instead of surfacing only as "CLI exit 1".
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().map_err(|e| format!("CLI: {e}"))?;
-    let mut stderr = child.stderr.take().map(|mut stderr| {
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            String::from_utf8_lossy(&bytes).trim().to_string()
-        })
-    });
-
-    // Hard timeout: a CLI that hangs (network stall, auth/update prompt) must NOT hold the prime
-    // worker forever — that would block the scheduler's overlap guard and skip every later prime.
-    let deadline = std::time::Instant::now() + CLI_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let detail = stderr
-                    .take()
-                    .and_then(|reader| reader.join().ok())
-                    .map(|text| concise_cli_error(&text))
-                    .filter(|text| !text.is_empty());
-                return if status.success() {
-                    Ok(())
-                } else {
-                    let code = status.code().unwrap_or(-1);
-                    Err(detail
-                        .map(|detail| format!("CLI exit {code}: {detail}"))
-                        .unwrap_or_else(|| format!("CLI exit {code}")))
-                };
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("CLI timeout".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(e) => return Err(format!("CLI: {e}")),
-        }
-    }
-}
-
-/// Append a human next-step hint to a Claude CLI error when it's recognisably user-actionable,
-/// so the log says WHAT to do rather than implying a retry will fix it. Empty when it's a plain
-/// transient error (retry is the right move).
-fn claude_cli_error_hint(reason: &str) -> &'static str {
-    let r = reason.to_ascii_lowercase();
-    if r.contains("/login") || r.contains("not logged in") || r.contains("please run") {
-        " → CẦN đăng nhập lại: mở `claude` trên account này rồi /login (retry không tự khỏi)"
-    } else if r.contains("not allowed for this organization") || r.contains("disabled claude") {
-        " → org đã TẮT OAuth cho account này (lỗi phía Anthropic, app không sửa được — hỏi admin org)"
-    } else {
-        " → thử lại tick sau"
-    }
-}
-
-fn concise_cli_error(stderr: &str) -> String {
-    const MAX_CHARS: usize = 240;
-    let text = stderr
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && *line != "Reading additional input from stdin...")
-        .collect::<Vec<_>>()
-        .join(" · ");
-    if text.chars().count() <= MAX_CHARS {
-        text
-    } else {
-        format!("{}…", text.chars().take(MAX_CHARS).collect::<String>())
-    }
-}
-
-fn cli_path(binary: &Path) -> OsString {
-    cli_path_with_priority_dirs(binary, &[])
-}
-
-/// Build the PATH for a spawned CLI, with `priority_dirs` searched FIRST — before the binary's own
-/// directory, the common install locations, and the inherited PATH. Used to shadow a real executable
-/// (e.g. `git`) with a shim so the child never resolves the real one, regardless of what else is on
-/// PATH.
-fn cli_path_with_priority_dirs(binary: &Path, priority_dirs: &[std::path::PathBuf]) -> OsString {
-    use std::collections::HashSet;
-
-    let mut paths = Vec::new();
-    let mut seen = HashSet::new();
-    let mut push = |path: std::path::PathBuf| {
-        if seen.insert(path.clone()) {
-            paths.push(path);
-        }
-    };
-
-    for path in priority_dirs {
-        push(path.clone());
-    }
-    if let Some(parent) = binary.parent() {
-        push(parent.to_path_buf());
-    }
-    for path in crate::tools::common_bin_dirs() {
-        push(path);
-    }
-    if let Some(inherited) = std::env::var_os("PATH") {
-        for path in std::env::split_paths(&inherited) {
-            push(path);
-        }
-    }
-
-    std::env::join_paths(paths)
-        .unwrap_or_else(|_| OsString::from("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"))
-}
-
 /// POST a lightweight request directly. Returns Ok(()) only after the HTTP status is 2xx AND the
 /// response body has been fully consumed.
 ///
@@ -869,9 +455,8 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
 
     let response = match tool_id {
         ToolId::Claude => {
-            // Reached only on the VALID-token fast path (D1 classified the token as usable). An
-            // expired token is handled entirely by the CLI at D1 and never reaches here, so this is
-            // a plain read of the current (still-valid) access token — no refresh.
+            // Reached only on the VALID-token fast path (D1 classified the token as usable), so this
+            // is a plain read of the current (still-valid) access token — no refresh.
             let token =
                 quota::claude_oauth_token_fresh(config_dir).ok_or_else(|| "token".to_string())?;
             let version = quota::claude_version().unwrap_or_else(|| "2.0.0".to_string());
@@ -971,7 +556,6 @@ fn window_moved(before: Option<&str>, after: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn eligibility_excludes_api_and_antigravity() {
@@ -979,12 +563,6 @@ mod tests {
         assert!(is_prime_eligible(&ToolId::Codex, false));
         assert!(!is_prime_eligible(&ToolId::Claude, true)); // API-proxy account
         assert!(!is_prime_eligible(&ToolId::Antigravity, false));
-    }
-
-    #[test]
-    fn subscription_primes_bypass_agent_cli() {
-        assert!(!uses_cli_for_prime(&ToolId::Codex));
-        assert!(!uses_cli_for_prime(&ToolId::Claude));
     }
 
     #[test]
@@ -1093,20 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_confirm_poll_budget_fits_proof_window() {
-        // The inline poll must finish within the scheduler's per-tick proof budget so a tick is never
-        // cut off mid-confirmation (PRIME_PROOF_BUDGET_SECONDS = 150 in app_state). The hard cap is
-        // the wall-clock budget; account for one in-flight read (~20s curl) on top of it.
-        const PROOF_BUDGET: u64 = 150;
-        const READ_LATENCY_HEADROOM: u64 = 20;
-        assert!(
-            CODEX_CONFIRM_TOTAL_BUDGET.as_secs() + READ_LATENCY_HEADROOM <= PROOF_BUDGET,
-            "total budget + one read can overrun the proof window"
-        );
-        assert!(CODEX_CONFIRM_MAX_POLLS >= 2, "must poll more than once");
-    }
-
-    #[test]
     fn claude_confirm_accepts_newly_active_session_or_moved_reset() {
         let baseline = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
         let same = baseline.clone();
@@ -1159,88 +723,5 @@ mod tests {
             Some(false)
         ));
         assert!(!claude_reset_confirms(Some(&baseline), None, &same, None));
-    }
-
-    #[test]
-    fn claude_confirm_budget_fits_proof_window() {
-        // The whole inline confirm must finish inside the scheduler's per-tick proof budget
-        // (PRIME_PROOF_BUDGET_SECONDS = 150 in app_state), leaving headroom for the HTTP reads.
-        const PROOF_BUDGET: u64 = 150;
-        const READ_LATENCY_HEADROOM: u64 = 20;
-        assert!(
-            CONFIRM_TOTAL_BUDGET.as_secs() + READ_LATENCY_HEADROOM <= PROOF_BUDGET,
-            "Claude confirm budget must fit the scheduler proof window"
-        );
-        assert!(CONFIRM_MAX_TRIES >= 2, "must poll more than once");
-    }
-
-    #[test]
-    fn cli_path_includes_runtime_locations_for_env_shebangs() {
-        let path = cli_path(Path::new("/Users/test/.npm-global/bin/codex"));
-        let entries = std::env::split_paths(&path).collect::<Vec<PathBuf>>();
-        assert!(entries.contains(&PathBuf::from("/Users/test/.npm-global/bin")));
-        assert!(entries.contains(&PathBuf::from("/opt/homebrew/bin")));
-        assert!(entries.contains(&PathBuf::from("/usr/local/bin")));
-        assert!(entries.contains(&PathBuf::from("/usr/bin")));
-    }
-
-    #[test]
-    fn cli_path_puts_priority_dirs_before_everything_else() {
-        let priority = vec![PathBuf::from("/fake/shim/dir")];
-        let path = cli_path_with_priority_dirs(Path::new("/Users/test/.local/bin/claude"), &priority);
-        let entries = std::env::split_paths(&path).collect::<Vec<PathBuf>>();
-        assert_eq!(entries.first(), Some(&PathBuf::from("/fake/shim/dir")));
-        // The real /usr/bin (where the system git lives) must still be present — just after the
-        // shim dir — so everything else the CLI needs to resolve on PATH keeps working.
-        assert!(entries.contains(&PathBuf::from("/usr/bin")));
-    }
-
-    #[test]
-    fn cli_path_without_priority_dirs_matches_plain_cli_path() {
-        let binary = Path::new("/Users/test/.local/bin/claude");
-        let plain = cli_path(binary);
-        let via_helper = cli_path_with_priority_dirs(binary, &[]);
-        assert_eq!(plain, via_helper);
-    }
-
-    #[test]
-    fn git_shim_dir_contains_an_executable_git_that_exits_nonzero() {
-        let tmp = std::env::temp_dir().join(format!(
-            "ai-switcher-git-shim-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let shim_dir = ensure_git_shim_dir(&tmp).expect("shim dir should be created");
-        let shim_path = shim_dir.join(GIT_SHIM_NAME);
-        assert!(shim_path.is_file());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&shim_path).unwrap().permissions().mode();
-            assert!(mode & 0o111 != 0, "shim must be executable");
-
-            let status = std::process::Command::new(&shim_path)
-                .status()
-                .expect("shim should run");
-            assert!(!status.success(), "shim must exit non-zero like a missing git repo");
-        }
-
-        // Calling again must not error and must keep returning the same directory (idempotent).
-        let shim_dir_again = ensure_git_shim_dir(&tmp).expect("second call should also succeed");
-        assert_eq!(shim_dir, shim_dir_again);
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn cli_error_is_short_and_drops_codex_stdin_noise() {
-        let error = concise_cli_error(
-            "Reading additional input from stdin...\nNot inside a trusted directory\n",
-        );
-        assert_eq!(error, "Not inside a trusted directory");
-        assert!(concise_cli_error(&"x".repeat(500)).chars().count() <= 241);
     }
 }
