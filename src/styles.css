@@ -2225,6 +2225,16 @@ div.quotaError .linkBtn {
   justify-content: center;
 }
 
+.modelPicker {
+  display: grid;
+  gap: 8px;
+}
+
+.modelPicker select,
+.modelPicker input {
+  width: 100%;
+}
+
 .checkRow {
   align-items: start;
   display: flex;

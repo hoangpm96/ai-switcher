@@ -5,6 +5,15 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-07-11
+
+### Changed
+
+- **API/proxy model selection is now one clear flow.** Fetched gateway models and the `Custom…`
+  choice live in the same dropdown; the manual model-id field only appears when `Custom…` is
+  selected. Fetching models remains optional, and changing the gateway URL or API key safely moves
+  the previous selection into the custom field instead of silently submitting a stale preset.
+
 ## [0.7.0] - 2026-07-10
 
 ### Removed

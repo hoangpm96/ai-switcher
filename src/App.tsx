@@ -2369,8 +2369,21 @@ function AddDialog({
   const [apiKey, setApiKey] = useState("");
   const [models, setModels] = useState<string[]>([]);
   const [fetching, setFetching] = useState(false);
-  const [model, setModel] = useState("");
+  const [modelChoice, setModelChoice] = useState("");
+  const [customModel, setCustomModel] = useState("");
+  const [modelsOutdated, setModelsOutdated] = useState(false);
   const [bypass, setBypass] = useState(false);
+
+  const updateGatewayDetail = (field: "baseUrl" | "apiKey", value: string) => {
+    if (field === "baseUrl") setBaseUrl(value);
+    else setApiKey(value);
+    if (models.length > 0) {
+      if (modelChoice) setCustomModel(modelChoice);
+      setModelChoice("");
+      setModels([]);
+      setModelsOutdated(true);
+    }
+  };
 
   const fetchModels = async () => {
     if (!baseUrl.trim().startsWith("https://")) {
@@ -2386,7 +2399,10 @@ function AddDialog({
     try {
       const list = await api.fetchGatewayModels(baseUrl.trim(), apiKey.trim());
       setModels(list);
-      if (list.length > 0 && !model) setModel(list[0]);
+      setModelsOutdated(false);
+      if (list.length > 0 && !modelChoice && !customModel.trim()) {
+        setModelChoice(list[0]);
+      }
     } catch (err) {
       setMessage(errorMessage(err));
     } finally {
@@ -2416,12 +2432,9 @@ function AddDialog({
       setMessage("Account name is limited to 20 characters");
       return;
     }
-    if (models.length === 0) {
-      setMessage("Fetch the gateway models first");
-      return;
-    }
-    if (!model) {
-      setMessage("Pick a model");
+    const normalizedModel = (modelChoice || customModel).trim();
+    if (!normalizedModel) {
+      setMessage("Enter a model");
       return;
     }
     await onSubmitApi({
@@ -2429,7 +2442,7 @@ function AddDialog({
       name: name.trim(),
       baseUrl: baseUrl.trim(),
       apiKey: apiKey.trim(),
-      model,
+      model: normalizedModel,
       launcher: launcher.trim() || undefined,
       bypass,
     });
@@ -2495,7 +2508,7 @@ function AddDialog({
               Gateway URL
               <input
                 value={baseUrl}
-                onChange={(event) => setBaseUrl(event.target.value)}
+                onChange={(event) => updateGatewayDetail("baseUrl", event.target.value)}
                 placeholder="https://your-gateway.com/v1"
               />
             </label>
@@ -2504,7 +2517,7 @@ function AddDialog({
               <input
                 type="password"
                 value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
+                onChange={(event) => updateGatewayDetail("apiKey", event.target.value)}
                 placeholder="sk-…"
               />
             </label>
@@ -2513,57 +2526,69 @@ function AddDialog({
               {models.length > 0 ? `Models loaded (${models.length})` : "Fetch models"}
             </button>
 
-            {models.length > 0 && (
-              <>
-                <label>
-                  <span className="labelRow">
-                    Model (required)
-                    <span
-                      className="helpDot"
-                      title="The gateway model this account runs. The CLI's model picker can't switch gateway models — add a separate account for a different model."
-                    >
-                      <CircleHelp />
-                    </span>
-                  </span>
-                  <select value={model} onChange={(event) => setModel(event.target.value)}>
-                    {models.map((id) => (
-                      <option key={id} value={id}>
-                        {id}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <p className="hint">
-                  One account = one model. The gateway only knows its own model ids — for another
-                  model, add another account.
-                </p>
-
-                <label>
-                  <span className="labelRow">
-                    Custom command (optional)
-                    <span
-                      className="helpDot"
-                      title={`A separate command (e.g. ${tool.id}-p) to use this account in its own terminal. Forces the ${tool.id}- prefix.`}
-                    >
-                      <CircleHelp />
-                    </span>
-                  </span>
+            <label>
+              <span className="labelRow">
+                Model (required)
+                <span
+                  className="helpDot"
+                  title="Enter any gateway model id, or fetch models to choose from suggestions. The CLI's model picker can't switch gateway models — add a separate account for a different model."
+                >
+                  <CircleHelp />
+                </span>
+              </span>
+              <div className="modelPicker">
+                <select
+                  value={modelChoice}
+                  onChange={(event) => setModelChoice(event.target.value)}
+                  aria-label="Gateway model"
+                >
+                  {models.map((id) => (
+                    <option key={id} value={id}>
+                      {id}
+                    </option>
+                  ))}
+                  <option value="">Custom…</option>
+                </select>
+                {!modelChoice && (
                   <input
-                    value={launcher}
-                    onChange={(event) => setLauncher(event.target.value)}
-                    placeholder={`${tool.id}-p`}
+                    value={customModel}
+                    onChange={(event) => setCustomModel(event.target.value)}
+                    placeholder="Enter custom model id"
+                    aria-label="Custom model id"
                   />
-                </label>
+                )}
+              </div>
+            </label>
+            <p className="hint">
+              {modelsOutdated
+                ? "Gateway details changed. Fetch again for updated suggestions, or enter a custom model."
+                : "Fetching models is optional. One account = one model; add another account for a different model."}
+            </p>
 
-                <div className="apiToggleRow">
-                  <span>
-                    Bypass approvals &amp; sandbox in the custom command
-                    <small>Adds {bypassFlag}. Off by default.</small>
-                  </span>
-                  <Toggle checked={bypass} onChange={setBypass} title="Bypass approvals & sandbox" />
-                </div>
-              </>
-            )}
+            <label>
+              <span className="labelRow">
+                Custom command (optional)
+                <span
+                  className="helpDot"
+                  title={`A separate command (e.g. ${tool.id}-p) to use this account in its own terminal. Forces the ${tool.id}- prefix.`}
+                >
+                  <CircleHelp />
+                </span>
+              </span>
+              <input
+                value={launcher}
+                onChange={(event) => setLauncher(event.target.value)}
+                placeholder={`${tool.id}-p`}
+              />
+            </label>
+
+            <div className="apiToggleRow">
+              <span>
+                Bypass approvals &amp; sandbox in the custom command
+                <small>Adds {bypassFlag}. Off by default.</small>
+              </span>
+              <Toggle checked={bypass} onChange={setBypass} title="Bypass approvals & sandbox" />
+            </div>
           </>
         )}
 
