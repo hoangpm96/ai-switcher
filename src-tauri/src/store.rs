@@ -26,6 +26,9 @@ pub struct StoredState {
     /// Local OpenAI/Anthropic-compatible proxy settings for the API tab.
     #[serde(default)]
     pub api_gateway: ApiGatewayConfig,
+    /// Monthly USD budget per project folder, shared across Claude and Codex usage.
+    #[serde(default)]
+    pub project_budgets: BTreeMap<String, f64>,
 }
 
 fn default_threshold() -> f64 {
@@ -42,6 +45,7 @@ impl Default for StoredState {
             auto_switch_settings: BTreeMap::new(),
             tool_setups: BTreeMap::new(),
             api_gateway: ApiGatewayConfig::default(),
+            project_budgets: BTreeMap::new(),
         }
     }
 }

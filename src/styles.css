@@ -2076,6 +2076,30 @@ div.quotaError .linkBtn {
   font-weight: 600;
   margin-left: 6px;
 }
+.usageViewSwitch {
+  display: inline-grid;
+  grid-auto-flow: column;
+  gap: 3px;
+  margin-bottom: 10px;
+  padding: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.usageViewSwitch button {
+  min-height: 30px;
+  background: transparent;
+  border-color: transparent;
+  font-size: 12.5px;
+}
+.usageViewSwitch button svg {
+  width: 14px;
+  height: 14px;
+}
+.usageViewSwitch button.selected {
+  background: var(--surface);
+  border-color: var(--line);
+}
 .usageChartSvg {
   width: 100%;
   height: 56px;
@@ -2129,6 +2153,192 @@ div.quotaError .linkBtn {
 .usageTable code {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 11.5px;
+}
+
+.projectUsageHead {
+  align-items: flex-end;
+  color: var(--text-3);
+  display: flex;
+  font-size: 11.5px;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.projectUsageHead > div {
+  display: grid;
+  gap: 2px;
+}
+.projectUsageHead strong {
+  color: var(--text);
+  font-size: 13px;
+}
+.projectGrid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+}
+.projectCard {
+  background:
+    linear-gradient(135deg, rgba(251, 106, 26, 0.035), transparent 45%),
+    var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--edge);
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+.projectCard.near {
+  border-color: rgba(252, 211, 77, 0.45);
+}
+.projectCard.over {
+  border-color: rgba(251, 113, 133, 0.55);
+  background:
+    linear-gradient(135deg, var(--red-soft), transparent 46%),
+    var(--surface-2);
+}
+.projectCardHead,
+.projectMeta,
+.budgetLine,
+.budgetCaption {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+.projectIdentity {
+  align-items: center;
+  display: flex;
+  gap: 9px;
+  min-width: 0;
+}
+.projectIdentity > svg {
+  color: var(--accent);
+  flex: none;
+  height: 18px;
+  width: 18px;
+}
+.projectIdentity > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.projectIdentity strong,
+.projectIdentity code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.projectIdentity strong {
+  font-size: 14px;
+}
+.projectIdentity code {
+  color: var(--text-3);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10.5px;
+}
+.projectCost {
+  display: grid;
+  flex: none;
+  gap: 1px;
+  text-align: right;
+}
+.projectCost strong {
+  color: var(--accent);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.projectCost span,
+.projectMeta,
+.budgetCaption,
+.budgetUnset {
+  color: var(--text-3);
+  font-size: 11px;
+}
+.projectMeta {
+  justify-content: flex-start;
+}
+.projectMeta span + span::before {
+  color: var(--line-strong);
+  content: "•";
+  margin-right: 10px;
+}
+.projectMeta strong {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.budgetBlock {
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 7px;
+  padding-top: 10px;
+}
+.budgetLine {
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+.budgetLine label {
+  align-items: center;
+  color: var(--text-3);
+  display: flex;
+  gap: 4px;
+}
+.budgetLine input {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  height: 27px;
+  padding: 0 7px;
+  text-align: right;
+  width: 76px;
+}
+.budgetLine input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.budgetTrack {
+  background: var(--surface);
+  border-radius: 99px;
+  height: 6px;
+  overflow: hidden;
+}
+.budgetTrack span {
+  background: var(--accent-grad);
+  border-radius: inherit;
+  display: block;
+  height: 100%;
+}
+.projectCard.near .budgetTrack span {
+  background: var(--amber);
+}
+.projectCard.over .budgetTrack span {
+  background: var(--red);
+}
+.budgetCaption {
+  font-variant-numeric: tabular-nums;
+}
+.budgetUnset {
+  margin: 0;
+}
+.budgetError {
+  color: var(--red);
+  font-size: 11px;
+  margin: 0;
+}
+
+@media (max-width: 620px) {
+  .projectGrid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .projectUsageHead > span {
+    display: none;
+  }
+  .projectCardHead,
+  .budgetLine {
+    align-items: flex-start;
+  }
 }
 
 /* Account waiting for login */

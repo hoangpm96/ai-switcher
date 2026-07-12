@@ -15,11 +15,12 @@
 // ---------------------------------------------------------------------------
 
 use crate::models::{
-    DayUsage, ModelUsage, SessionUsage, TokenBreakdown, ToolId, ToolUsage, UsageReport,
+    DayUsage, ModelUsage, ProjectUsage, SessionUsage, TokenBreakdown, ToolId, ToolUsage,
+    UsageReport,
 };
 use crate::pricing::{load_price_table, PriceTable};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -28,7 +29,7 @@ const MAX_SESSIONS: usize = 30;
 
 /// Bump when the cache format or scan logic changes in a way that invalidates old aggregates
 /// (e.g. the symlink-dedup fix) so a stale cache is discarded instead of double-counting.
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // On-disk incremental cache
@@ -44,6 +45,8 @@ struct UsageCache {
     files: BTreeMap<String, FileCursor>,
     /// "tool|YYYY-MM-DD|model" → token totals (drives daily + per-model views).
     buckets: BTreeMap<String, TokenBreakdown>,
+    /// "tool|YYYY-MM-DD|model|absolute-path" → totals for the Projects view.
+    project_buckets: BTreeMap<String, TokenBreakdown>,
     /// JSONL file path → session summary (each file is one session).
     sessions: BTreeMap<String, SessionRecord>,
 }
@@ -63,6 +66,9 @@ struct FileCursor {
     /// Codex only: the model in effect at the cursor (latest turn_context).
     #[serde(default)]
     codex_model: String,
+    /// Codex only: working directory from the session_meta event.
+    #[serde(default)]
+    codex_project: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,6 +78,8 @@ struct SessionRecord {
     id: String,
     date: String,
     model: String,
+    #[serde(default)]
+    project: String,
     tokens: TokenBreakdown,
 }
 
@@ -108,6 +116,7 @@ pub fn build_report(
     price_cache_path: &Path,
     claude_dirs: &[PathBuf],
     codex_dirs: &[PathBuf],
+    project_budgets: &BTreeMap<String, f64>,
     range_days: u32,
 ) -> UsageReport {
     let mut cache = load_cache(cache_path);
@@ -138,7 +147,7 @@ pub fn build_report(
     save_cache(cache_path, &cache);
 
     let prices = load_price_table(price_cache_path);
-    build_report_from_cache(&cache, &prices, range_days)
+    build_report_from_cache(&cache, &prices, project_budgets, range_days)
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +217,11 @@ fn file_stem(path: &Path) -> String {
 fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
     let key = path.to_string_lossy().to_string();
     let offset = cache.files.get(&key).map(|c| c.offset).unwrap_or(0);
+    let mut project = cache
+        .sessions
+        .get(&key)
+        .map(|record| record.project.clone())
+        .unwrap_or_default();
     let Some((lines, new_offset)) = read_new_lines(path, offset) else {
         return;
     };
@@ -220,15 +234,19 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
     // entry with the most tokens per message id (within this batch).
     let mut best: BTreeMap<String, ClaudeEntry> = BTreeMap::new();
     for line in &lines {
-        if !line.contains("\"usage\"") {
-            continue;
-        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let Some(entry) = claude_entry(&value) else {
+        if let Some(found) = project_path(&value) {
+            project = found;
+        }
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        let Some(mut entry) = claude_entry(&value) else {
             continue;
         };
+        entry.project = project.clone();
         match best.get(&entry.id) {
             Some(existing) if existing.tokens.total() >= entry.tokens.total() => {}
             _ => {
@@ -240,7 +258,24 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
     let session_id = file_stem(path);
     for entry in best.into_values() {
         add_bucket(cache, "claude", &entry.date, &entry.model, &entry.tokens);
-        add_session(cache, &key, "claude", &session_id, &entry.date, &entry.model, &entry.tokens);
+        add_project_bucket(
+            cache,
+            "claude",
+            &entry.date,
+            &entry.model,
+            &entry.project,
+            &entry.tokens,
+        );
+        add_session(
+            cache,
+            &key,
+            "claude",
+            &session_id,
+            &entry.date,
+            &entry.model,
+            &entry.project,
+            &entry.tokens,
+        );
     }
 
     cache.files.entry(key).or_default().offset = new_offset;
@@ -250,6 +285,7 @@ struct ClaudeEntry {
     id: String,
     model: String,
     date: String,
+    project: String,
     tokens: TokenBreakdown,
 }
 
@@ -286,7 +322,13 @@ fn claude_entry(value: &serde_json::Value) -> Option<ClaudeEntry> {
         .or_else(|| value.get("uuid").and_then(|u| u.as_str()))
         .unwrap_or("")
         .to_string();
-    Some(ClaudeEntry { id, model, date, tokens })
+    Some(ClaudeEntry {
+        id,
+        model,
+        date,
+        project: String::new(),
+        tokens,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +346,9 @@ fn scan_codex_file(path: &Path, cache: &mut UsageCache) {
         .map(|c| c.codex_model.clone())
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
+    let mut project = cursor
+        .map(|c| c.codex_project.clone())
+        .unwrap_or_default();
 
     let Some((lines, new_offset)) = read_new_lines(path, offset) else {
         return;
@@ -314,6 +359,10 @@ fn scan_codex_file(path: &Path, cache: &mut UsageCache) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if let Some(found) = codex_project(&value) {
+            project = found;
+            continue;
+        }
         if let Some(found) = codex_model(&value) {
             model = found;
             continue;
@@ -348,7 +397,17 @@ fn scan_codex_file(path: &Path, cache: &mut UsageCache) {
         }
         let date = total.date.clone().unwrap_or_else(unknown_date);
         add_bucket(cache, "codex", &date, &model, &tokens);
-        add_session(cache, &key, "codex", &session_id, &date, &model, &tokens);
+        add_project_bucket(cache, "codex", &date, &model, &project, &tokens);
+        add_session(
+            cache,
+            &key,
+            "codex",
+            &session_id,
+            &date,
+            &model,
+            &project,
+            &tokens,
+        );
     }
 
     let entry = cache.files.entry(key).or_default();
@@ -357,6 +416,7 @@ fn scan_codex_file(path: &Path, cache: &mut UsageCache) {
     entry.codex_cached = last_cached;
     entry.codex_output = last_output;
     entry.codex_model = model;
+    entry.codex_project = project;
 }
 
 struct CodexTotal {
@@ -396,6 +456,28 @@ fn codex_model(value: &serde_json::Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn codex_project(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    project_path(value.get("payload")?)
+}
+
+fn project_path(value: &serde_json::Value) -> Option<String> {
+    let raw = value.get("cwd")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    let normalized = std::fs::canonicalize(&path).unwrap_or(path);
+    let rendered = normalized.to_string_lossy();
+    Some(if rendered == "/" {
+        rendered.to_string()
+    } else {
+        rendered.trim_end_matches('/').to_string()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Aggregation helpers
 // ---------------------------------------------------------------------------
@@ -405,6 +487,21 @@ fn add_bucket(cache: &mut UsageCache, tool: &str, date: &str, model: &str, token
     cache.buckets.entry(key).or_default().add(tokens);
 }
 
+fn add_project_bucket(
+    cache: &mut UsageCache,
+    tool: &str,
+    date: &str,
+    model: &str,
+    project: &str,
+    tokens: &TokenBreakdown,
+) {
+    if project.is_empty() {
+        return;
+    }
+    let key = format!("{tool}|{date}|{model}|{project}");
+    cache.project_buckets.entry(key).or_default().add(tokens);
+}
+
 fn add_session(
     cache: &mut UsageCache,
     path_key: &str,
@@ -412,6 +509,7 @@ fn add_session(
     id: &str,
     date: &str,
     model: &str,
+    project: &str,
     tokens: &TokenBreakdown,
 ) {
     let record = cache.sessions.entry(path_key.to_string()).or_insert_with(|| SessionRecord {
@@ -419,6 +517,7 @@ fn add_session(
         id: id.to_string(),
         date: date.to_string(),
         model: model.to_string(),
+        project: project.to_string(),
         tokens: TokenBreakdown::default(),
     });
     record.tokens.add(tokens);
@@ -426,6 +525,9 @@ fn add_session(
     if date >= record.date.as_str() {
         record.date = date.to_string();
         record.model = model.to_string();
+    }
+    if !project.is_empty() {
+        record.project = project.to_string();
     }
 }
 
@@ -468,16 +570,32 @@ fn sum_cost(items: impl Iterator<Item = Option<f64>>) -> Option<f64> {
 // Report building
 // ---------------------------------------------------------------------------
 
-fn build_report_from_cache(cache: &UsageCache, prices: &PriceTable, range_days: u32) -> UsageReport {
+fn build_report_from_cache(
+    cache: &UsageCache,
+    prices: &PriceTable,
+    project_budgets: &BTreeMap<String, f64>,
+    range_days: u32,
+) -> UsageReport {
     let today = today_local();
+    let month_start = format!("{}-01", &today[..7]);
     let cutoff = cutoff_date(range_days);
     let tools = [ToolId::Claude, ToolId::Codex]
         .into_iter()
-        .map(|tool_id| tool_usage(cache, prices, &tool_id, &today, cutoff.as_deref()))
+        .map(|tool_id| {
+            tool_usage(
+                cache,
+                prices,
+                &tool_id,
+                &today,
+                &month_start,
+                cutoff.as_deref(),
+            )
+        })
         .collect();
 
     UsageReport {
         tools,
+        project_budgets: project_budgets.clone(),
         generated_at: chrono::Utc::now().to_rfc3339(),
         price_status: prices.status.clone(),
         price_updated_at: prices.updated_at.clone(),
@@ -508,6 +626,7 @@ fn tool_usage(
     prices: &PriceTable,
     tool_id: &ToolId,
     today: &str,
+    month_start: &str,
     cutoff: Option<&str>,
 ) -> ToolUsage {
     let tool = tool_id.as_str();
@@ -518,6 +637,9 @@ fn tool_usage(
     let mut by_model: BTreeMap<String, TokenBreakdown> = BTreeMap::new();
     let mut total = TokenBreakdown::default();
     let mut today_tokens = TokenBreakdown::default();
+    let mut project_models: BTreeMap<String, BTreeMap<String, TokenBreakdown>> = BTreeMap::new();
+    let mut month_project_models: BTreeMap<String, BTreeMap<String, TokenBreakdown>> =
+        BTreeMap::new();
 
     for (key, tokens) in cache.buckets.iter().filter(|(k, _)| k.starts_with(&prefix)) {
         // key = "tool|date|model" — model may itself contain '|'? Model names never do.
@@ -563,6 +685,104 @@ fn tool_usage(
     let total_cost_usd = sum_cost(by_model.iter().map(|m| m.cost_usd));
     let today_cost_usd = day_cost.get(today).copied().flatten();
 
+    for (key, tokens) in cache
+        .project_buckets
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+    {
+        let mut parts = key.splitn(4, '|');
+        let _ = parts.next();
+        let date = parts.next().unwrap_or("unknown");
+        let model = parts.next().unwrap_or("unknown");
+        let path = parts.next().unwrap_or("");
+        if path.is_empty() {
+            continue;
+        }
+        if in_range(date, cutoff) {
+            project_models
+                .entry(path.to_string())
+                .or_default()
+                .entry(model.to_string())
+                .or_default()
+                .add(tokens);
+        }
+        if date != "unknown" && date >= month_start {
+            month_project_models
+                .entry(path.to_string())
+                .or_default()
+                .entry(model.to_string())
+                .or_default()
+                .add(tokens);
+        }
+    }
+
+    let mut project_sessions: BTreeMap<String, (u32, String)> = BTreeMap::new();
+    for record in cache.sessions.values().filter(|record| record.tool == tool) {
+        if record.project.is_empty() {
+            continue;
+        }
+        let item = project_sessions
+            .entry(record.project.clone())
+            .or_insert((0, record.date.clone()));
+        if in_range(&record.date, cutoff) {
+            item.0 += 1;
+        }
+        if record.date > item.1 {
+            item.1 = record.date.clone();
+        }
+    }
+
+    let project_paths: BTreeSet<String> = project_models
+        .keys()
+        .chain(month_project_models.keys())
+        .cloned()
+        .collect();
+    let mut projects: Vec<ProjectUsage> = project_paths
+        .into_iter()
+        .map(|path| {
+            let models = project_models.get(&path);
+            let tokens = models
+                .into_iter()
+                .flat_map(|models| models.values())
+                .fold(TokenBreakdown::default(), |mut sum, item| {
+                    sum.add(item);
+                    sum
+                });
+            let cost_usd = models.and_then(|models| {
+                sum_cost(
+                    models
+                        .iter()
+                        .map(|(model, tokens)| prices.cost(model, tokens)),
+                )
+            });
+            let month_cost_usd = month_project_models.get(&path).and_then(|month_models| {
+                sum_cost(
+                    month_models
+                        .iter()
+                        .map(|(model, tokens)| prices.cost(model, tokens)),
+                )
+            });
+            let (session_count, last_active) = project_sessions
+                .get(&path)
+                .cloned()
+                .unwrap_or((0, "unknown".to_string()));
+            ProjectUsage {
+                path,
+                tokens,
+                cost_usd,
+                month_cost_usd,
+                session_count,
+                last_active,
+            }
+        })
+        .collect();
+    projects.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.tokens.total().cmp(&a.tokens.total()))
+    });
+
     let mut sessions: Vec<SessionUsage> = cache
         .sessions
         .values()
@@ -589,6 +809,7 @@ fn tool_usage(
         daily,
         by_model,
         sessions,
+        projects,
     }
 }
 
@@ -684,15 +905,15 @@ mod tests {
 
         // 7-day range → only the recent line. (Use a fresh cache per call to re-aggregate.)
         let cache7 = base.join("usage7.json");
-        let r7 = build_report(&cache7, &prices, &dirs, &[], 7);
+        let r7 = build_report(&cache7, &prices, &dirs, &[], &BTreeMap::new(), 7);
         let claude7 = r7.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
         assert_eq!(claude7.total.total(), 15);
 
         // All time → both lines.
-        let cacheAll = base.join("usageAll.json");
-        let rAll = build_report(&cacheAll, &prices, &dirs, &[], 0);
-        let claudeAll = rAll.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
-        assert_eq!(claudeAll.total.total(), 1515);
+        let cache_all = base.join("usageAll.json");
+        let r_all = build_report(&cache_all, &prices, &dirs, &[], &BTreeMap::new(), 0);
+        let claude_all = r_all.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude_all.total.total(), 1515);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -718,7 +939,14 @@ mod tests {
         let cache = base.join("usage.json");
         let prices = base.join("prices.json"); // missing → no cost, fine for token assert
         let claude_dirs = vec![base.join("default"), base.join("profile")];
-        let report = build_report(&cache, &prices, &claude_dirs, &[], 0);
+        let report = build_report(
+            &cache,
+            &prices,
+            &claude_dirs,
+            &[],
+            &BTreeMap::new(),
+            0,
+        );
         let _ = std::fs::remove_dir_all(&base);
 
         let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
@@ -726,6 +954,59 @@ mod tests {
         assert_eq!(claude.total.input, 100);
         assert_eq!(claude.total.output, 50);
         assert_eq!(claude.sessions.len(), 1);
+    }
+
+    #[test]
+    fn groups_claude_and_codex_usage_by_working_directory() {
+        let base = std::env::temp_dir().join(format!("aisw_projects_{}", std::process::id()));
+        let project = base.join("work/my-project");
+        let claude_projects = base.join("claude/projects");
+        let codex_sessions = base.join("codex/sessions/2026/07/12");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&claude_projects).unwrap();
+        std::fs::create_dir_all(&codex_sessions).unwrap();
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+        let project_path = canonical_project.to_string_lossy();
+
+        let claude = format!(
+            "{}\n{}\n",
+            format!(r#"{{"type":"user","cwd":"{project_path}"}}"#),
+            r#"{"message":{"model":"claude-x","id":"m1","role":"assistant","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-07-12T10:00:00+07:00"}"#,
+        );
+        std::fs::write(claude_projects.join("claude-session.jsonl"), claude).unwrap();
+
+        let codex = format!(
+            "{}\n{}\n{}\n",
+            format!(r#"{{"type":"session_meta","payload":{{"id":"codex-session","cwd":"{project_path}"}}}}"#),
+            r#"{"type":"turn_context","payload":{"model":"gpt-x"}}"#,
+            r#"{"timestamp":"2026-07-12T10:05:00+07:00","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":5}}}}"#,
+        );
+        std::fs::write(codex_sessions.join("rollout-session.jsonl"), codex).unwrap();
+
+        let mut budgets = BTreeMap::new();
+        budgets.insert(project_path.to_string(), 25.0);
+        let report = build_report(
+            &base.join("usage.json"),
+            &base.join("prices.json"),
+            &[base.join("claude")],
+            &[base.join("codex")],
+            &budgets,
+            0,
+        );
+
+        let claude = report.tools.iter().find(|tool| tool.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude.projects.len(), 1);
+        assert_eq!(claude.projects[0].path, project_path);
+        assert_eq!(claude.projects[0].tokens.total(), 15);
+        assert_eq!(claude.projects[0].session_count, 1);
+
+        let codex = report.tools.iter().find(|tool| tool.tool_id == ToolId::Codex).unwrap();
+        assert_eq!(codex.projects.len(), 1);
+        assert_eq!(codex.projects[0].path, project_path);
+        assert_eq!(codex.projects[0].tokens.total(), 35);
+        assert_eq!(report.project_budgets.get(project_path.as_ref()), Some(&25.0));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

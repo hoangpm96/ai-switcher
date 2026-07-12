@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, BarChart3, Loader2, RefreshCw } from "lucide-react";
+import { AlertTriangle, BarChart3, FolderKanban, LayoutDashboard, Loader2, RefreshCw } from "lucide-react";
 import { api } from "./tauri";
-import type { DayUsage, ModelUsage, SessionUsage, TokenBreakdown, ToolUsage, UsageReport } from "./types";
+import type { DayUsage, ModelUsage, ProjectUsage, SessionUsage, TokenBreakdown, ToolUsage, UsageReport } from "./types";
 
 const RANGES: { label: string; days: number }[] = [
   { label: "7d", days: 7 },
@@ -17,6 +17,7 @@ export function UsageView() {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string>("all");
   const [range, setRange] = useState(30);
+  const [view, setView] = useState<"overview" | "projects">("overview");
 
   const load = useCallback(async () => {
     setBusy(true);
@@ -88,6 +89,14 @@ export function UsageView() {
 
       {report && (
         <>
+          <div className="usageViewSwitch" role="group" aria-label="Usage view">
+            <button className={view === "overview" ? "selected" : ""} onClick={() => setView("overview")}>
+              <LayoutDashboard /> Overview
+            </button>
+            <button className={view === "projects" ? "selected" : ""} onClick={() => setView("projects")}>
+              <FolderKanban /> Projects
+            </button>
+          </div>
           <div className="usageTabs">
             {usageTools.map((tool) => (
               <button
@@ -103,7 +112,17 @@ export function UsageView() {
           {(() => {
             const tool = usageTools.find((t) => t.toolId === selected) ?? usageTools[0];
             return tool ? (
-              <ToolUsageSection tool={tool} range={range} priceUnavailable={report.priceStatus === "unavailable"} />
+              view === "overview" ? (
+                <ToolUsageSection tool={tool} range={range} priceUnavailable={report.priceStatus === "unavailable"} />
+              ) : (
+                <ProjectUsageSection
+                  tool={tool}
+                  allProjects={usageTools[0]?.projects ?? []}
+                  budgets={report.projectBudgets}
+                  range={range}
+                  onBudgetSaved={load}
+                />
+              )
             ) : null;
           })()}
         </>
@@ -116,6 +135,153 @@ export function UsageView() {
         </div>
       )}
     </section>
+  );
+}
+
+function ProjectUsageSection({
+  tool,
+  allProjects,
+  budgets,
+  range,
+  onBudgetSaved,
+}: {
+  tool: ToolUsage;
+  allProjects: ProjectUsage[];
+  budgets: Record<string, number>;
+  range: number;
+  onBudgetSaved: () => Promise<void>;
+}) {
+  const allMonthCosts = new Map(allProjects.map((project) => [project.path, project.monthCostUsd]));
+  const projects = tool.toolId === "all" ? withBudgetOnlyProjects(tool.projects, budgets) : tool.projects;
+  if (projects.length === 0) {
+    return (
+      <div className="usageEmpty">
+        <FolderKanban />
+        <span>No project usage found in the selected range.</span>
+      </div>
+    );
+  }
+  const rangeLabel = range === 0 ? "All time" : `Last ${range} days`;
+  return (
+    <div className="projectUsage">
+      <div className="projectUsageHead">
+        <div>
+          <strong>{projects.length} projects</strong>
+          <span>{rangeLabel} · budgets reset each calendar month</span>
+        </div>
+        <span>Budget spend always includes Claude + Codex</span>
+      </div>
+      <div className="projectGrid">
+        {projects.map((project) => (
+          <ProjectCard
+            key={project.path}
+            project={project}
+            budget={budgets[project.path] ?? null}
+            combinedMonthCost={allMonthCosts.get(project.path) ?? null}
+            estimate={tool.estimate}
+            onBudgetSaved={onBudgetSaved}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProjectCard({
+  project,
+  budget,
+  combinedMonthCost,
+  estimate,
+  onBudgetSaved,
+}: {
+  project: ProjectUsage;
+  budget: number | null;
+  combinedMonthCost: number | null;
+  estimate: boolean;
+  onBudgetSaved: () => Promise<void>;
+}) {
+  const [draft, setDraft] = useState(budget == null ? "" : String(budget));
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  useEffect(() => setDraft(budget == null ? "" : String(budget)), [budget]);
+
+  const spend = combinedMonthCost ?? 0;
+  const percent = budget && budget > 0 ? (spend / budget) * 100 : null;
+  const save = async () => {
+    const next = draft.trim() === "" ? 0 : Number(draft);
+    if (!Number.isFinite(next) || next < 0) {
+      setSaveError("Budget must be a non-negative USD amount.");
+      return;
+    }
+    if (next === (budget ?? 0)) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await api.setProjectBudget(project.path, next);
+      await onBudgetSaved();
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <article className={`projectCard ${percent != null && percent >= 100 ? "over" : percent != null && percent >= 80 ? "near" : ""}`}>
+      <div className="projectCardHead">
+        <div className="projectIdentity">
+          <FolderKanban />
+          <div>
+            <strong title={project.path}>{projectName(project.path)}</strong>
+            <code title={project.path}>{project.path}</code>
+          </div>
+        </div>
+        <div className="projectCost">
+          <strong>{formatUsd(project.costUsd)}</strong>
+          <span>{estimate ? "≈ " : ""}{formatTokens(total(project.tokens))} tokens</span>
+        </div>
+      </div>
+
+      <div className="projectMeta">
+        <span><strong>{project.sessionCount}</strong> sessions</span>
+        <span>Last active <strong>{project.lastActive === "unknown" ? "—" : project.lastActive}</strong></span>
+      </div>
+
+      <div className="budgetBlock">
+        <div className="budgetLine">
+          <span>This month <strong>{formatUsd(combinedMonthCost)}</strong></span>
+          <label>
+            Budget $
+            <input
+              type="number"
+              min="0"
+              step="1"
+              value={draft}
+              placeholder="Not set"
+              disabled={saving}
+              onChange={(event) => setDraft(event.target.value)}
+              onBlur={() => void save()}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+              }}
+              aria-label={`Monthly budget for ${projectName(project.path)}`}
+            />
+          </label>
+        </div>
+        {percent != null ? (
+          <>
+            <div className="budgetTrack"><span style={{ width: `${Math.min(percent, 100)}%` }} /></div>
+            <div className="budgetCaption">
+              <span>{percent.toFixed(0)}% used</span>
+              <span>{formatUsd(Math.max(budget! - spend, 0))} remaining</span>
+            </div>
+          </>
+        ) : (
+          <p className="budgetUnset">Set a monthly budget to track project spend.</p>
+        )}
+        {saveError && <p className="budgetError">{saveError}</p>}
+      </div>
+    </article>
   );
 }
 
@@ -323,6 +489,7 @@ function SessionTable({ sessions }: { sessions: SessionUsage[] }) {
 function buildAllUsage(tools: ToolUsage[]): ToolUsage {
   const daily = mergeByDate(tools.flatMap((tool) => tool.daily));
   const byModel = mergeByModel(tools.flatMap((tool) => tool.byModel));
+  const projects = mergeProjects(tools.flatMap((tool) => tool.projects));
   const sessions = tools
     .flatMap((tool) =>
       tool.sessions.map((session) => ({
@@ -345,7 +512,49 @@ function buildAllUsage(tools: ToolUsage[]): ToolUsage {
     daily,
     byModel,
     sessions,
+    projects,
   };
+}
+
+function mergeProjects(projects: ProjectUsage[]): ProjectUsage[] {
+  const byPath = new Map<string, ProjectUsage>();
+  for (const project of projects) {
+    const current = byPath.get(project.path);
+    if (!current) {
+      byPath.set(project.path, { ...project, tokens: { ...project.tokens } });
+      continue;
+    }
+    current.tokens = addTokens(current.tokens, project.tokens);
+    current.costUsd = sumNullable([current.costUsd, project.costUsd]);
+    current.monthCostUsd = sumNullable([current.monthCostUsd, project.monthCostUsd]);
+    current.sessionCount += project.sessionCount;
+    if (project.lastActive > current.lastActive) current.lastActive = project.lastActive;
+  }
+  return Array.from(byPath.values()).sort(
+    (a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0) || total(b.tokens) - total(a.tokens),
+  );
+}
+
+function withBudgetOnlyProjects(projects: ProjectUsage[], budgets: Record<string, number>): ProjectUsage[] {
+  const result = [...projects];
+  const known = new Set(projects.map((project) => project.path));
+  for (const path of Object.keys(budgets)) {
+    if (known.has(path)) continue;
+    result.push({
+      path,
+      tokens: zeroTokens(),
+      costUsd: null,
+      monthCostUsd: null,
+      sessionCount: 0,
+      lastActive: "unknown",
+    });
+  }
+  return result;
+}
+
+function projectName(path: string) {
+  const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? path;
 }
 
 function mergeByDate(days: DayUsage[]): DayUsage[] {

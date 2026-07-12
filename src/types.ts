@@ -377,6 +377,16 @@ export interface SessionUsage {
   costUsd: number | null;
 }
 
+export interface ProjectUsage {
+  path: string;
+  tokens: TokenBreakdown;
+  costUsd: number | null;
+  /** Cost in the current local calendar month, regardless of the selected range. */
+  monthCostUsd: number | null;
+  sessionCount: number;
+  lastActive: string;
+}
+
 export interface ToolUsage {
   toolId: UsageToolId;
   displayName: string;
@@ -389,10 +399,13 @@ export interface ToolUsage {
   daily: DayUsage[];
   byModel: ModelUsage[];
   sessions: SessionUsage[];
+  projects: ProjectUsage[];
 }
 
 export interface UsageReport {
   tools: ToolUsage[];
+  /** Monthly USD budgets keyed by absolute project path. */
+  projectBudgets: Record<string, number>;
   generatedAt: string;
   /** "live" | "cached" | "unavailable" */
   priceStatus: string;

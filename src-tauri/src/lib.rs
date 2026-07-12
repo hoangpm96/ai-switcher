@@ -291,6 +291,17 @@ fn get_usage(state: State<'_, ManagedState>, range_days: u32) -> UsageReport {
 }
 
 #[tauri::command]
+fn set_project_budget(
+    state: State<'_, ManagedState>,
+    project_path: String,
+    budget_usd: f64,
+) -> Result<(), String> {
+    state
+        .set_project_budget(project_path, budget_usd)
+        .map_err(display_error)
+}
+
+#[tauri::command]
 fn get_api_usage(state: State<'_, ManagedState>) -> ApiUsageReport {
     state.api_usage_report()
 }
@@ -439,6 +450,7 @@ pub fn run() {
             validate_tool_setup,
             set_tool_setup,
             get_usage,
+            set_project_budget,
             get_api_usage,
             start_api_gateway,
             stop_api_gateway,

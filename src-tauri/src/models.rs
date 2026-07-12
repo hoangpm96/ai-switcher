@@ -824,6 +824,19 @@ pub struct SessionUsage {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProjectUsage {
+    /// Absolute working directory recorded by the CLI session.
+    pub path: String,
+    pub tokens: TokenBreakdown,
+    pub cost_usd: Option<f64>,
+    /// Cost in the current local calendar month, independent of the selected report range.
+    pub month_cost_usd: Option<f64>,
+    pub session_count: u32,
+    pub last_active: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolUsage {
     pub tool_id: ToolId,
     pub display_name: String,
@@ -839,12 +852,16 @@ pub struct ToolUsage {
     pub by_model: Vec<ModelUsage>,
     /// Recent sessions, newest first (capped).
     pub sessions: Vec<SessionUsage>,
+    /// Per-working-directory totals, highest cost/token usage first.
+    pub projects: Vec<ProjectUsage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageReport {
     pub tools: Vec<ToolUsage>,
+    /// Monthly USD budgets keyed by absolute project path. A budget spans both CLI tools.
+    pub project_budgets: std::collections::BTreeMap<String, f64>,
     pub generated_at: String,
     /// "live" (just fetched), "cached" (LiteLLM cache on disk), or "unavailable".
     pub price_status: String,
