@@ -237,7 +237,7 @@ function ProjectCard({
   };
 
   return (
-    <article className={`projectCard ${percent != null && percent >= 100 ? "over" : percent != null && percent >= 80 ? "near" : ""}`}>
+    <article className={`projectCard ${expanded ? "expanded" : ""} ${percent != null && percent >= 100 ? "over" : percent != null && percent >= 80 ? "near" : ""}`}>
       <div className="projectCardHead">
         <div className="projectIdentity">
           <FolderKanban />

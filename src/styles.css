@@ -2188,6 +2188,9 @@ div.quotaError .linkBtn {
   gap: 12px;
   padding: 14px;
 }
+.projectCard.expanded {
+  grid-column: 1 / -1;
+}
 .projectCard.near {
   border-color: rgba(252, 211, 77, 0.45);
 }
