@@ -28,6 +28,8 @@ pub struct ManagedState {
     pub store: Store,
     pub data: Mutex<StoredState>,
     pub api_server: Mutex<crate::api_gateway::ApiServerHandle>,
+    /// Serializes usage scans so repeated tab opens cannot race while rebuilding the same cache.
+    pub usage_scan: Mutex<()>,
     /// True while a "Prime ngay" attempt is running, so a second button press can't start an
     /// overlapping attempt (send + confirm can block for ~2 minutes). An `Arc` so the backgrounded
     /// worker can move a clear-on-drop guard into its thread without a raw pointer (see
@@ -48,6 +50,7 @@ impl ManagedState {
             store,
             data: Mutex::new(data),
             api_server: Mutex::new(server),
+            usage_scan: Mutex::new(()),
             priming: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         // Clean up orphan active files: pointing to a deleted profile → clear + reinstall the hook.
@@ -768,6 +771,10 @@ impl ManagedState {
     /// dir on the machine, aggregate per tool, and price it via the LiteLLM cache. Antigravity
     /// is excluded (no token logs). Cheap to call repeatedly thanks to the per-file cursor cache.
     pub fn usage_report(&self, range_days: u32) -> UsageReport {
+        let _scan = self
+            .usage_scan
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let project_budgets = self
             .data
             .lock()

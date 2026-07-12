@@ -2327,6 +2327,34 @@ div.quotaError .linkBtn {
   font-size: 11px;
   margin: 0;
 }
+.projectExpand {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-2);
+  justify-content: center;
+  margin: -4px 0 -6px;
+  min-height: 28px;
+  width: 100%;
+}
+.projectExpand svg {
+  height: 14px;
+  transition: transform 0.15s ease;
+  width: 14px;
+}
+.projectExpand.expanded svg {
+  transform: rotate(180deg);
+}
+.projectDetail {
+  border-top: 1px solid var(--line);
+  display: grid;
+  padding-top: 14px;
+}
+.projectStats {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.projectDetail .usageTable {
+  overflow-x: auto;
+}
 
 @media (max-width: 620px) {
   .projectGrid {
@@ -2338,6 +2366,9 @@ div.quotaError .linkBtn {
   .projectCardHead,
   .budgetLine {
     align-items: flex-start;
+  }
+  .projectStats {
+    grid-template-columns: 1fr;
   }
 }
 

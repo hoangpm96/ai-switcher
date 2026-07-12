@@ -199,8 +199,8 @@ const demoUsage: UsageReport = {
         { id: "a1b2c3d4", date: "2026-06-01", model: "claude-sonnet-4-5", tokens: tb(12000, 40000, 380000, 120000), costUsd: 0.95 },
       ],
       projects: [
-        { path: "/Volumes/Data/Git/ai-switcher", tokens: tb(90000, 360000, 3900000, 950000), costUsd: 9.74, monthCostUsd: 4.18, sessionCount: 12, lastActive: "2026-06-02" },
-        { path: "/Volumes/Data/Git/reqwise", tokens: tb(30000, 120000, 1300000, 350000), costUsd: 3.1, monthCostUsd: 1.2, sessionCount: 4, lastActive: "2026-06-01" },
+        { path: "/Volumes/Data/Git/ai-switcher", tokens: tb(90000, 360000, 3900000, 950000), costUsd: 9.74, monthCostUsd: 4.18, sessionCount: 12, lastActive: "2026-06-02", daily: [{ date: "2026-06-01", tokens: tb(82000, 328000, 3490000, 855000), costUsd: 8.62 }, { date: "2026-06-02", tokens: tb(8000, 32000, 410000, 95000), costUsd: 1.12 }], byModel: [{ model: "claude-opus-4-8", tokens: tb(90000, 360000, 3900000, 950000), costUsd: 9.74 }], sessions: [{ id: "7e5d3164", date: "2026-06-02", model: "claude-opus-4-8", tokens: tb(8000, 32000, 410000, 95000), costUsd: 1.12 }] },
+        { path: "/Volumes/Data/Git/reqwise", tokens: tb(30000, 120000, 1300000, 350000), costUsd: 3.1, monthCostUsd: 1.2, sessionCount: 4, lastActive: "2026-06-01", daily: [{ date: "2026-06-01", tokens: tb(30000, 120000, 1300000, 350000), costUsd: 3.1 }], byModel: [{ model: "claude-sonnet-4-5", tokens: tb(30000, 120000, 1300000, 350000), costUsd: 3.1 }], sessions: [] },
       ],
     },
     {
@@ -226,8 +226,8 @@ const demoUsage: UsageReport = {
         { id: "019e887b", date: "2026-06-02", model: "gpt-5.5", tokens: tb(60000, 18000, 210000, 0), costUsd: 0.51 },
       ],
       projects: [
-        { path: "/Volumes/Data/Git/ai-switcher", tokens: tb(650000, 180000, 2300000, 0), costUsd: 4.9, monthCostUsd: 2.42, sessionCount: 8, lastActive: "2026-06-02" },
-        { path: "/Volumes/Data/Git/reqwise", tokens: tb(250000, 60000, 800000, 0), costUsd: 1.52, monthCostUsd: 0.64, sessionCount: 3, lastActive: "2026-06-01" },
+        { path: "/Volumes/Data/Git/ai-switcher", tokens: tb(650000, 180000, 2300000, 0), costUsd: 4.9, monthCostUsd: 2.42, sessionCount: 8, lastActive: "2026-06-02", daily: [{ date: "2026-06-02", tokens: tb(650000, 180000, 2300000, 0), costUsd: 4.9 }], byModel: [{ model: "gpt-5.5", tokens: tb(650000, 180000, 2300000, 0), costUsd: 4.9 }], sessions: [{ id: "019e887b", date: "2026-06-02", model: "gpt-5.5", tokens: tb(60000, 18000, 210000, 0), costUsd: 0.51 }] },
+        { path: "/Volumes/Data/Git/reqwise", tokens: tb(250000, 60000, 800000, 0), costUsd: 1.52, monthCostUsd: 0.64, sessionCount: 3, lastActive: "2026-06-01", daily: [{ date: "2026-06-01", tokens: tb(250000, 60000, 800000, 0), costUsd: 1.52 }], byModel: [{ model: "gpt-5", tokens: tb(250000, 60000, 800000, 0), costUsd: 1.52 }], sessions: [] },
       ],
     },
   ],

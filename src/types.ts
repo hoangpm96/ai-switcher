@@ -385,6 +385,9 @@ export interface ProjectUsage {
   monthCostUsd: number | null;
   sessionCount: number;
   lastActive: string;
+  daily: DayUsage[];
+  byModel: ModelUsage[];
+  sessions: SessionUsage[];
 }
 
 export interface ToolUsage {

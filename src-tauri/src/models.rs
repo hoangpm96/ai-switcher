@@ -833,6 +833,9 @@ pub struct ProjectUsage {
     pub month_cost_usd: Option<f64>,
     pub session_count: u32,
     pub last_active: String,
+    pub daily: Vec<DayUsage>,
+    pub by_model: Vec<ModelUsage>,
+    pub sessions: Vec<SessionUsage>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

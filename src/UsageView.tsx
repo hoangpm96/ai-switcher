@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertTriangle, BarChart3, FolderKanban, LayoutDashboard, Loader2, RefreshCw } from "lucide-react";
+import { AlertTriangle, BarChart3, ChevronDown, FolderKanban, LayoutDashboard, Loader2, RefreshCw } from "lucide-react";
 import { api } from "./tauri";
 import type { DayUsage, ModelUsage, ProjectUsage, SessionUsage, TokenBreakdown, ToolUsage, UsageReport } from "./types";
 
@@ -131,7 +131,7 @@ export function UsageView() {
       {!report && !error && (
         <div className="empty">
           <Loader2 className="spin" />
-          <span>Reading usage logs…</span>
+          <span>Reading usage logs… the first project scan can take around 30 seconds.</span>
         </div>
       )}
     </section>
@@ -151,6 +151,7 @@ function ProjectUsageSection({
   range: number;
   onBudgetSaved: () => Promise<void>;
 }) {
+  const [expanded, setExpanded] = useState<string | null>(null);
   const allMonthCosts = new Map(allProjects.map((project) => [project.path, project.monthCostUsd]));
   const projects = tool.toolId === "all" ? withBudgetOnlyProjects(tool.projects, budgets) : tool.projects;
   if (projects.length === 0) {
@@ -179,6 +180,9 @@ function ProjectUsageSection({
             budget={budgets[project.path] ?? null}
             combinedMonthCost={allMonthCosts.get(project.path) ?? null}
             estimate={tool.estimate}
+            range={range}
+            expanded={expanded === project.path}
+            onToggle={() => setExpanded(expanded === project.path ? null : project.path)}
             onBudgetSaved={onBudgetSaved}
           />
         ))}
@@ -192,12 +196,18 @@ function ProjectCard({
   budget,
   combinedMonthCost,
   estimate,
+  range,
+  expanded,
+  onToggle,
   onBudgetSaved,
 }: {
   project: ProjectUsage;
   budget: number | null;
   combinedMonthCost: number | null;
   estimate: boolean;
+  range: number;
+  expanded: boolean;
+  onToggle: () => void;
   onBudgetSaved: () => Promise<void>;
 }) {
   const [draft, setDraft] = useState(budget == null ? "" : String(budget));
@@ -281,6 +291,26 @@ function ProjectCard({
         )}
         {saveError && <p className="budgetError">{saveError}</p>}
       </div>
+      <button className={`projectExpand ${expanded ? "expanded" : ""}`} onClick={onToggle}>
+        {expanded ? "Hide details" : "View details"}
+        <ChevronDown />
+      </button>
+      {expanded && (
+        <div className="projectDetail">
+          <div className="usageStats projectStats">
+            <StatTile label="Range cost" value={formatUsd(project.costUsd)} sub={`${formatTokens(total(project.tokens))} tokens`} big />
+            <StatTile label="Output" value={formatTokens(project.tokens.output)} sub="generated tokens" />
+            <StatTile label="Cache read" value={formatTokens(project.tokens.cacheRead)} sub="reused tokens" />
+          </div>
+          <TrendChart
+            daily={project.daily}
+            range={range}
+            priceUnavailable={!project.daily.some((day) => day.costUsd != null)}
+          />
+          <ModelTable models={project.byModel} />
+          <SessionTable sessions={project.sessions} />
+        </div>
+      )}
     </article>
   );
 }
@@ -489,7 +519,18 @@ function SessionTable({ sessions }: { sessions: SessionUsage[] }) {
 function buildAllUsage(tools: ToolUsage[]): ToolUsage {
   const daily = mergeByDate(tools.flatMap((tool) => tool.daily));
   const byModel = mergeByModel(tools.flatMap((tool) => tool.byModel));
-  const projects = mergeProjects(tools.flatMap((tool) => tool.projects));
+  const projects = mergeProjects(
+    tools.flatMap((tool) =>
+      tool.projects.map((project) => ({
+        ...project,
+        sessions: project.sessions.map((session) => ({
+          ...session,
+          id: `${tool.toolId}:${session.id}`,
+          model: `${tool.displayName} / ${session.model}`,
+        })),
+      })),
+    ),
+  );
   const sessions = tools
     .flatMap((tool) =>
       tool.sessions.map((session) => ({
@@ -521,13 +562,24 @@ function mergeProjects(projects: ProjectUsage[]): ProjectUsage[] {
   for (const project of projects) {
     const current = byPath.get(project.path);
     if (!current) {
-      byPath.set(project.path, { ...project, tokens: { ...project.tokens } });
+      byPath.set(project.path, {
+        ...project,
+        tokens: { ...project.tokens },
+        daily: [...project.daily],
+        byModel: [...project.byModel],
+        sessions: [...project.sessions],
+      });
       continue;
     }
     current.tokens = addTokens(current.tokens, project.tokens);
     current.costUsd = sumNullable([current.costUsd, project.costUsd]);
     current.monthCostUsd = sumNullable([current.monthCostUsd, project.monthCostUsd]);
     current.sessionCount += project.sessionCount;
+    current.daily = mergeByDate([...current.daily, ...project.daily]);
+    current.byModel = mergeByModel([...current.byModel, ...project.byModel]);
+    current.sessions = [...current.sessions, ...project.sessions]
+      .sort((a, b) => b.date.localeCompare(a.date) || total(b.tokens) - total(a.tokens))
+      .slice(0, 30);
     if (project.lastActive > current.lastActive) current.lastActive = project.lastActive;
   }
   return Array.from(byPath.values()).sort(
@@ -547,6 +599,9 @@ function withBudgetOnlyProjects(projects: ProjectUsage[], budgets: Record<string
       monthCostUsd: null,
       sessionCount: 0,
       lastActive: "unknown",
+      daily: [],
+      byModel: [],
+      sessions: [],
     });
   }
   return result;

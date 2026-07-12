@@ -286,8 +286,12 @@ fn set_tool_setup(
 /// Token usage + cost report for the Usage tab (Claude + Codex, aggregated per tool).
 /// `range_days` limits the totals to the last N local days (0 = all time).
 #[tauri::command]
-fn get_usage(state: State<'_, ManagedState>, range_days: u32) -> UsageReport {
-    state.usage_report(range_days)
+async fn get_usage(app: tauri::AppHandle, range_days: u32) -> Result<UsageReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<ManagedState>().usage_report(range_days)
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

@@ -21,7 +21,7 @@ use crate::models::{
 use crate::pricing::{load_price_table, PriceTable};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Cap on sessions returned per tool in the report (newest first).
@@ -154,25 +154,37 @@ pub fn build_report(
 // Incremental file reading
 // ---------------------------------------------------------------------------
 
-/// Reads the bytes appended since `offset`. Returns the complete lines plus the new offset
-/// (advanced only past the last newline, so a half-written final line waits for next time).
-fn read_new_lines(path: &Path, offset: u64) -> Option<(Vec<String>, u64)> {
+/// Streams complete lines appended since `offset`. The cursor only advances past newline-terminated
+/// records, so a half-written JSON event waits for the next refresh without loading huge rollouts
+/// into memory at once.
+fn for_each_new_line(
+    path: &Path,
+    offset: u64,
+    mut visit: impl FnMut(&str),
+) -> Option<u64> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     // File shrank (rotated/replaced) → start over.
     let start = if offset > len { 0 } else { offset };
     if start == len {
-        return Some((Vec::new(), start));
+        return Some(start);
     }
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).ok()?;
-    let consumed = match buf.rfind('\n') {
-        Some(idx) => idx + 1,
-        None => 0,
-    };
-    let lines = buf[..consumed].lines().map(ToString::to_string).collect();
-    Some((lines, start + consumed as u64))
+    let mut reader = BufReader::new(file);
+    let mut cursor = start;
+    loop {
+        let line_start = cursor;
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).ok()?;
+        if bytes == 0 {
+            return Some(cursor);
+        }
+        if !line.ends_with('\n') {
+            return Some(line_start);
+        }
+        cursor += bytes as u64;
+        visit(&line);
+    }
 }
 
 /// Recursively collects `*.jsonl` files under `dir` whose name starts with `name_prefix`.
@@ -222,29 +234,30 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
         .get(&key)
         .map(|record| record.project.clone())
         .unwrap_or_default();
-    let Some((lines, new_offset)) = read_new_lines(path, offset) else {
-        return;
-    };
-    if lines.is_empty() {
-        cache.files.entry(key).or_default().offset = new_offset;
-        return;
-    }
-
     // Dedup the same assistant message appearing on multiple streaming lines: keep the
     // entry with the most tokens per message id (within this batch).
     let mut best: BTreeMap<String, ClaudeEntry> = BTreeMap::new();
-    for line in &lines {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some(found) = project_path(&value) {
-            project = found;
-        }
+    let Some(new_offset) = for_each_new_line(path, offset, |line| {
         if !line.contains("\"usage\"") {
-            continue;
+            if project.is_empty() && line.contains("\"cwd\"") {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(found) = project_path(&value) {
+                        project = found;
+                    }
+                }
+            }
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if project.is_empty() {
+            if let Some(found) = project_path(&value) {
+                project = found;
+            }
         }
         let Some(mut entry) = claude_entry(&value) else {
-            continue;
+            return;
         };
         entry.project = project.clone();
         match best.get(&entry.id) {
@@ -253,7 +266,9 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
                 best.insert(entry.id.clone(), entry);
             }
         }
-    }
+    }) else {
+        return;
+    };
 
     let session_id = file_stem(path);
     for entry in best.into_values() {
@@ -350,25 +365,28 @@ fn scan_codex_file(path: &Path, cache: &mut UsageCache) {
         .map(|c| c.codex_project.clone())
         .unwrap_or_default();
 
-    let Some((lines, new_offset)) = read_new_lines(path, offset) else {
-        return;
-    };
-
     let session_id = file_stem(path);
-    for line in &lines {
+    let mut deltas: Vec<(String, String, String, TokenBreakdown)> = Vec::new();
+    let Some(new_offset) = for_each_new_line(path, offset, |line| {
+        if !line.contains("\"session_meta\"")
+            && !line.contains("\"turn_context\"")
+            && !line.contains("\"token_count\"")
+        {
+            return;
+        }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
+            return;
         };
         if let Some(found) = codex_project(&value) {
             project = found;
-            continue;
+            return;
         }
         if let Some(found) = codex_model(&value) {
             model = found;
-            continue;
+            return;
         }
         let Some(total) = codex_total_usage(&value) else {
-            continue;
+            return;
         };
         // Delta from the last cumulative snapshot (reset to the raw total if it went backwards).
         let growing = total.input >= last_input && total.output >= last_output;
@@ -393,9 +411,15 @@ fn scan_codex_file(path: &Path, cache: &mut UsageCache) {
             cache_creation: 0,
         };
         if tokens.total() == 0 {
-            continue;
+            return;
         }
         let date = total.date.clone().unwrap_or_else(unknown_date);
+        deltas.push((date, model.clone(), project.clone(), tokens));
+    }) else {
+        return;
+    };
+
+    for (date, model, project, tokens) in deltas {
         add_bucket(cache, "codex", &date, &model, &tokens);
         add_project_bucket(cache, "codex", &date, &model, &project, &tokens);
         add_session(
@@ -638,6 +662,10 @@ fn tool_usage(
     let mut total = TokenBreakdown::default();
     let mut today_tokens = TokenBreakdown::default();
     let mut project_models: BTreeMap<String, BTreeMap<String, TokenBreakdown>> = BTreeMap::new();
+    let mut project_day_models: BTreeMap<
+        String,
+        BTreeMap<String, BTreeMap<String, TokenBreakdown>>,
+    > = BTreeMap::new();
     let mut month_project_models: BTreeMap<String, BTreeMap<String, TokenBreakdown>> =
         BTreeMap::new();
 
@@ -705,6 +733,14 @@ fn tool_usage(
                 .entry(model.to_string())
                 .or_default()
                 .add(tokens);
+            project_day_models
+                .entry(path.to_string())
+                .or_default()
+                .entry(date.to_string())
+                .or_default()
+                .entry(model.to_string())
+                .or_default()
+                .add(tokens);
         }
         if date != "unknown" && date >= month_start {
             month_project_models
@@ -717,6 +753,7 @@ fn tool_usage(
     }
 
     let mut project_sessions: BTreeMap<String, (u32, String)> = BTreeMap::new();
+    let mut project_session_rows: BTreeMap<String, Vec<SessionUsage>> = BTreeMap::new();
     for record in cache.sessions.values().filter(|record| record.tool == tool) {
         if record.project.is_empty() {
             continue;
@@ -726,6 +763,16 @@ fn tool_usage(
             .or_insert((0, record.date.clone()));
         if in_range(&record.date, cutoff) {
             item.0 += 1;
+            project_session_rows
+                .entry(record.project.clone())
+                .or_default()
+                .push(SessionUsage {
+                    id: record.id.clone(),
+                    date: record.date.clone(),
+                    model: record.model.clone(),
+                    tokens: record.tokens,
+                    cost_usd: prices.cost(&record.model, &record.tokens),
+                });
         }
         if record.date > item.1 {
             item.1 = record.date.clone();
@@ -766,6 +813,47 @@ fn tool_usage(
                 .get(&path)
                 .cloned()
                 .unwrap_or((0, "unknown".to_string()));
+            let daily = project_day_models
+                .get(&path)
+                .into_iter()
+                .flat_map(|days| days.iter())
+                .map(|(date, models)| {
+                    let tokens = models.values().fold(
+                        TokenBreakdown::default(),
+                        |mut sum, tokens| {
+                            sum.add(tokens);
+                            sum
+                        },
+                    );
+                    let cost_usd = sum_cost(
+                        models
+                            .iter()
+                            .map(|(model, tokens)| prices.cost(model, tokens)),
+                    );
+                    DayUsage {
+                        date: date.clone(),
+                        tokens,
+                        cost_usd,
+                    }
+                })
+                .collect();
+            let mut by_model: Vec<ModelUsage> = models
+                .into_iter()
+                .flat_map(|models| models.iter())
+                .map(|(model, tokens)| ModelUsage {
+                    model: model.clone(),
+                    tokens: *tokens,
+                    cost_usd: prices.cost(model, tokens),
+                })
+                .collect();
+            by_model.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total()));
+            let mut sessions = project_session_rows.get(&path).cloned().unwrap_or_default();
+            sessions.sort_by(|a, b| {
+                b.date
+                    .cmp(&a.date)
+                    .then(b.tokens.total().cmp(&a.tokens.total()))
+            });
+            sessions.truncate(MAX_SESSIONS);
             ProjectUsage {
                 path,
                 tokens,
@@ -773,6 +861,9 @@ fn tool_usage(
                 month_cost_usd,
                 session_count,
                 last_active,
+                daily,
+                by_model,
+                sessions,
             }
         })
         .collect();
