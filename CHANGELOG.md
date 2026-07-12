@@ -5,6 +5,22 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-07-12
+
+### Added
+
+- **Usage can now be explored by project folder.** The Projects view groups Claude Code and Codex
+  token usage by the working directory recorded in each local session. It supports combined and
+  per-tool views with token totals, estimated cost, session count, and last activity.
+- **Each project has an expandable usage report.** Opening a project widens it across the panel and
+  shows the same useful breakdowns as Overview: daily trend, model totals, and recent sessions.
+
+### Changed
+
+- **Large usage histories no longer freeze the app.** JSONL files are streamed instead of loaded
+  whole, irrelevant Codex events are skipped before JSON parsing, and usage scans run away from the
+  UI thread. The incremental cache keeps subsequent refreshes fast even on multi-gigabyte histories.
+
 ## [0.7.1] - 2026-07-11
 
 ### Changed

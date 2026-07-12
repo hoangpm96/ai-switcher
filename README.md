@@ -94,7 +94,7 @@ git push origin main v0.6.3
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version history and
-[the v0.6.3 release notes](docs/releases/v0.6.3.md) for the current release.
+[the v0.7.2 release notes](docs/releases/v0.7.2.md) for the current release.
 
 ## License
 
