@@ -381,8 +381,6 @@ export interface ProjectUsage {
   path: string;
   tokens: TokenBreakdown;
   costUsd: number | null;
-  /** Cost in the current local calendar month, regardless of the selected range. */
-  monthCostUsd: number | null;
   sessionCount: number;
   lastActive: string;
   daily: DayUsage[];
@@ -407,8 +405,6 @@ export interface ToolUsage {
 
 export interface UsageReport {
   tools: ToolUsage[];
-  /** Monthly USD budgets keyed by absolute project path. */
-  projectBudgets: Record<string, number>;
   generatedAt: string;
   /** "live" | "cached" | "unavailable" */
   priceStatus: string;

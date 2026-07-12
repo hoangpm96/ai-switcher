@@ -117,10 +117,7 @@ export function UsageView() {
               ) : (
                 <ProjectUsageSection
                   tool={tool}
-                  allProjects={usageTools[0]?.projects ?? []}
-                  budgets={report.projectBudgets}
                   range={range}
-                  onBudgetSaved={load}
                 />
               )
             ) : null;
@@ -140,20 +137,13 @@ export function UsageView() {
 
 function ProjectUsageSection({
   tool,
-  allProjects,
-  budgets,
   range,
-  onBudgetSaved,
 }: {
   tool: ToolUsage;
-  allProjects: ProjectUsage[];
-  budgets: Record<string, number>;
   range: number;
-  onBudgetSaved: () => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
-  const allMonthCosts = new Map(allProjects.map((project) => [project.path, project.monthCostUsd]));
-  const projects = tool.toolId === "all" ? withBudgetOnlyProjects(tool.projects, budgets) : tool.projects;
+  const projects = tool.projects;
   if (projects.length === 0) {
     return (
       <div className="usageEmpty">
@@ -168,22 +158,19 @@ function ProjectUsageSection({
       <div className="projectUsageHead">
         <div>
           <strong>{projects.length} projects</strong>
-          <span>{rangeLabel} · budgets reset each calendar month</span>
+          <span>{rangeLabel}</span>
         </div>
-        <span>Budget spend always includes Claude + Codex</span>
+        <span>Open a project for daily, model, and session details</span>
       </div>
       <div className="projectGrid">
         {projects.map((project) => (
           <ProjectCard
             key={project.path}
             project={project}
-            budget={budgets[project.path] ?? null}
-            combinedMonthCost={allMonthCosts.get(project.path) ?? null}
             estimate={tool.estimate}
             range={range}
             expanded={expanded === project.path}
             onToggle={() => setExpanded(expanded === project.path ? null : project.path)}
-            onBudgetSaved={onBudgetSaved}
           />
         ))}
       </div>
@@ -193,51 +180,19 @@ function ProjectUsageSection({
 
 function ProjectCard({
   project,
-  budget,
-  combinedMonthCost,
   estimate,
   range,
   expanded,
   onToggle,
-  onBudgetSaved,
 }: {
   project: ProjectUsage;
-  budget: number | null;
-  combinedMonthCost: number | null;
   estimate: boolean;
   range: number;
   expanded: boolean;
   onToggle: () => void;
-  onBudgetSaved: () => Promise<void>;
 }) {
-  const [draft, setDraft] = useState(budget == null ? "" : String(budget));
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  useEffect(() => setDraft(budget == null ? "" : String(budget)), [budget]);
-
-  const spend = combinedMonthCost ?? 0;
-  const percent = budget && budget > 0 ? (spend / budget) * 100 : null;
-  const save = async () => {
-    const next = draft.trim() === "" ? 0 : Number(draft);
-    if (!Number.isFinite(next) || next < 0) {
-      setSaveError("Budget must be a non-negative USD amount.");
-      return;
-    }
-    if (next === (budget ?? 0)) return;
-    setSaving(true);
-    setSaveError(null);
-    try {
-      await api.setProjectBudget(project.path, next);
-      await onBudgetSaved();
-    } catch (error) {
-      setSaveError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setSaving(false);
-    }
-  };
-
   return (
-    <article className={`projectCard ${expanded ? "expanded" : ""} ${percent != null && percent >= 100 ? "over" : percent != null && percent >= 80 ? "near" : ""}`}>
+    <article className={`projectCard ${expanded ? "expanded" : ""}`}>
       <div className="projectCardHead">
         <div className="projectIdentity">
           <FolderKanban />
@@ -257,40 +212,6 @@ function ProjectCard({
         <span>Last active <strong>{project.lastActive === "unknown" ? "—" : project.lastActive}</strong></span>
       </div>
 
-      <div className="budgetBlock">
-        <div className="budgetLine">
-          <span>This month <strong>{formatUsd(combinedMonthCost)}</strong></span>
-          <label>
-            Budget $
-            <input
-              type="number"
-              min="0"
-              step="1"
-              value={draft}
-              placeholder="Not set"
-              disabled={saving}
-              onChange={(event) => setDraft(event.target.value)}
-              onBlur={() => void save()}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") event.currentTarget.blur();
-              }}
-              aria-label={`Monthly budget for ${projectName(project.path)}`}
-            />
-          </label>
-        </div>
-        {percent != null ? (
-          <>
-            <div className="budgetTrack"><span style={{ width: `${Math.min(percent, 100)}%` }} /></div>
-            <div className="budgetCaption">
-              <span>{percent.toFixed(0)}% used</span>
-              <span>{formatUsd(Math.max(budget! - spend, 0))} remaining</span>
-            </div>
-          </>
-        ) : (
-          <p className="budgetUnset">Set a monthly budget to track project spend.</p>
-        )}
-        {saveError && <p className="budgetError">{saveError}</p>}
-      </div>
       <button className={`projectExpand ${expanded ? "expanded" : ""}`} onClick={onToggle}>
         {expanded ? "Hide details" : "View details"}
         <ChevronDown />
@@ -573,7 +494,6 @@ function mergeProjects(projects: ProjectUsage[]): ProjectUsage[] {
     }
     current.tokens = addTokens(current.tokens, project.tokens);
     current.costUsd = sumNullable([current.costUsd, project.costUsd]);
-    current.monthCostUsd = sumNullable([current.monthCostUsd, project.monthCostUsd]);
     current.sessionCount += project.sessionCount;
     current.daily = mergeByDate([...current.daily, ...project.daily]);
     current.byModel = mergeByModel([...current.byModel, ...project.byModel]);
@@ -585,26 +505,6 @@ function mergeProjects(projects: ProjectUsage[]): ProjectUsage[] {
   return Array.from(byPath.values()).sort(
     (a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0) || total(b.tokens) - total(a.tokens),
   );
-}
-
-function withBudgetOnlyProjects(projects: ProjectUsage[], budgets: Record<string, number>): ProjectUsage[] {
-  const result = [...projects];
-  const known = new Set(projects.map((project) => project.path));
-  for (const path of Object.keys(budgets)) {
-    if (known.has(path)) continue;
-    result.push({
-      path,
-      tokens: zeroTokens(),
-      costUsd: null,
-      monthCostUsd: null,
-      sessionCount: 0,
-      lastActive: "unknown",
-      daily: [],
-      byModel: [],
-      sessions: [],
-    });
-  }
-  return result;
 }
 
 function projectName(path: string) {

@@ -116,7 +116,6 @@ pub fn build_report(
     price_cache_path: &Path,
     claude_dirs: &[PathBuf],
     codex_dirs: &[PathBuf],
-    project_budgets: &BTreeMap<String, f64>,
     range_days: u32,
 ) -> UsageReport {
     let mut cache = load_cache(cache_path);
@@ -147,7 +146,7 @@ pub fn build_report(
     save_cache(cache_path, &cache);
 
     let prices = load_price_table(price_cache_path);
-    build_report_from_cache(&cache, &prices, project_budgets, range_days)
+    build_report_from_cache(&cache, &prices, range_days)
 }
 
 // ---------------------------------------------------------------------------
@@ -597,11 +596,9 @@ fn sum_cost(items: impl Iterator<Item = Option<f64>>) -> Option<f64> {
 fn build_report_from_cache(
     cache: &UsageCache,
     prices: &PriceTable,
-    project_budgets: &BTreeMap<String, f64>,
     range_days: u32,
 ) -> UsageReport {
     let today = today_local();
-    let month_start = format!("{}-01", &today[..7]);
     let cutoff = cutoff_date(range_days);
     let tools = [ToolId::Claude, ToolId::Codex]
         .into_iter()
@@ -611,7 +608,6 @@ fn build_report_from_cache(
                 prices,
                 &tool_id,
                 &today,
-                &month_start,
                 cutoff.as_deref(),
             )
         })
@@ -619,7 +615,6 @@ fn build_report_from_cache(
 
     UsageReport {
         tools,
-        project_budgets: project_budgets.clone(),
         generated_at: chrono::Utc::now().to_rfc3339(),
         price_status: prices.status.clone(),
         price_updated_at: prices.updated_at.clone(),
@@ -650,7 +645,6 @@ fn tool_usage(
     prices: &PriceTable,
     tool_id: &ToolId,
     today: &str,
-    month_start: &str,
     cutoff: Option<&str>,
 ) -> ToolUsage {
     let tool = tool_id.as_str();
@@ -666,8 +660,6 @@ fn tool_usage(
         String,
         BTreeMap<String, BTreeMap<String, TokenBreakdown>>,
     > = BTreeMap::new();
-    let mut month_project_models: BTreeMap<String, BTreeMap<String, TokenBreakdown>> =
-        BTreeMap::new();
 
     for (key, tokens) in cache.buckets.iter().filter(|(k, _)| k.starts_with(&prefix)) {
         // key = "tool|date|model" — model may itself contain '|'? Model names never do.
@@ -742,14 +734,6 @@ fn tool_usage(
                 .or_default()
                 .add(tokens);
         }
-        if date != "unknown" && date >= month_start {
-            month_project_models
-                .entry(path.to_string())
-                .or_default()
-                .entry(model.to_string())
-                .or_default()
-                .add(tokens);
-        }
     }
 
     let mut project_sessions: BTreeMap<String, (u32, String)> = BTreeMap::new();
@@ -779,11 +763,7 @@ fn tool_usage(
         }
     }
 
-    let project_paths: BTreeSet<String> = project_models
-        .keys()
-        .chain(month_project_models.keys())
-        .cloned()
-        .collect();
+    let project_paths: BTreeSet<String> = project_models.keys().cloned().collect();
     let mut projects: Vec<ProjectUsage> = project_paths
         .into_iter()
         .map(|path| {
@@ -798,13 +778,6 @@ fn tool_usage(
             let cost_usd = models.and_then(|models| {
                 sum_cost(
                     models
-                        .iter()
-                        .map(|(model, tokens)| prices.cost(model, tokens)),
-                )
-            });
-            let month_cost_usd = month_project_models.get(&path).and_then(|month_models| {
-                sum_cost(
-                    month_models
                         .iter()
                         .map(|(model, tokens)| prices.cost(model, tokens)),
                 )
@@ -858,7 +831,6 @@ fn tool_usage(
                 path,
                 tokens,
                 cost_usd,
-                month_cost_usd,
                 session_count,
                 last_active,
                 daily,
@@ -996,13 +968,13 @@ mod tests {
 
         // 7-day range → only the recent line. (Use a fresh cache per call to re-aggregate.)
         let cache7 = base.join("usage7.json");
-        let r7 = build_report(&cache7, &prices, &dirs, &[], &BTreeMap::new(), 7);
+        let r7 = build_report(&cache7, &prices, &dirs, &[], 7);
         let claude7 = r7.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
         assert_eq!(claude7.total.total(), 15);
 
         // All time → both lines.
         let cache_all = base.join("usageAll.json");
-        let r_all = build_report(&cache_all, &prices, &dirs, &[], &BTreeMap::new(), 0);
+        let r_all = build_report(&cache_all, &prices, &dirs, &[], 0);
         let claude_all = r_all.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
         assert_eq!(claude_all.total.total(), 1515);
 
@@ -1030,14 +1002,7 @@ mod tests {
         let cache = base.join("usage.json");
         let prices = base.join("prices.json"); // missing → no cost, fine for token assert
         let claude_dirs = vec![base.join("default"), base.join("profile")];
-        let report = build_report(
-            &cache,
-            &prices,
-            &claude_dirs,
-            &[],
-            &BTreeMap::new(),
-            0,
-        );
+        let report = build_report(&cache, &prices, &claude_dirs, &[], 0);
         let _ = std::fs::remove_dir_all(&base);
 
         let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
@@ -1074,14 +1039,11 @@ mod tests {
         );
         std::fs::write(codex_sessions.join("rollout-session.jsonl"), codex).unwrap();
 
-        let mut budgets = BTreeMap::new();
-        budgets.insert(project_path.to_string(), 25.0);
         let report = build_report(
             &base.join("usage.json"),
             &base.join("prices.json"),
             &[base.join("claude")],
             &[base.join("codex")],
-            &budgets,
             0,
         );
 
@@ -1095,8 +1057,6 @@ mod tests {
         assert_eq!(codex.projects.len(), 1);
         assert_eq!(codex.projects[0].path, project_path);
         assert_eq!(codex.projects[0].tokens.total(), 35);
-        assert_eq!(report.project_budgets.get(project_path.as_ref()), Some(&25.0));
-
         let _ = std::fs::remove_dir_all(&base);
     }
 

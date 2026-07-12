@@ -2191,19 +2191,8 @@ div.quotaError .linkBtn {
 .projectCard.expanded {
   grid-column: 1 / -1;
 }
-.projectCard.near {
-  border-color: rgba(252, 211, 77, 0.45);
-}
-.projectCard.over {
-  border-color: rgba(251, 113, 133, 0.55);
-  background:
-    linear-gradient(135deg, var(--red-soft), transparent 46%),
-    var(--surface-2);
-}
 .projectCardHead,
-.projectMeta,
-.budgetLine,
-.budgetCaption {
+.projectMeta {
   align-items: center;
   display: flex;
   gap: 10px;
@@ -2252,9 +2241,7 @@ div.quotaError .linkBtn {
   font-variant-numeric: tabular-nums;
 }
 .projectCost span,
-.projectMeta,
-.budgetCaption,
-.budgetUnset {
+.projectMeta {
   color: var(--text-3);
   font-size: 11px;
 }
@@ -2269,66 +2256,6 @@ div.quotaError .linkBtn {
 .projectMeta strong {
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
-}
-.budgetBlock {
-  border-top: 1px solid var(--line);
-  display: grid;
-  gap: 7px;
-  padding-top: 10px;
-}
-.budgetLine {
-  color: var(--text-2);
-  font-size: 11.5px;
-}
-.budgetLine label {
-  align-items: center;
-  color: var(--text-3);
-  display: flex;
-  gap: 4px;
-}
-.budgetLine input {
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-  height: 27px;
-  padding: 0 7px;
-  text-align: right;
-  width: 76px;
-}
-.budgetLine input:focus {
-  border-color: var(--accent);
-  outline: none;
-}
-.budgetTrack {
-  background: var(--surface);
-  border-radius: 99px;
-  height: 6px;
-  overflow: hidden;
-}
-.budgetTrack span {
-  background: var(--accent-grad);
-  border-radius: inherit;
-  display: block;
-  height: 100%;
-}
-.projectCard.near .budgetTrack span {
-  background: var(--amber);
-}
-.projectCard.over .budgetTrack span {
-  background: var(--red);
-}
-.budgetCaption {
-  font-variant-numeric: tabular-nums;
-}
-.budgetUnset {
-  margin: 0;
-}
-.budgetError {
-  color: var(--red);
-  font-size: 11px;
-  margin: 0;
 }
 .projectExpand {
   background: transparent;
@@ -2366,8 +2293,7 @@ div.quotaError .linkBtn {
   .projectUsageHead > span {
     display: none;
   }
-  .projectCardHead,
-  .budgetLine {
+  .projectCardHead {
     align-items: flex-start;
   }
   .projectStats {

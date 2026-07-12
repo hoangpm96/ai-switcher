@@ -829,8 +829,6 @@ pub struct ProjectUsage {
     pub path: String,
     pub tokens: TokenBreakdown,
     pub cost_usd: Option<f64>,
-    /// Cost in the current local calendar month, independent of the selected report range.
-    pub month_cost_usd: Option<f64>,
     pub session_count: u32,
     pub last_active: String,
     pub daily: Vec<DayUsage>,
@@ -863,8 +861,6 @@ pub struct ToolUsage {
 #[serde(rename_all = "camelCase")]
 pub struct UsageReport {
     pub tools: Vec<ToolUsage>,
-    /// Monthly USD budgets keyed by absolute project path. A budget spans both CLI tools.
-    pub project_budgets: std::collections::BTreeMap<String, f64>,
     pub generated_at: String,
     /// "live" (just fetched), "cached" (LiteLLM cache on disk), or "unavailable".
     pub price_status: String,

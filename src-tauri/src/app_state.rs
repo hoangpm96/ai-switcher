@@ -775,40 +775,13 @@ impl ManagedState {
             .usage_scan
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let project_budgets = self
-            .data
-            .lock()
-            .map(|data| data.project_budgets.clone())
-            .unwrap_or_default();
         crate::usage::build_report(
             &self.store.usage_cache_path(),
             &self.store.price_cache_path(),
             &self.config_dirs(&ToolId::Claude),
             &self.config_dirs(&ToolId::Codex),
-            &project_budgets,
             range_days,
         )
-    }
-
-    pub fn set_project_budget(&self, project_path: String, budget_usd: f64) -> Result<()> {
-        let project_path = project_path.trim();
-        if project_path.is_empty() {
-            anyhow::bail!("Project path is required");
-        }
-        if !budget_usd.is_finite() || budget_usd < 0.0 {
-            anyhow::bail!("Budget must be a non-negative USD amount");
-        }
-        let mut data = self
-            .data
-            .lock()
-            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-        if budget_usd == 0.0 {
-            data.project_budgets.remove(project_path);
-        } else {
-            data.project_budgets
-                .insert(project_path.to_string(), budget_usd);
-        }
-        self.store.save(&data)
     }
 
     pub fn api_usage_report(&self) -> ApiUsageReport {
