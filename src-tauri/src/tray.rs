@@ -15,11 +15,18 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, Wry};
 use tauri_plugin_notification::NotificationExt;
 
-/// Tools shown in the tray, in order. Antigravity is intentionally excluded.
-const TRAY_TOOLS: [ToolId; 2] = [ToolId::Claude, ToolId::Codex];
+/// Tools shown in the tray, in order. Antigravity is intentionally excluded (switching it
+/// restarts the IDE — too heavy for a menu-bar click).
+const TRAY_TOOLS: [ToolId; 4] = [
+    ToolId::Claude,
+    ToolId::Codex,
+    ToolId::Cursor,
+    ToolId::Opencode,
+];
 
 const SWITCH_PREFIX: &str = "switch:";
 const REFRESH_PREFIX: &str = "refresh:";
+const OVERLAY_ID: &str = "tray:overlay";
 const OPEN_ID: &str = "tray:open";
 const QUIT_ID: &str = "tray:quit";
 
@@ -80,6 +87,21 @@ fn build_menu(app: &AppHandle, snapshot: Option<&AppSnapshot>) -> tauri::Result<
         }
     }
 
+    // Floating quota overlay on/off, checked when the window is up.
+    let overlay_on = app
+        .state::<ManagedState>()
+        .overlay_settings()
+        .map(|settings| settings.enabled)
+        .unwrap_or(false);
+    menu.append(&CheckMenuItem::with_id(
+        app,
+        OVERLAY_ID,
+        "Quota overlay",
+        true,
+        overlay_on,
+        None::<&str>,
+    )?)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(
         app,
         OPEN_ID,
@@ -97,6 +119,14 @@ fn build_menu(app: &AppHandle, snapshot: Option<&AppSnapshot>) -> tauri::Result<
     Ok(menu)
 }
 
+/// Parse the `<tool>` part of a tray menu id back into the tool it names.
+fn tray_tool_from_str(value: &str) -> Option<ToolId> {
+    TRAY_TOOLS
+        .iter()
+        .find(|tool_id| tool_id.as_str() == value)
+        .cloned()
+}
+
 fn append_refresh_section(
     app: &AppHandle,
     menu: &Menu<Wry>,
@@ -104,20 +134,14 @@ fn append_refresh_section(
 ) -> tauri::Result<()> {
     let refresh_menu = Submenu::with_id(app, "refresh:menu", "Refresh Quotas", true)?;
 
-    if installed_tools.contains(&ToolId::Claude) {
+    for tool_id in TRAY_TOOLS {
+        if !installed_tools.contains(&tool_id) {
+            continue;
+        }
         refresh_menu.append(&MenuItem::with_id(
             app,
-            "refresh:claude",
-            "Claude Code",
-            true,
-            None::<&str>,
-        )?)?;
-    }
-    if installed_tools.contains(&ToolId::Codex) {
-        refresh_menu.append(&MenuItem::with_id(
-            app,
-            "refresh:codex",
-            "Codex",
+            format!("{REFRESH_PREFIX}{}", tool_id.as_str()),
+            tool_id.display_name(),
             true,
             None::<&str>,
         )?)?;
@@ -214,6 +238,7 @@ fn handle_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     let id = event.id();
     match id.as_ref() {
         OPEN_ID => show_main_window(app),
+        OVERLAY_ID => toggle_overlay(app),
         QUIT_ID => app.exit(0),
         other if other.starts_with(SWITCH_PREFIX) => switch_from_id(app, id),
         other if other.starts_with(REFRESH_PREFIX) => refresh_from_id(app, id),
@@ -228,10 +253,8 @@ fn switch_from_id(app: &AppHandle, id: &MenuId) {
     let Some((tool_str, account_id)) = rest.split_once(':') else {
         return;
     };
-    let tool_id = match tool_str {
-        "claude" => ToolId::Claude,
-        "codex" => ToolId::Codex,
-        _ => return,
+    let Some(tool_id) = tray_tool_from_str(tool_str) else {
+        return;
     };
     let account_id = account_id.to_string();
     let app = app.clone();
@@ -253,11 +276,13 @@ fn switch_from_id(app: &AppHandle, id: &MenuId) {
 /// menu event handler stays responsive while quota endpoints are queried.
 fn refresh_from_id(app: &AppHandle, id: &MenuId) {
     let target = &id.as_ref()[REFRESH_PREFIX.len()..];
-    let tools: Vec<ToolId> = match target {
-        "claude" => vec![ToolId::Claude],
-        "codex" => vec![ToolId::Codex],
-        "all" => vec![ToolId::Claude, ToolId::Codex],
-        _ => return,
+    let tools: Vec<ToolId> = if target == "all" {
+        TRAY_TOOLS.to_vec()
+    } else {
+        match tray_tool_from_str(target) {
+            Some(tool_id) => vec![tool_id],
+            None => return,
+        }
     };
     let app = app.clone();
     std::thread::spawn(move || {
@@ -285,6 +310,20 @@ fn refresh_from_id(app: &AppHandle, id: &MenuId) {
         }
         rebuild(&app);
     });
+}
+
+/// Tray toggle for the floating quota overlay. Persists the new state so it survives a restart,
+/// then rebuilds the menu so the checkmark matches.
+fn toggle_overlay(app: &AppHandle) {
+    let state = app.state::<ManagedState>();
+    let enabled = state
+        .overlay_settings()
+        .map(|settings| settings.enabled)
+        .unwrap_or(false);
+    if let Ok(settings) = state.set_overlay_enabled(!enabled) {
+        crate::overlay::apply(app, &settings);
+    }
+    rebuild(app);
 }
 
 fn show_main_window(app: &AppHandle) {

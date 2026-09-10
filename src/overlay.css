@@ -1,0 +1,339 @@
+/* ============================================================
+   Floating quota overlay (window label "overlay")
+   Self-contained: the window is transparent, so nothing here
+   may rely on the main window's page background.
+   ============================================================ */
+
+html.ovWindow,
+html.ovWindow body,
+html.ovWindow #root {
+  background: transparent !important;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ovRoot {
+  /* --ov-alpha is set inline from the saved opacity setting. */
+  --ov-alpha: 0.9;
+  --ov-text: #f4efe8;
+  --ov-text-2: #b7ac9d;
+  --ov-text-3: #8a8073;
+  --ov-line: rgba(255, 255, 255, 0.09);
+  --ov-green: #34d399;
+  --ov-amber: #fcd34d;
+  --ov-red: #fb7185;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid var(--ov-line);
+  background: rgba(16, 14, 12, var(--ov-alpha));
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  backdrop-filter: blur(18px) saturate(150%);
+  color: var(--ov-text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  font-size: 11px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+/* ---------- title bar ---------- */
+
+.ovBar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 5px 6px 5px 9px;
+  border-bottom: 1px solid var(--ov-line);
+}
+
+.ovTitle {
+  flex: 1;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ov-text-3);
+}
+
+.ovIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 19px;
+  height: 19px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ov-text-3);
+  cursor: pointer;
+}
+
+.ovIcon:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--ov-text);
+}
+
+.ovIcon.on {
+  background: rgba(251, 106, 26, 0.18);
+  color: #fb8a2a;
+}
+
+.ovIcon:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ovSpin {
+  animation: ovSpin 0.9s linear infinite;
+}
+
+@keyframes ovSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- body ---------- */
+
+.ovBody {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.ovBody::-webkit-scrollbar {
+  width: 6px;
+}
+
+.ovBody::-webkit-scrollbar-thumb {
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.ovHint {
+  margin: 0;
+  color: var(--ov-text-3);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.ovRow {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ovRowHead {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.ovTool {
+  flex: 0 0 auto;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ov-text-2);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.ovName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.ovDot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ov-green);
+}
+
+.ovPlan {
+  flex: 0 0 auto;
+  color: var(--ov-text-3);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ovErr {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ov-red);
+  font-size: 10px;
+}
+
+/* ---------- quota bars ---------- */
+
+.ovBarRow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ovBarLabel {
+  /* Wide enough for the longest short label ("30d", "roll", "incl"). */
+  flex: 0 0 26px;
+  color: var(--ov-text-3);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ovBarTrack {
+  position: relative;
+  flex: 1;
+  min-width: 24px;
+  height: 5px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.ovBarFill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--ov-green);
+  transition: width 0.25s ease;
+}
+
+.ovBarTrack[data-level="mid"] .ovBarFill {
+  background: var(--ov-amber);
+}
+
+.ovBarTrack[data-level="high"] .ovBarFill {
+  background: var(--ov-red);
+}
+
+.ovBarTrack[data-level="unknown"] .ovBarFill {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.ovBarPct {
+  flex: 0 0 auto;
+  min-width: 27px;
+  text-align: right;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ovReset {
+  flex: 0 0 auto;
+  min-width: 38px;
+  text-align: right;
+  color: var(--ov-text-3);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- settings panel ---------- */
+
+.ovSettings {
+  gap: 5px;
+}
+
+.ovSectionTitle {
+  margin: 3px 0 1px;
+  color: var(--ov-text-3);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ovPick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 5px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ovPick:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.ovPick.on {
+  background: rgba(251, 106, 26, 0.14);
+}
+
+.ovPickBox {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 13px;
+  height: 13px;
+  border: 1px solid var(--ov-line);
+  border-radius: 4px;
+  color: #fb8a2a;
+}
+
+.ovOpt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ov-text-2);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.ovOpt input[type="checkbox"] {
+  accent-color: #fb6a1a;
+  margin: 0;
+}
+
+.ovSlider input[type="range"] {
+  flex: 1;
+  accent-color: #fb6a1a;
+}
+
+/* ---------- resize grip ---------- */
+
+.ovGrip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+  background: linear-gradient(
+    135deg,
+    transparent 0 48%,
+    rgba(255, 255, 255, 0.28) 48% 56%,
+    transparent 56% 74%,
+    rgba(255, 255, 255, 0.28) 74% 82%,
+    transparent 82%
+  );
+}

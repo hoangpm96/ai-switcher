@@ -224,6 +224,38 @@ fn config_candidate(
                 1,
             );
         }
+        ToolId::Cursor => {
+            add_evidence(
+                &mut evidence,
+                &mut score,
+                "cli-config.json",
+                path.join("cli-config.json").exists(),
+                2,
+            );
+            add_evidence(
+                &mut evidence,
+                &mut score,
+                "auth.json",
+                path.join("auth.json").exists(),
+                1,
+            );
+        }
+        ToolId::Opencode => {
+            add_evidence(
+                &mut evidence,
+                &mut score,
+                "opencode/auth.json",
+                path.join("opencode/auth.json").exists(),
+                2,
+            );
+            add_evidence(
+                &mut evidence,
+                &mut score,
+                "opencode dir",
+                path.join("opencode").is_dir(),
+                1,
+            );
+        }
         ToolId::Antigravity => {
             add_evidence(
                 &mut evidence,
@@ -458,7 +490,9 @@ fn env_config_dir(tool_id: &ToolId) -> Option<PathBuf> {
     let name = match tool_id {
         ToolId::Claude => "CLAUDE_CONFIG_DIR",
         ToolId::Codex => "CODEX_HOME",
-        ToolId::Antigravity => return None,
+        ToolId::Opencode => "XDG_DATA_HOME",
+        // Cursor resolves its config from HOME; there is no dedicated variable to honour.
+        ToolId::Cursor | ToolId::Antigravity => return None,
     };
     std::env::var_os(name)
         .map(PathBuf::from)

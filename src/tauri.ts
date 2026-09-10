@@ -10,6 +10,7 @@ import type {
   CreateApiGatewayKeyResult,
   CreateVirtualApiAccountInput,
   OrphanAccountDir,
+  OverlaySettings,
   PrimeNowInput,
   PrimeNowResult,
   RateLimitResetCredits,
@@ -63,6 +64,15 @@ const demoResetCredits: RateLimitResetCredits = {
       expiresAt: "2026-07-31T19:46:23Z",
     },
   ],
+};
+
+const demoOverlaySettings: OverlaySettings = {
+  enabled: false,
+  accounts: [],
+  opacity: 0.9,
+  compact: false,
+  clickThrough: false,
+  rect: { x: 40, y: 60, width: 288, height: 330 },
 };
 
 const demoSnapshot: AppSnapshot = {
@@ -153,6 +163,67 @@ const demoSnapshot: AppSnapshot = {
       ],
     },
     {
+      id: "cursor",
+      name: "Cursor CLI",
+      installed: true,
+      activeAccountId: "cur1",
+      accounts: [
+        {
+          id: "default-cursor", toolId: "cursor", name: "Machine default", state: "idle",
+          fingerprint: "default", createdAt: "2026-08-27T10:00:00Z", updatedAt: "2026-09-10T08:00:00Z",
+          lastUsedAt: null, launcherCommand: null, isDefault: true,
+          quota: {
+            fiveHour: { label: "Included usage", percentUsed: 35, resetAt: "2026-09-27T17:05:49Z" },
+            weekly: { label: "Named models (API)", percentUsed: 100, resetAt: "2026-09-27T17:05:49Z" },
+            models: [
+              { label: "Included usage", percentUsed: 35, resetAt: "2026-09-27T17:05:49Z" },
+              { label: "Auto models", percentUsed: 29, resetAt: "2026-09-27T17:05:49Z" },
+              { label: "Named models (API)", percentUsed: 100, resetAt: "2026-09-27T17:05:49Z" },
+            ],
+            plan: "Pro+", updatedAt: "2026-09-10T08:00:00Z", error: null,
+          },
+        },
+        {
+          id: "cur1", toolId: "cursor", name: "Work", state: "active",
+          fingerprint: "profile:cur1", createdAt: "2026-09-01T10:00:00Z", updatedAt: "2026-09-10T08:00:00Z",
+          lastUsedAt: "2026-09-10T07:00:00Z", launcherCommand: "cursor-agent-work", isDefault: false,
+          quota: {
+            fiveHour: { label: "Included usage", percentUsed: 12, resetAt: "2026-09-30T00:00:00Z" },
+            weekly: { label: "Named models (API)", percentUsed: 4, resetAt: "2026-09-30T00:00:00Z" },
+            models: [
+              { label: "Included usage", percentUsed: 12, resetAt: "2026-09-30T00:00:00Z" },
+              { label: "Auto models", percentUsed: 15, resetAt: "2026-09-30T00:00:00Z" },
+              { label: "Named models (API)", percentUsed: 4, resetAt: "2026-09-30T00:00:00Z" },
+            ],
+            plan: "Pro", updatedAt: "2026-09-10T08:00:00Z", error: null,
+          },
+        },
+      ],
+    },
+    {
+      id: "opencode",
+      name: "opencode",
+      installed: true,
+      activeAccountId: "default-opencode",
+      accounts: [
+        {
+          id: "default-opencode", toolId: "opencode", name: "Machine default", state: "active",
+          fingerprint: "default", createdAt: "2026-08-27T10:00:00Z", updatedAt: "2026-09-10T08:00:00Z",
+          lastUsedAt: null, launcherCommand: null, isDefault: true,
+          quota: {
+            fiveHour: { label: "Rolling", percentUsed: 12, resetAt: "2026-09-10T11:26:40Z" },
+            weekly: { label: "Weekly", percentUsed: 34, resetAt: "2026-09-14T00:00:00Z" },
+            models: [
+              { label: "Rolling", percentUsed: 12, resetAt: "2026-09-10T11:26:40Z" },
+              { label: "Weekly", percentUsed: 34, resetAt: "2026-09-14T00:00:00Z" },
+              { label: "Monthly", percentUsed: 56, resetAt: "2026-10-07T14:01:45Z" },
+            ],
+            plan: "Go", updatedAt: "2026-09-10T08:00:00Z", error: null,
+          },
+        },
+      ],
+    },
+    {
       id: "antigravity",
       name: "Antigravity",
       installed: false,
@@ -178,6 +249,7 @@ const demoUsage: UsageReport = {
       toolId: "claude",
       displayName: "Claude Code",
       estimate: true,
+      unpricedModels: [],
       total: tb(120_000, 480_000, 5_200_000, 1_300_000),
       totalCostUsd: 12.84,
       today: tb(8_000, 32_000, 410_000, 95_000),
@@ -207,6 +279,7 @@ const demoUsage: UsageReport = {
       toolId: "codex",
       displayName: "Codex",
       estimate: false,
+      unpricedModels: [],
       total: tb(900_000, 240_000, 3_100_000, 0),
       totalCostUsd: 6.42,
       today: tb(60_000, 18_000, 210_000, 0),
@@ -246,8 +319,15 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   }
 
   await new Promise((resolve) => window.setTimeout(resolve, 120));
-  if (command === "load_snapshot" || command === "refresh_tool") {
+  if (command === "load_snapshot" || command === "get_snapshot" || command === "refresh_tool") {
     return structuredClone(demoSnapshot) as T;
+  }
+  if (
+    command === "get_overlay_settings" ||
+    command === "set_overlay_settings" ||
+    command === "set_overlay_enabled"
+  ) {
+    return structuredClone({ ...demoOverlaySettings, ...(args?.input as object | undefined) }) as T;
   }
   if (command === "prime_now") {
     return { kind: "success", message: "Đã mở phiên mới — reset lúc 12:00" } as T;
@@ -464,6 +544,13 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
 
 export const api = {
   loadSnapshot: () => invoke<AppSnapshot>("load_snapshot"),
+  /** Cached snapshot without the pending-login recheck — for the overlay's polling. */
+  getSnapshot: () => invoke<AppSnapshot>("get_snapshot"),
+  getOverlaySettings: () => invoke<OverlaySettings>("get_overlay_settings"),
+  setOverlaySettings: (input: OverlaySettings) =>
+    invoke<OverlaySettings>("set_overlay_settings", { input }),
+  setOverlayEnabled: (enabled: boolean) =>
+    invoke<OverlaySettings>("set_overlay_enabled", { enabled }),
   refreshTool: (toolId: ToolId) => invoke<AppSnapshot>("refresh_tool", { toolId }),
   refreshAccount: (toolId: ToolId, accountId: string) =>
     invoke<AppSnapshot>("refresh_account", { toolId, accountId }),

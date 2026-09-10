@@ -3,7 +3,8 @@ use crate::models::{
     ApiGatewayConfig, ApiGatewayKey, ApiGatewayServerState, ApiGatewaySnapshot, ApiProvider,
     ApiUsageReport, AppSnapshot, AutoSwitchSetting, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
-    DeleteApiGatewayKeyInput, DetectionReport, QuotaInfo, RenameAccountInput,
+    DeleteApiGatewayKeyInput, DetectionReport, OverlayRect, OverlaySettings, QuotaInfo,
+    RenameAccountInput,
     SaveApiGatewayComboInput, SetApiGatewayAccountInput, SetLauncherInput, SetToolSetupInput,
     StartApiGatewayInput, SwitchAccountInput, ToolId, ToolStatus, UsageReport,
 };
@@ -392,7 +393,7 @@ impl ManagedState {
                 write_claude_proxy_settings(&profile, &base_url, &api_key, &model)?;
                 crate::tools::seed_onboarding(&input.tool_id, &profile);
             }
-            ToolId::Antigravity => unreachable!("guarded above"),
+            other => unreachable!("{} is guarded above", other.as_str()),
         }
         // Give the virtual account its own standalone command (`claude-api` / `codex-api`) so it can
         // be run in parallel from any terminal without "Use"-ing it as the active account. Failure
@@ -430,7 +431,7 @@ impl ManagedState {
             match input.tool_id {
                 ToolId::Claude => data.api_gateway.virtual_claude_enabled = true,
                 ToolId::Codex => data.api_gateway.virtual_codex_enabled = true,
-                ToolId::Antigravity => {}
+                _ => {}
             }
             if is_new {
                 data.accounts.push(Account {
@@ -749,6 +750,16 @@ impl ManagedState {
     }
 
     pub fn set_tool_setup(&self, input: SetToolSetupInput) -> Result<AppSnapshot> {
+        // An app-managed profile dir must never become the tool's default config dir: every other
+        // account symlinks its shared config/sessions back into the default dir, so pointing the
+        // default at profile B means deleting account B breaks all of them.
+        let app_root = canonical_path(&self.store.tool_accounts_root(&input.tool_id));
+        if canonical_path(&input.default_config_dir).starts_with(&app_root) {
+            anyhow::bail!(
+                "That folder is a profile this app manages — pick the tool's own config folder (e.g. ~/.claude, ~/.codex) instead"
+            );
+        }
+
         let (setup, _) = crate::detection::setup_from_manual(
             &input.tool_id,
             &self.store,
@@ -1092,6 +1103,70 @@ impl ManagedState {
         self.snapshot()
     }
 
+    /// Current settings of the always-on-top quota overlay.
+    pub fn overlay_settings(&self) -> Result<OverlaySettings> {
+        let data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        Ok(data.overlay.clone())
+    }
+
+    /// Persist overlay settings coming from the UI. Values are clamped here (not in the UI) so a
+    /// hand-edited `state.json` can't produce an invisible or off-screen overlay.
+    pub fn save_overlay_settings(&self, mut next: OverlaySettings) -> Result<OverlaySettings> {
+        next.opacity = if next.opacity.is_finite() {
+            next.opacity.clamp(0.25, 1.0)
+        } else {
+            1.0
+        };
+        // Order matters (it's the row order), so keep the first occurrence of each key.
+        let mut seen = std::collections::HashSet::new();
+        next.accounts.retain(|key| seen.insert(key.clone()));
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        // Geometry is owned by the window-move/resize handler, not by the settings form.
+        next.rect = data.overlay.rect;
+        data.overlay = next.clone();
+        self.store.save(&data)?;
+        Ok(next)
+    }
+
+    /// Remember where the user dragged/resized the overlay to. Called on every move/resize event,
+    /// so it only touches disk when the geometry actually changed.
+    pub fn set_overlay_rect(&self, rect: OverlayRect) -> Result<()> {
+        if !(rect.width.is_finite() && rect.height.is_finite() && rect.x.is_finite() && rect.y.is_finite()) {
+            return Ok(());
+        }
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        let current = data.overlay.rect;
+        let same = (current.x - rect.x).abs() < 1.0
+            && (current.y - rect.y).abs() < 1.0
+            && (current.width - rect.width).abs() < 1.0
+            && (current.height - rect.height).abs() < 1.0;
+        if same {
+            return Ok(());
+        }
+        data.overlay.rect = rect;
+        self.store.save(&data)
+    }
+
+    /// Flip only the `enabled` flag (tray toggle / overlay close button) and return the new value.
+    pub fn set_overlay_enabled(&self, enabled: bool) -> Result<OverlaySettings> {
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        data.overlay.enabled = enabled;
+        self.store.save(&data)?;
+        Ok(data.overlay.clone())
+    }
+
     /// Prepend one event line to the prime activity log so the NEWEST entry is at the TOP of the
     /// file (no scrolling to the bottom to see what just happened). The log is small, so rewriting
     /// it on each append is cheap. Written atomically (temp + rename) so a concurrent read never
@@ -1339,11 +1414,16 @@ impl ManagedState {
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
-            let active = data
-                .accounts
-                .iter()
-                .find(|a| a.tool_id == *tool_id && a.state == AccountState::Active);
-            // No active account (using Default) or the active one still has quota → no switch needed.
+            // Resolve the account in use from the active-profile file, NOT from `state == Active`:
+            // an account that just hit 100% is marked `Exhausted`, so matching on `Active` misses
+            // exactly the case auto-switch exists for.
+            let active_id = active_account_id_for(&self.store, tool_id, &data.accounts);
+            let active = active_id.as_deref().and_then(|id| {
+                data.accounts
+                    .iter()
+                    .find(|a| a.tool_id == *tool_id && a.id == id)
+            });
+            // No account in use, or the one in use still has quota → no switch needed.
             match active {
                 Some(active) if max_percent_used(active) >= threshold => {
                     best_replacement(&data.accounts, tool_id, threshold, Some(&active.id))
@@ -1662,7 +1742,7 @@ impl ManagedState {
                 // Skip the first-run wizard so the bare command / launcher start straight into a session.
                 crate::tools::seed_onboarding(&input.tool_id, &profile);
             }
-            ToolId::Antigravity => unreachable!("guarded above"),
+            other => unreachable!("{} is guarded above", other.as_str()),
         }
         if let Some(full) = &full_launcher {
             write_api_launcher(
@@ -1853,7 +1933,9 @@ impl ManagedState {
         }
 
         match input.tool_id {
-            ToolId::Claude | ToolId::Codex => {
+            // Every profile-based CLI switches the same way: point the active file at the chosen
+            // profile (or clear it for the machine default) and refresh the shell hook.
+            ToolId::Claude | ToolId::Codex | ToolId::Cursor | ToolId::Opencode => {
                 if is_default {
                     clear_active_profile(&input.tool_id, &self.store)
                         .context("Failed to switch account — kept the previous account")?;
@@ -1912,21 +1994,48 @@ impl ManagedState {
             if account.is_default {
                 anyhow::bail!("Can't delete the machine default account");
             }
-            (
-                account.launcher_command.clone(),
-                account.state == AccountState::Active,
-            )
+            // "In use" comes from the active-profile file, not from `state`: an account that ran
+            // out of quota is marked `Exhausted` while still being the one the plain command uses,
+            // and deleting it without clearing the active file leaves that file pointing at a
+            // profile dir that no longer exists.
+            let was_active =
+                active_account_id_for(&self.store, &tool_id, &data.accounts).as_deref()
+                    == Some(account_id.as_str());
+            (account.launcher_command.clone(), was_active)
         };
+
+        // Refuse if this account's folder is the tool's configured default config dir — other
+        // accounts symlink their shared config/sessions into it, so removing it breaks them all.
+        {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let account_dir = canonical_path(&self.store.account_dir(&tool_id, &account_id));
+            let configured = data
+                .tool_setups
+                .get(tool_id.as_str())
+                .and_then(|setup| setup.default_config_dir.as_ref())
+                .map(|dir| canonical_path(dir));
+            if configured.as_deref() == Some(account_dir.as_path()) {
+                anyhow::bail!(
+                    "This account's folder is set as the tool's default config folder — change it in Settings before deleting"
+                );
+            }
+        }
+
+        // Clear the pointer BEFORE removing the files, so a failure here aborts the delete instead
+        // of leaving the plain command aimed at a deleted profile.
+        if was_active && matches!(tool_id, ToolId::Claude | ToolId::Codex) {
+            clear_active_profile(&tool_id, &self.store)
+                .context("Couldn't clear the account in use — nothing was deleted")?;
+            install_shell_hook(&self.store)
+                .context("Couldn't update the shell hook — nothing was deleted")?;
+        }
 
         delete_account_files(&tool_id, &self.store, &account_id)?;
         if let Some(name) = launcher {
             remove_launcher(&name);
-        }
-        // Deleting the active account (the one the plain command uses) → clear the active file so
-        // the plain command falls back to the machine Default, NOT leaving it pointing to a deleted profile.
-        if was_active && matches!(tool_id, ToolId::Claude | ToolId::Codex) {
-            let _ = clear_active_profile(&tool_id, &self.store);
-            let _ = install_shell_hook(&self.store);
         }
 
         {
@@ -2135,7 +2244,14 @@ fn migrate_defaults(accounts: &mut Vec<Account>) {
     accounts.retain(|a| a.id != "system-default");
     // Antigravity (capture/swap) has no machine Default account — remove the old one if present.
     accounts.retain(|a| a.id != "default-antigravity");
-    for tool_id in [ToolId::Claude, ToolId::Codex] {
+    // Every profile-based CLI gets a "Machine default" row: the login the tool already has
+    // outside the app. Antigravity is excluded (it captures/swaps instead).
+    for tool_id in [
+        ToolId::Claude,
+        ToolId::Codex,
+        ToolId::Cursor,
+        ToolId::Opencode,
+    ] {
         let default_id = format!("default-{}", tool_id.as_str());
         if accounts.iter().any(|a| a.id == default_id) {
             continue;
@@ -2163,6 +2279,7 @@ fn migrate_defaults(accounts: &mut Vec<Account>) {
 
 fn migrate_auto_switch_settings(data: &mut StoredState) {
     let legacy = default_auto_switch_setting_from_legacy(data);
+    // Auto-switch stays on the two CLIs whose quota the app can act on mid-session.
     for tool_id in [ToolId::Claude, ToolId::Codex] {
         data.auto_switch_settings
             .entry(tool_id.as_str().to_string())
@@ -2182,7 +2299,13 @@ fn build_snapshot(
     status: crate::models::ApiGatewayStatus,
 ) -> AppSnapshot {
     let show_virtual_api = status.state == ApiGatewayServerState::Running;
-    let tools = [ToolId::Claude, ToolId::Codex, ToolId::Antigravity]
+    let tools = [
+        ToolId::Claude,
+        ToolId::Codex,
+        ToolId::Cursor,
+        ToolId::Opencode,
+        ToolId::Antigravity,
+    ]
         .into_iter()
         .map(|tool_id| {
             let mut accounts = data
@@ -2292,7 +2415,12 @@ fn redacted_api_gateway_config(data: &StoredState) -> ApiGatewayConfig {
 }
 
 fn autodetect_missing_tool_setups(store: &Store, data: &mut StoredState) {
-    for tool_id in [ToolId::Claude, ToolId::Codex] {
+    for tool_id in [
+        ToolId::Claude,
+        ToolId::Codex,
+        ToolId::Cursor,
+        ToolId::Opencode,
+    ] {
         if data.tool_setups.contains_key(tool_id.as_str()) {
             continue;
         }
@@ -2316,6 +2444,12 @@ fn is_installed_resolved(data: &StoredState, tool_id: &ToolId) -> bool {
 /// NOT inferred from `state==Active` (an exhausted account is still the one the plain command uses,
 /// but its state is Exhausted, so inferring from state would be wrong). Empty/missing file = machine Default.
 /// Antigravity is copy-swap (no active file), so it still follows `state==Active`.
+/// Resolve symlinks/`..` so two paths that name the same folder compare equal. Falls back to the
+/// path as given when it doesn't exist yet (canonicalize fails on missing paths).
+fn canonical_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn active_account_id_for(store: &Store, tool_id: &ToolId, accounts: &[Account]) -> Option<String> {
     if matches!(tool_id, ToolId::Antigravity) {
         // The account in use = the account whose token matches the IDE's current token in state.vscdb.
@@ -2424,6 +2558,8 @@ fn virtual_api_name(tool_id: &ToolId) -> &'static str {
     match tool_id {
         ToolId::Claude => "claude-api",
         ToolId::Codex => "codex-api",
+        ToolId::Cursor => "cursor-api",
+        ToolId::Opencode => "opencode-api",
         ToolId::Antigravity => "antigravity-api",
     }
 }

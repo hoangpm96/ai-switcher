@@ -1,4 +1,4 @@
-export type ToolId = "claude" | "codex" | "antigravity";
+export type ToolId = "claude" | "codex" | "cursor" | "opencode" | "antigravity";
 export type UsageToolId = ToolId | "all";
 
 export type AccountState = "idle" | "active" | "exhausted" | "needs-login";
@@ -40,6 +40,29 @@ export interface QuotaInfo {
   primeAvailable?: boolean;
   updatedAt: string | null;
   error: string | null;
+}
+
+/** Saved position/size of the floating quota overlay (logical pixels, screen coordinates). */
+export interface OverlayRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Settings of the always-on-top quota overlay window. */
+export interface OverlaySettings {
+  /** Overlay window shown (and restored on next app start). */
+  enabled: boolean;
+  /** `"<tool>:<accountId>"` rows to render. Empty = the account in use of each CLI. */
+  accounts: string[];
+  /** Background opacity, 0.25..1. */
+  opacity: number;
+  /** One line per account (weekly bar hidden). */
+  compact: boolean;
+  /** Clicks pass through to the app behind the overlay. */
+  clickThrough: boolean;
+  rect: OverlayRect;
 }
 
 export interface ApiProvider {
@@ -401,6 +424,9 @@ export interface ToolUsage {
   byModel: ModelUsage[];
   sessions: SessionUsage[];
   projects: ProjectUsage[];
+  /** Models with tokens but no price in the LiteLLM cache. Non-empty = every cost above is a
+   *  LOWER BOUND, so the UI must not present it as the full amount. */
+  unpricedModels: string[];
 }
 
 export interface UsageReport {

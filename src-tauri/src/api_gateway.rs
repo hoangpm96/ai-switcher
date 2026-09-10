@@ -12,6 +12,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -80,6 +81,19 @@ struct SelectedMember {
     key: String,
 }
 
+/// Upstream HTTP client. No overall request timeout on purpose — a streaming answer can legitimately
+/// run for many minutes — but a connect timeout and a per-read inactivity timeout, so an upstream
+/// that accepts the connection and then goes silent can't pin a request (and its pool connection)
+/// forever.
+fn build_upstream_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(180))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 pub fn start_server(store: Store, config: ApiGatewayConfig) -> Result<ApiServerHandle> {
     let addr = SocketAddr::new(
         config
@@ -91,7 +105,7 @@ pub fn start_server(store: Store, config: ApiGatewayConfig) -> Result<ApiServerH
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let state = GatewayState {
         store,
-        client: reqwest::Client::new(),
+        client: build_upstream_client(),
         runtime: Mutex::new(GatewayRuntime::default()),
     };
     let app = Router::new()
@@ -278,7 +292,8 @@ async fn handle_ai_request(
         let provider = match selected.tool_id {
             ToolId::Claude => ClientProtocol::Anthropic,
             ToolId::Codex => ClientProtocol::OpenAiResponses,
-            ToolId::Antigravity => unreachable!("Antigravity is not selectable for API combos"),
+            // Only the two subscription CLIs speak a protocol the gateway can proxy.
+            other => unreachable!("{} is not selectable for API combos", other.as_str()),
         };
         let request_body = match (protocol, provider) {
             (left, right) if left == right => request_body,
@@ -306,7 +321,7 @@ async fn handle_ai_request(
         let builder = match selected.tool_id {
             ToolId::Claude => build_claude_request(&state, &data, &selected.account, request_body),
             ToolId::Codex => build_codex_request(&state, &data, &selected.account, request_body),
-            ToolId::Antigravity => unreachable!("guarded above"),
+            _ => unreachable!("guarded above"),
         };
         let builder = match builder {
             Ok(builder) => builder,
@@ -1335,11 +1350,12 @@ pub fn discover_account_models(
     binary: Option<&FsPath>,
 ) -> ApiGatewayModelRegistry {
     let config_dir = account_config_dir(store, data, account);
-    let result = match account.tool_id {
+    let result = match &account.tool_id {
         ToolId::Claude => discover_claude_models(&config_dir),
         ToolId::Codex => discover_codex_models(&config_dir, binary),
-        ToolId::Antigravity => Err(anyhow::anyhow!(
-            "Antigravity is not supported by the API gateway"
+        other => Err(anyhow::anyhow!(
+            "{} is not supported by the API gateway",
+            other.display_name()
         )),
     };
     match result {
@@ -1483,6 +1499,33 @@ fn parse_codex_model_response(response: &Value) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Upper bound for a response the gateway has to hold in memory (non-streaming answers only —
+/// streamed ones are forwarded chunk by chunk and are not subject to this).
+const MAX_BUFFERED_RESPONSE: usize = 64 * 1024 * 1024;
+
+/// Drain the rest of an upstream body into memory, starting from an already-read first chunk.
+/// Fails instead of growing without bound when an upstream sends more than the cap.
+async fn collect_body(
+    first: Option<Bytes>,
+    mut upstream: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin,
+) -> std::result::Result<Bytes, String> {
+    let mut buffer = Vec::new();
+    if let Some(chunk) = first {
+        buffer.extend_from_slice(&chunk);
+    }
+    while let Some(chunk) = upstream.next().await {
+        let chunk = chunk.map_err(|err| format!("Upstream response failed: {err}"))?;
+        if buffer.len() + chunk.len() > MAX_BUFFERED_RESPONSE {
+            return Err(format!(
+                "Upstream response exceeded {} MB",
+                MAX_BUFFERED_RESPONSE / (1024 * 1024)
+            ));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buffer))
+}
+
 async fn translate_response(
     store: &Store,
     response: reqwest::Response,
@@ -1527,18 +1570,26 @@ async fn translate_response(
     }
 
     // We force Codex upstream to stream, and some providers send SSE without a clear content-type,
-    // so buffer the body and detect SSE by its shape too (not only the header).
-    let body = match response.bytes().await {
-        Ok(body) => body,
-        Err(err) => {
-            return api_error(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                format!("Upstream response failed: {err}"),
-            )
+    // so the shape of the body decides too. Only the FIRST chunk is read for that sniff — the rest
+    // is either forwarded chunk by chunk (real streaming) or collected under a size cap.
+    let mut upstream = response.bytes_stream();
+    let first = loop {
+        match upstream.next().await {
+            // Skip empty keep-alive chunks so the sniff sees actual bytes.
+            Some(Ok(chunk)) if chunk.is_empty() => continue,
+            Some(Ok(chunk)) => break Some(chunk),
+            Some(Err(err)) => {
+                return api_error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    format!("Upstream response failed: {err}"),
+                )
+            }
+            None => break None,
         }
     };
-    let head = String::from_utf8_lossy(&body[..body.len().min(64)]);
+    let head_bytes = first.as_deref().unwrap_or_default();
+    let head = String::from_utf8_lossy(&head_bytes[..head_bytes.len().min(64)]);
     let head = head.trim_start();
     let looks_like_sse = content_type.contains("text/event-stream")
         || head.starts_with("event:")
@@ -1546,27 +1597,59 @@ async fn translate_response(
 
     if looks_like_sse {
         if client_wants_stream {
-            // Translate the SSE stream into the client's protocol on the fly.
+            // Forward the SSE as it arrives — the client sees tokens while upstream is still
+            // generating, and the gateway never holds a whole answer in memory. The sniffer keeps
+            // partial lines across chunks; its `UsageRecorder` records on drop, i.e. at stream end.
             let recorder = UsageRecorder::new(store, model, key_id, member, provider);
             let translate = provider != client;
-            let mut sniffer =
-                StreamUsageSniffer::new(provider, client, model.to_string(), recorder);
-            let out = if translate {
-                sniffer.push_translate(&body)
-            } else {
-                sniffer.push_passthrough(&body);
-                String::from_utf8_lossy(&body).into_owned()
-            };
+            let sniffer = StreamUsageSniffer::new(provider, client, model.to_string(), recorder);
+            let stream = futures_util::stream::unfold(
+                (upstream, sniffer, first, false),
+                move |(mut upstream, mut sniffer, pending, failed)| async move {
+                    if failed {
+                        return None;
+                    }
+                    let next = match pending {
+                        Some(chunk) => Some(Ok(chunk)),
+                        None => upstream.next().await,
+                    };
+                    match next {
+                        Some(Ok(chunk)) => {
+                            let out = if translate {
+                                Bytes::from(sniffer.push_translate(&chunk))
+                            } else {
+                                sniffer.push_passthrough(&chunk);
+                                chunk
+                            };
+                            Some((
+                                Ok::<Bytes, std::io::Error>(out),
+                                (upstream, sniffer, None, false),
+                            ))
+                        }
+                        Some(Err(err)) => Some((
+                            Err(std::io::Error::other(err.to_string())),
+                            (upstream, sniffer, None, true),
+                        )),
+                        None => None,
+                    }
+                },
+            );
             return (
                 status,
                 [(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("text/event-stream"),
                 )],
-                out,
+                axum::body::Body::from_stream(stream),
             )
                 .into_response();
         }
+
+        // Client asked for one JSON answer, so the stream has to be collected first.
+        let body = match collect_body(first, upstream).await {
+            Ok(body) => body,
+            Err(message) => return api_error(StatusCode::BAD_GATEWAY, "upstream_error", message),
+        };
         // Client wants a single JSON answer: collapse the SSE into the final response object,
         // record usage, then translate to the client's JSON shape.
         let value = aggregate_sse_to_json(&body, provider);
@@ -1575,6 +1658,10 @@ async fn translate_response(
         return (status, Json(translated)).into_response();
     }
 
+    let body = match collect_body(first, upstream).await {
+        Ok(body) => body,
+        Err(message) => return api_error(StatusCode::BAD_GATEWAY, "upstream_error", message),
+    };
     let value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
@@ -1591,6 +1678,23 @@ async fn translate_response(
     );
     let translated = translate_json_response(value, provider, client, model);
     (status, Json(translated)).into_response()
+}
+
+/// Combine two Anthropic usage objects into one: fields from `later` win when present and non-zero,
+/// everything else is kept from `earlier`. Either side may be missing.
+fn merge_usage_objects(earlier: Option<Value>, later: Option<Value>) -> Option<Value> {
+    match (earlier, later) {
+        (Some(Value::Object(mut base)), Some(Value::Object(over))) => {
+            for (key, value) in over {
+                let keep_base = value.as_i64() == Some(0) && base.contains_key(&key);
+                if !keep_base {
+                    base.insert(key, value);
+                }
+            }
+            Some(Value::Object(base))
+        }
+        (earlier, later) => later.or(earlier),
+    }
 }
 
 /// Collapse a buffered SSE body into the single final response JSON for the given provider.
@@ -1644,11 +1748,14 @@ fn aggregate_sse_to_json(body: &[u8], provider: ClientProtocol) -> Value {
                     }
                 }
             }
-            let usage = events
+            // Anthropic splits usage across two events: `message_start` carries the input and
+            // cache counts, `message_delta` carries the final output count. Taking only the last
+            // one reported 0 input tokens for every streamed answer.
+            let start_usage = events
                 .iter()
-                .rev()
-                .find_map(|e| e.pointer("/usage").cloned())
-                .or_else(|| events.iter().find_map(|e| e.pointer("/message/usage").cloned()));
+                .find_map(|e| e.pointer("/message/usage").cloned());
+            let delta_usage = events.iter().rev().find_map(|e| e.pointer("/usage").cloned());
+            let usage = merge_usage_objects(start_usage, delta_usage);
             json!({
                 "type": "message",
                 "role": "assistant",
@@ -1716,6 +1823,10 @@ fn record_api_usage(
     tokens: TokenBreakdown,
 ) {
     let account_id = member.account.id.clone();
+    // Held across the whole read-modify-write below.
+    let _guard = API_USAGE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut report = read_api_usage(store);
     let now = chrono::Utc::now().to_rfc3339();
     if let Some(row) = report.rows.iter_mut().find(|row| {
@@ -1746,10 +1857,25 @@ fn record_api_usage(
             total.add(&row.tokens);
             total
         });
-    let _ = std::fs::write(
-        store.api_usage_path(),
-        serde_json::to_vec_pretty(&report).unwrap_or_default(),
-    );
+    write_api_usage(store, &report);
+}
+
+/// Serializes the read-modify-write of `api_usage.json`. Two requests finishing at the same moment
+/// would otherwise both read the pre-update file and the second write would drop the first one's
+/// tokens.
+static API_USAGE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Write the usage report atomically (temp file + rename) so a concurrent reader never sees a
+/// half-written file.
+fn write_api_usage(store: &Store, report: &ApiUsageReport) {
+    let path = store.api_usage_path();
+    let tmp = path.with_extension("json.tmp");
+    let Ok(bytes) = serde_json::to_vec_pretty(report) else {
+        return;
+    };
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
 }
 
 fn read_api_usage(store: &Store) -> ApiUsageReport {

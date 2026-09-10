@@ -28,7 +28,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -51,6 +51,7 @@ import type {
   CreateApiGatewayKeyInput,
   DetectionReport,
   OrphanAccountDir,
+  OverlaySettings,
   PrimeNowDone,
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
@@ -70,11 +71,39 @@ function gatewayHost(baseUrl: string) {
   }
 }
 
+/** The plain command each CLI installs. The account "in use" is the one this command runs as. */
+const bareCommands: Record<ToolId, string> = {
+  claude: "claude",
+  codex: "codex",
+  cursor: "cursor-agent",
+  opencode: "opencode",
+  antigravity: "",
+};
+
+/** The command name each tool's per-account launcher must start with (mirrors `launcher_prefix`
+ *  in tools.rs — the backend rejects anything else). */
+const launcherPrefixes: Record<ToolId, string> = {
+  claude: "claude-",
+  codex: "codex-",
+  cursor: "cursor-agent-",
+  opencode: "opencode-",
+  antigravity: "",
+};
+
+/** Example command shown as the placeholder, e.g. `cursor-agent-work`. */
+function launcherExample(toolId: ToolId, suffix = "work") {
+  return `${launcherPrefixes[toolId]}${suffix}`;
+}
+
 const toolDescriptions: Record<ToolId, string> = {
   claude:
     "The bare `claude` command follows the selected account (Use button). Each account also has its own `claude-…` command to run in parallel in another terminal.",
   codex:
     "The bare `codex` command follows the selected account (Use button). Each account also has its own `codex-…` command to run in parallel in another terminal.",
+  cursor:
+    "The bare `cursor-agent` command follows the selected account (Use button). Each account also has its own `cursor-agent-…` command to run in parallel in another terminal.",
+  opencode:
+    "The bare `opencode` command follows the selected account (Use button). Each account also has its own `opencode-…` command to run in parallel in another terminal.",
   antigravity:
     "Save Antigravity IDE login sessions to switch between them. Click Use: the app quits the IDE, loads that account's token, then reopens the IDE.",
 };
@@ -106,6 +135,21 @@ const emptySnapshot: AppSnapshot = {
 
 export function App() {
   const [snapshot, setSnapshot] = useState<AppSnapshot>(emptySnapshot);
+  // Every full-snapshot fetch takes a ticket, and only the newest ticket may write state. Without
+  // this a background quota poll that started before a switch/delete could land afterwards and put
+  // the pre-action snapshot back on screen.
+  const snapshotSeq = useRef(0);
+  const takeSnapshotTicket = useCallback(() => (snapshotSeq.current += 1), []);
+  /** Apply a READ result, unless something newer happened meanwhile. */
+  const applySnapshot = useCallback((ticket: number, next: AppSnapshot) => {
+    if (ticket === snapshotSeq.current) setSnapshot(next);
+  }, []);
+  /** Apply an AUTHORITATIVE snapshot (result of a user action, or a push from the backend):
+   *  it always wins and invalidates every read still in flight. */
+  const commitSnapshot = useCallback((next: AppSnapshot) => {
+    snapshotSeq.current += 1;
+    setSnapshot(next);
+  }, []);
   const [selectedTool, setSelectedTool] = useState<ToolId>("claude");
   const [view, setView] = useState<"accounts" | "api" | "usage" | "settings">("accounts");
   // One unified notification channel for the whole app: success + error both render as a
@@ -144,8 +188,9 @@ export function App() {
   const load = useCallback(async () => {
     setBusy("load");
     setError(null);
+    const ticket = takeSnapshotTicket();
     try {
-      setSnapshot(await api.loadSnapshot());
+      applySnapshot(ticket, await api.loadSnapshot());
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -160,7 +205,7 @@ export function App() {
   // Backend pushes a fresh snapshot when a login finishes / a background auto-switch happens.
   useEffect(() => {
     const unlisten = listen<AppSnapshot>("snapshot-changed", (event) => {
-      setSnapshot(event.payload);
+      commitSnapshot(event.payload);
     });
     return () => {
       void unlisten.then((fn) => fn());
@@ -181,12 +226,19 @@ export function App() {
     const tick = () => {
       if (cancelled || inFlight) return;
       inFlight = true;
-      Promise.allSettled([
-        api.refreshTool("claude").then(setSnapshot),
-        api.refreshTool("codex").then(setSnapshot),
-      ]).finally(() => {
-        inFlight = false;
-      });
+      const ticket = takeSnapshotTicket();
+      // Read the combined snapshot once BOTH refreshes are done: each `refresh_tool` returns a
+      // snapshot built at its own return time, so applying them individually could show the older
+      // of the two. `get_snapshot` is the in-memory state, so this extra call is cheap.
+      Promise.allSettled([api.refreshTool("claude"), api.refreshTool("codex")])
+        .then(() => api.getSnapshot())
+        .then((next) => {
+          if (!cancelled) applySnapshot(ticket, next);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          inFlight = false;
+        });
     };
     const start = () => {
       if (cancelled || timer !== undefined) return;
@@ -202,7 +254,22 @@ export function App() {
 
     // Register the focus listener BEFORE reading the current focus, so we can't miss a blur that
     // happens between the isFocused() read and the listener being installed.
-    const appWindow = getCurrentWindow();
+    //
+    // Outside the desktop app (browser dev fallback, `npm run dev`) there is no Tauri window and
+    // this throws — which used to take the whole App tree down with it, leaving a blank page.
+    const appWindow = (() => {
+      try {
+        return getCurrentWindow();
+      } catch {
+        return null;
+      }
+    })();
+    if (!appWindow) {
+      tick(); // no focus events in the browser: just load once
+      return () => {
+        cancelled = true;
+      };
+    }
     void appWindow
       .onFocusChanged(({ payload: focused }) => {
         if (cancelled) return;
@@ -295,7 +362,7 @@ export function App() {
     setError(null);
     try {
       const next = await task();
-      setSnapshot(next);
+      commitSnapshot(next);
       if (success) setToast(success);
       if (notice) setSwitchNotice(notice);
       return true;
@@ -327,8 +394,11 @@ export function App() {
           ),
         };
       });
-    } catch {
-      // quota error is surfaced inside account.quota.error — no global toast needed
+    } catch (err) {
+      // A quota problem comes back INSIDE `account.quota.error` and needs no toast; reaching this
+      // catch means the command itself failed (IPC/IO), which the user would otherwise never see —
+      // the spinner would just stop with nothing changed.
+      notify(errorMessage(err), "error");
     } finally {
       setRefreshingAccounts((prev) => {
         const next = new Set(prev);
@@ -742,7 +812,7 @@ export function App() {
         <NameDialog
           title={`Custom command (${currentTool.id}-…)`}
           label="Command name"
-          hint={`Forces the ${currentTool.id}- prefix, only a-z 0-9 - _`}
+          hint={`Forces the ${launcherPrefixes[currentTool.id]} prefix, only a-z 0-9 - _`}
           initialName={selectedAccount.launcherCommand ?? ""}
           maxLength={47}
           submitText="Save command"
@@ -789,6 +859,8 @@ function SettingsView({
   onAutoSwitchChange: (toolId: ToolId, enabled: boolean, threshold: number) => void;
 }) {
   const cliTools = snapshot.tools.filter((tool) => tool.id !== "antigravity");
+  // Auto-switch reacts to a 5-hour window running out — only Claude and Codex have one.
+  const autoSwitchTools = cliTools.filter((tool) => tool.id === "claude" || tool.id === "codex");
   const [wakeHelperInstalled, setWakeHelperInstalled] = useState(false);
   const [wakeHelperBusy, setWakeHelperBusy] = useState(false);
 
@@ -860,7 +932,7 @@ function SettingsView({
               <small>Configure quota fallback separately for each CLI.</small>
             </div>
           </div>
-          {cliTools.map((tool) => {
+          {autoSwitchTools.map((tool) => {
             const setting = snapshot.autoSwitchSettings[tool.id] ?? {
               enabled: snapshot.autoSwitch,
               threshold: snapshot.autoSwitchThreshold,
@@ -876,6 +948,17 @@ function SettingsView({
               />
             );
           })}
+        </div>
+
+        <div className="settingsSection">
+          <div className="settingsSectionHead">
+            <Layers />
+            <div>
+              <strong>Overlay quota</strong>
+              <small>Cửa sổ nhỏ nổi trên mọi app để xem quota trong lúc code.</small>
+            </div>
+          </div>
+          <OverlaySettingsBar snapshot={snapshot} notify={notify} />
         </div>
 
         <div className="settingsSection">
@@ -920,6 +1003,145 @@ function SettingsView({
         </div>
       </div>
     </section>
+  );
+}
+
+/** Overlay controls in Settings: on/off, which accounts it shows, opacity, click-through.
+ *  Mirrors the overlay's own gear panel — needed here because click-through makes the overlay
+ *  itself unclickable, so this is the way back. */
+function OverlaySettingsBar({
+  snapshot,
+  notify,
+}: {
+  snapshot: AppSnapshot;
+  notify: (text: string, kind?: "success" | "error" | "info") => void;
+}) {
+  const [settings, setSettings] = useState<OverlaySettings | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getOverlaySettings()
+      .then((next) => {
+        if (!cancelled) setSettings(next);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // The overlay's own gear panel writes the same settings — stay in sync with it.
+  useEffect(() => {
+    const unlisten = listen<OverlaySettings>("overlay-settings-changed", (event) =>
+      setSettings(event.payload),
+    );
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const save = async (next: OverlaySettings) => {
+    setSettings(next);
+    try {
+      setSettings(await api.setOverlaySettings(next));
+    } catch (err) {
+      notify(errorMessage(err), "error");
+    }
+  };
+
+  if (!settings) return null;
+
+  const picked = new Set(settings.accounts);
+  const rows = snapshot.tools.flatMap((tool) =>
+    tool.accounts.map((account) => ({
+      key: `${tool.id}:${account.id}`,
+      toolName: tool.name,
+      account,
+      active: tool.activeAccountId === account.id,
+    })),
+  );
+
+  const toggleAccount = (key: string) => {
+    void save({
+      ...settings,
+      accounts: picked.has(key)
+        ? settings.accounts.filter((item) => item !== key)
+        : [...settings.accounts, key],
+    });
+  };
+
+  return (
+    <div className="overlaySettings">
+      <div className="wakeRow">
+        <div className="wakeText">
+          <strong>Hiện overlay</strong>
+          <span className="muted">
+            Luôn nổi trên cùng, kéo để di chuyển, kéo góc dưới phải để đổi kích thước. Bật/tắt nhanh
+            ở menu bar.
+          </span>
+        </div>
+        <button onClick={() => void save({ ...settings, enabled: !settings.enabled })}>
+          {settings.enabled ? "Tắt overlay" : "Bật overlay"}
+        </button>
+      </div>
+
+      <div className="overlayPicks">
+        <span className="overlayPicksLabel">Account hiển thị</span>
+        {rows.length === 0 ? (
+          <p className="orphanHint">Chưa có account nào.</p>
+        ) : (
+          <div className="overlayPickList">
+            {rows.map((row) => (
+              <button
+                key={row.key}
+                type="button"
+                className={`overlayPick ${picked.has(row.key) ? "on" : ""}`}
+                onClick={() => toggleAccount(row.key)}
+              >
+                {picked.has(row.key) && <Check size={12} />}
+                {row.toolName} · {row.account.name}
+                {row.active && " ●"}
+              </button>
+            ))}
+          </div>
+        )}
+        <p className="orphanHint">Bỏ chọn hết = tự hiện account đang dùng của mỗi CLI.</p>
+      </div>
+
+      <div className="overlayOptions">
+        <label>
+          <input
+            type="checkbox"
+            checked={settings.compact}
+            onChange={(event) => void save({ ...settings, compact: event.target.checked })}
+          />
+          Gọn (chỉ mốc 5 giờ)
+        </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={settings.clickThrough}
+            onChange={(event) => void save({ ...settings, clickThrough: event.target.checked })}
+          />
+          Cho chuột xuyên qua
+        </label>
+        <label className="overlayOpacity">
+          Độ mờ
+          <input
+            type="range"
+            min={25}
+            max={100}
+            step={5}
+            value={Math.round(settings.opacity * 100)}
+            onChange={(event) =>
+              void save({ ...settings, opacity: Number(event.target.value) / 100 })
+            }
+          />
+          <span>{Math.round(settings.opacity * 100)}%</span>
+        </label>
+      </div>
+    </div>
   );
 }
 
@@ -1135,16 +1357,44 @@ function ApiGatewayView({
   }, [gateway.config.modelRegistry]);
 
   useEffect(() => {
-    api.getApiUsage().then(setUsage).catch(() => setUsage(null));
+    let cancelled = false;
+    api
+      .getApiUsage()
+      .then((next) => {
+        if (!cancelled) setUsage(next);
+      })
+      .catch(() => {
+        if (!cancelled) setUsage(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [gateway.status.state, gateway.config.combos.length]);
 
   useEffect(() => {
     if (!running) return;
+    let cancelled = false;
+    // One request at a time: at a 5s cadence a slower reply would otherwise overlap the next tick,
+    // and an out-of-order answer would show older numbers than the ones already on screen.
+    let inFlight = false;
     const timer = window.setInterval(() => {
+      if (inFlight) return;
+      inFlight = true;
       void onRefresh().catch(() => {});
-      void api.getApiUsage().then(setUsage).catch(() => {});
+      void api
+        .getApiUsage()
+        .then((next) => {
+          if (!cancelled) setUsage(next);
+        })
+        .catch(() => {})
+        .finally(() => {
+          inFlight = false;
+        });
     }, 5_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
   }, [onRefresh, running]);
 
   const submitStart = async () => {
@@ -1910,6 +2160,8 @@ async function copyToClipboard(text: string): Promise<boolean> {
 const FALLBACK_MODELS: Record<ToolId, string[]> = {
   claude: [],
   codex: [],
+  cursor: [],
+  opencode: [],
   antigravity: [],
 };
 
@@ -2027,13 +2279,23 @@ function AccountCard({
                   <Copy />
                 </button>
               )}
+              {/* The account in use is what the plain command runs — show which command that is,
+                  instead of repeating "Machine default" under a card already titled that. */}
+              {isActive && bareCommands[account.toolId] && (
+                <button
+                  className="cmdChip bare"
+                  onClick={() => onCopy(bareCommands[account.toolId])}
+                  title={`The plain \`${bareCommands[account.toolId]}\` command runs this account — click to copy`}
+                >
+                  <code>{bareCommands[account.toolId]}</code>
+                  <Copy />
+                </button>
+              )}
             </div>
-            {isApi ? (
+            {isApi && (
               <span className="fingerprint" title={account.apiProvider!.baseUrl}>
                 via {gatewayHost(account.apiProvider!.baseUrl)}
               </span>
-            ) : (
-              account.isDefault && <span className="fingerprint">Machine default</span>
             )}
           </div>
         </div>
@@ -2221,13 +2483,24 @@ function Quota({
     );
   }
 
-  // Antigravity: quota is reported per model instead of as a single overall window.
+  // Some providers report more than the 5h + weekly pair: Antigravity one window per model,
+  // Cursor and opencode several usage buckets. When they do, that list IS the quota.
   if (quota.models && quota.models.length > 0) {
+    // Cursor's three buckets all reset at the end of the same billing period — printing the same
+    // stamp on every row is just noise, so a repeated one is dropped.
     return (
       <div className="quotaBox">
-        <span className="quotaTitle">Quota by model</span>
-        {quota.models.map((model) => (
-          <QuotaBar key={model.label} label={model.label} percent={model.percentUsed} resetAt={model.resetAt} />
+        {quota.models.map((window, index) => (
+          <QuotaBar
+            key={window.label}
+            label={window.label}
+            percent={window.percentUsed}
+            resetAt={
+              index > 0 && window.resetAt === quota.models?.[index - 1].resetAt
+                ? null
+                : window.resetAt
+            }
+          />
         ))}
       </div>
     );
@@ -2235,8 +2508,16 @@ function Quota({
 
   return (
     <div className="quotaBox">
-      <QuotaBar label="5-hour limit" percent={quota.fiveHour.percentUsed} resetAt={quota.fiveHour.resetAt} />
-      <QuotaBar label="Weekly limit" percent={quota.weekly.percentUsed} resetAt={quota.weekly.resetAt} />
+      <QuotaBar
+        label={quota.fiveHour.label || "5-hour limit"}
+        percent={quota.fiveHour.percentUsed}
+        resetAt={quota.fiveHour.resetAt}
+      />
+      <QuotaBar
+        label={quota.weekly.label || "Weekly limit"}
+        percent={quota.weekly.percentUsed}
+        resetAt={quota.weekly.resetAt}
+      />
     </div>
   );
 }
@@ -2373,6 +2654,9 @@ function AddDialog({
   const [customModel, setCustomModel] = useState("");
   const [modelsOutdated, setModelsOutdated] = useState(false);
   const [bypass, setBypass] = useState(false);
+  // Creating an account shells out to the CLI and can take a while with no visible change in the
+  // dialog — without this guard a second click starts a second login/account.
+  const [submitting, setSubmitting] = useState(false);
 
   const updateGatewayDetail = (field: "baseUrl" | "apiKey", value: string) => {
     if (field === "baseUrl") setBaseUrl(value);
@@ -2411,23 +2695,30 @@ function AddDialog({
   };
 
   const submit = async () => {
+    if (submitting) return;
     if (name.trim().length > 20) {
       setMessage("Account name is limited to 20 characters");
       return;
     }
     if (isCli && launcher.trim() === "") {
-      setMessage(`A custom command is required (e.g. ${tool.id}-work)`);
+      setMessage(`A custom command is required (e.g. ${launcherExample(tool.id)})`);
       return;
     }
-    await onSubmit({
-      toolId: tool.id,
-      name: name.trim(),
-      mode: isCli ? "login" : "import",
-      launcher: isCli ? launcher.trim() : undefined,
-    });
+    setSubmitting(true);
+    try {
+      await onSubmit({
+        toolId: tool.id,
+        name: name.trim(),
+        mode: isCli ? "login" : "import",
+        launcher: isCli ? launcher.trim() : undefined,
+      });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const submitApi = async () => {
+    if (submitting) return;
     if (name.trim().length > 20) {
       setMessage("Account name is limited to 20 characters");
       return;
@@ -2437,15 +2728,20 @@ function AddDialog({
       setMessage("Enter a model");
       return;
     }
-    await onSubmitApi({
-      toolId: tool.id,
-      name: name.trim(),
-      baseUrl: baseUrl.trim(),
-      apiKey: apiKey.trim(),
-      model: normalizedModel,
-      launcher: launcher.trim() || undefined,
-      bypass,
-    });
+    setSubmitting(true);
+    try {
+      await onSubmitApi({
+        toolId: tool.id,
+        name: name.trim(),
+        baseUrl: baseUrl.trim(),
+        apiKey: apiKey.trim(),
+        model: normalizedModel,
+        launcher: launcher.trim() || undefined,
+        bypass,
+      });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -2489,7 +2785,7 @@ function AddDialog({
               Custom command (required)
               <span
                 className="helpDot"
-                title={`Open a terminal and run this command to use the account separately, in parallel. Forces the ${tool.id}- prefix, only a-z 0-9 - _`}
+                title={`Open a terminal and run this command to use the account separately, in parallel. Forces the ${launcherPrefixes[tool.id]} prefix, only a-z 0-9 - _`}
               >
                 <CircleHelp />
               </span>
@@ -2497,7 +2793,7 @@ function AddDialog({
             <input
               value={launcher}
               onChange={(event) => setLauncher(event.target.value)}
-              placeholder={`${tool.id}-work`}
+              placeholder={launcherExample(tool.id)}
             />
           </label>
         )}
@@ -2570,7 +2866,7 @@ function AddDialog({
                 Custom command (optional)
                 <span
                   className="helpDot"
-                  title={`A separate command (e.g. ${tool.id}-p) to use this account in its own terminal. Forces the ${tool.id}- prefix.`}
+                  title={`A separate command (e.g. ${launcherExample(tool.id, "p")}) to use this account in its own terminal. Forces the ${launcherPrefixes[tool.id]} prefix.`}
                 >
                   <CircleHelp />
                 </span>
@@ -2578,7 +2874,7 @@ function AddDialog({
               <input
                 value={launcher}
                 onChange={(event) => setLauncher(event.target.value)}
-                placeholder={`${tool.id}-p`}
+                placeholder={launcherExample(tool.id, "p")}
               />
             </label>
 
@@ -2601,8 +2897,11 @@ function AddDialog({
         )}
         {message && <p className="quotaError">{message}</p>}
         <div className="modalActions">
-          <button onClick={onClose}>Cancel</button>
-          <button className="primary" onClick={isApi ? submitApi : submit}>
+          <button onClick={onClose} disabled={submitting}>
+            Cancel
+          </button>
+          <button className="primary" onClick={isApi ? submitApi : submit} disabled={submitting}>
+            {submitting && <Loader2 className="spin" size={14} />}
             {isApi ? "Create account" : isCli ? "Create & login" : "Save this account"}
           </button>
         </div>

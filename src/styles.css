@@ -2828,3 +2828,109 @@ div.quotaError .linkBtn {
   cursor: default;
   opacity: 0.55;
 }
+
+/* ---------- Settings › Overlay quota ---------- */
+
+.overlaySettings {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.overlayPicks {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.overlayPicksLabel {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.overlayPickList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.overlayPick {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.overlayPick:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.overlayPick.on {
+  border-color: rgba(251, 106, 26, 0.45);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.overlayOptions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.overlayOptions label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.overlayOptions input[type="checkbox"],
+.overlayOptions input[type="range"] {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+.overlayOpacity input[type="range"] {
+  width: 120px;
+}
+
+/* Usage: "some models have no price" warning above the cost tiles. */
+.usageUnpriced {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 7px 10px;
+  border: 1px solid rgba(252, 211, 77, 0.28);
+  border-radius: var(--radius-sm);
+  background: var(--amber-soft);
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.usageUnpriced svg {
+  flex: 0 0 auto;
+  color: var(--amber);
+}
+
+/* The plain-command chip on the account in use — dimmer than a launcher chip so the
+   account's own command stays the prominent one. */
+.cmdChip.bare {
+  border-style: dashed;
+  opacity: 0.75;
+}
+
+.cmdChip.bare:hover {
+  opacity: 1;
+}

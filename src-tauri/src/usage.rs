@@ -29,7 +29,7 @@ const MAX_SESSIONS: usize = 30;
 
 /// Bump when the cache format or scan logic changes in a way that invalidates old aggregates
 /// (e.g. the symlink-dedup fix) so a stale cache is discarded instead of double-counting.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // On-disk incremental cache
@@ -69,6 +69,45 @@ struct FileCursor {
     /// Codex only: working directory from the session_meta event.
     #[serde(default)]
     codex_project: String,
+    /// Claude only: tokens already counted per assistant message id. Claude rewrites the same
+    /// message id across several streaming lines with growing usage, and those lines can land in
+    /// DIFFERENT scans — without this ledger the second scan would add the message's tokens all
+    /// over again. Capped to the most recent ids (see `remember_counted`).
+    #[serde(default)]
+    claude_counted: Vec<CountedMessage>,
+}
+
+/// One assistant message's usage as already added to the buckets.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CountedMessage {
+    id: String,
+    tokens: TokenBreakdown,
+}
+
+/// How many message ids to remember per file. Streaming rewrites of one message land within a few
+/// lines of each other, so a short window is enough and keeps the cache small.
+const COUNTED_MESSAGE_WINDOW: usize = 500;
+
+fn counted_tokens(list: &[CountedMessage], id: &str) -> TokenBreakdown {
+    list.iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.tokens)
+        .unwrap_or_default()
+}
+
+/// Record `tokens` as counted for `id`, keeping the entry most-recently-touched last so the cap
+/// drops the oldest ids first.
+fn remember_counted(list: &mut Vec<CountedMessage>, id: &str, tokens: TokenBreakdown) {
+    list.retain(|entry| entry.id != id);
+    list.push(CountedMessage {
+        id: id.to_string(),
+        tokens,
+    });
+    if list.len() > COUNTED_MESSAGE_WINDOW {
+        let overflow = list.len() - COUNTED_MESSAGE_WINDOW;
+        list.drain(..overflow);
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -228,6 +267,11 @@ fn file_stem(path: &Path) -> String {
 fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
     let key = path.to_string_lossy().to_string();
     let offset = cache.files.get(&key).map(|c| c.offset).unwrap_or(0);
+    let mut counted = cache
+        .files
+        .get(&key)
+        .map(|c| c.claude_counted.clone())
+        .unwrap_or_default();
     let mut project = cache
         .sessions
         .get(&key)
@@ -271,14 +315,22 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
 
     let session_id = file_stem(path);
     for entry in best.into_values() {
-        add_bucket(cache, "claude", &entry.date, &entry.model, &entry.tokens);
+        // Add only what this message hasn't contributed yet. A re-read of the same message id
+        // (Claude rewrites it as the answer streams) then tops up instead of double-counting.
+        let already = counted_tokens(&counted, &entry.id);
+        let delta = entry.tokens.saturating_delta(&already);
+        if delta.total() == 0 {
+            continue;
+        }
+        remember_counted(&mut counted, &entry.id, entry.tokens);
+        add_bucket(cache, "claude", &entry.date, &entry.model, &delta);
         add_project_bucket(
             cache,
             "claude",
             &entry.date,
             &entry.model,
             &entry.project,
-            &entry.tokens,
+            &delta,
         );
         add_session(
             cache,
@@ -288,11 +340,13 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
             &entry.date,
             &entry.model,
             &entry.project,
-            &entry.tokens,
+            &delta,
         );
     }
 
-    cache.files.entry(key).or_default().offset = new_offset;
+    let cursor = cache.files.entry(key).or_default();
+    cursor.offset = new_offset;
+    cursor.claude_counted = counted;
 }
 
 struct ClaudeEntry {
@@ -577,6 +631,7 @@ fn today_local() -> String {
 }
 
 /// Sums optional costs: Some when at least one item is priced, None when nothing is priced.
+/// A partially-priced sum is a LOWER BOUND — callers surface that via `ToolUsage::unpriced_models`.
 fn sum_cost(items: impl Iterator<Item = Option<f64>>) -> Option<f64> {
     let mut total = 0.0;
     let mut any = false;
@@ -701,6 +756,16 @@ fn tool_usage(
         })
         .collect();
     by_model.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total()));
+
+    // Models with real usage but no price: their cost is missing from every total below, so the
+    // report carries the list and the UI marks the numbers as a lower bound.
+    let mut unpriced_models: Vec<String> = by_model
+        .iter()
+        .filter(|m| m.cost_usd.is_none() && m.tokens.total() > 0)
+        .map(|m| m.model.clone())
+        .collect();
+    unpriced_models.sort();
+    unpriced_models.dedup();
 
     let total_cost_usd = sum_cost(by_model.iter().map(|m| m.cost_usd));
     let today_cost_usd = day_cost.get(today).copied().flatten();
@@ -873,6 +938,7 @@ fn tool_usage(
         by_model,
         sessions,
         projects,
+        unpriced_models,
     }
 }
 

@@ -2,6 +2,7 @@ mod api_gateway;
 mod app_state;
 mod detection;
 mod models;
+mod overlay;
 mod prime;
 mod pricing;
 mod quota;
@@ -15,9 +16,9 @@ use app_state::ManagedState;
 use models::{
     AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
-    DeleteApiGatewayKeyInput, DetectionReport, RenameAccountInput, SaveApiGatewayComboInput,
-    PrimeNowInput, SetApiGatewayAccountInput, SetLauncherInput, SetToolSetupInput,
-    StartApiGatewayInput, SwitchAccountInput, ToolId, UsageReport,
+    DeleteApiGatewayKeyInput, DetectionReport, OverlayRect, OverlaySettings, RenameAccountInput,
+    SaveApiGatewayComboInput, PrimeNowInput, SetApiGatewayAccountInput, SetLauncherInput,
+    SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -392,6 +393,53 @@ fn create_virtual_api_account(
     Ok(snapshot)
 }
 
+/// Snapshot without the pending-login recheck `load_snapshot` does — used by the overlay window,
+/// which polls often and only needs the cached account/quota state.
+#[tauri::command]
+fn get_snapshot(state: State<'_, ManagedState>) -> Result<AppSnapshot, String> {
+    state.snapshot().map_err(display_error)
+}
+
+#[tauri::command]
+fn get_overlay_settings(state: State<'_, ManagedState>) -> Result<OverlaySettings, String> {
+    state.overlay_settings().map_err(display_error)
+}
+
+/// Save the overlay settings and apply them right away (open/close the window, click-through),
+/// then broadcast them so an already-open overlay re-renders without a reload.
+#[tauri::command]
+fn set_overlay_settings(
+    app: tauri::AppHandle,
+    state: State<'_, ManagedState>,
+    input: OverlaySettings,
+) -> Result<OverlaySettings, String> {
+    let saved = state.save_overlay_settings(input).map_err(display_error)?;
+    overlay::apply(&app, &saved);
+    Ok(saved)
+}
+
+/// Show/hide the overlay window (tray item, Settings switch, overlay's own ✕).
+#[tauri::command]
+fn set_overlay_enabled(
+    app: tauri::AppHandle,
+    state: State<'_, ManagedState>,
+    enabled: bool,
+) -> Result<OverlaySettings, String> {
+    let saved = state.set_overlay_enabled(enabled).map_err(display_error)?;
+    overlay::apply(&app, &saved);
+    tray::rebuild(&app);
+    Ok(saved)
+}
+
+/// CLIs whose quota the background poller refreshes. Antigravity is excluded: its quota can only
+/// be read while the IDE is open, via a local language server.
+const POLLED_TOOLS: [ToolId; 4] = [
+    ToolId::Claude,
+    ToolId::Codex,
+    ToolId::Cursor,
+    ToolId::Opencode,
+];
+
 pub fn run() {
     // Legacy stub: older versions installed a LaunchDaemon that launches this binary with
     // `--prime-headless` every 60 seconds. The auto session prime feature is removed, but until
@@ -418,6 +466,10 @@ pub fn run() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             load_snapshot,
+            get_snapshot,
+            get_overlay_settings,
+            set_overlay_settings,
+            set_overlay_enabled,
             refresh_tool,
             refresh_account,
             add_account,
@@ -459,6 +511,33 @@ pub fn run() {
             // Menu-bar (tray) icon for quick account switching without opening the window.
             tray::create(app.handle())?;
 
+            // Reopen the floating quota overlay if it was left on last time.
+            if app
+                .state::<ManagedState>()
+                .overlay_settings()
+                .map(|settings| settings.enabled)
+                .unwrap_or(false)
+            {
+                let _ = overlay::show(app.handle());
+            }
+
+            // First quota read for every CLI, off the startup path so a slow network can't
+            // delay the window appearing.
+            let warm_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let state = warm_handle.state::<ManagedState>();
+                let mut latest = None;
+                for tool_id in POLLED_TOOLS {
+                    if let Ok(snapshot) = state.refresh_tool(tool_id, Some(&warm_handle)) {
+                        latest = Some(snapshot);
+                    }
+                }
+                if let Some(snapshot) = latest {
+                    let _ = warm_handle.emit("snapshot-changed", snapshot);
+                }
+                tray::rebuild(&warm_handle);
+            });
+
             // Background poller: periodically refresh quota + auto-switch if enabled.
             // Refresh every 5 minutes (Claude's quota endpoint is rate-limited hard;
             // the 5h/weekly quota changes slowly, so no need to poll more often).
@@ -466,8 +545,15 @@ pub fn run() {
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(300));
                 let state = handle.state::<ManagedState>();
-                for tool_id in [ToolId::Claude, ToolId::Codex] {
-                    let _ = state.refresh_tool(tool_id, Some(&handle));
+                let mut latest = None;
+                for tool_id in POLLED_TOOLS {
+                    if let Ok(snapshot) = state.refresh_tool(tool_id, Some(&handle)) {
+                        latest = Some(snapshot);
+                    }
+                }
+                // Push the fresh quota to every open window (main + overlay).
+                if let Some(snapshot) = latest {
+                    let _ = handle.emit("snapshot-changed", snapshot);
                 }
                 // Keep the token-usage cache warm and nudge any open Usage tab to refetch
                 // (with whatever range the user has selected).
@@ -487,6 +573,43 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 }
+            }
+
+            if window.label() != overlay::LABEL {
+                return;
+            }
+            // Remember where the user dragged/resized the overlay to, in logical pixels so the
+            // saved rect means the same thing on a Retina and a non-Retina screen.
+            let state = window.state::<ManagedState>();
+            let scale = window.scale_factor().unwrap_or(1.0);
+            match event {
+                tauri::WindowEvent::Moved(position) => {
+                    if let Ok(current) = state.overlay_settings() {
+                        let logical = position.to_logical::<f64>(scale);
+                        let _ = state.set_overlay_rect(OverlayRect {
+                            x: logical.x,
+                            y: logical.y,
+                            ..current.rect
+                        });
+                    }
+                }
+                tauri::WindowEvent::Resized(size) => {
+                    if let Ok(current) = state.overlay_settings() {
+                        let logical = size.to_logical::<f64>(scale);
+                        let _ = state.set_overlay_rect(OverlayRect {
+                            width: logical.width,
+                            height: logical.height,
+                            ..current.rect
+                        });
+                    }
+                }
+                // Closed by the user (⌘W / the overlay's own ✕): remember it as off so the next
+                // launch doesn't bring it back unasked. Quitting the app destroys the window
+                // without a CloseRequested, so the setting survives a normal quit.
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    let _ = state.set_overlay_enabled(false);
+                }
+                _ => {}
             }
         })
         .build(tauri::generate_context!())

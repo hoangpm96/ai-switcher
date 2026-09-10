@@ -16,6 +16,11 @@ pub fn default_config_dir(tool_id: &ToolId) -> PathBuf {
     match tool_id {
         ToolId::Claude => home.join(".claude"),
         ToolId::Codex => home.join(".codex"),
+        // Cursor CLI keeps config + (file-store) credentials under ~/.cursor.
+        ToolId::Cursor => home.join(".cursor"),
+        // opencode reads XDG_DATA_HOME; the machine default is ~/.local/share, and the CLI
+        // appends `opencode/` itself.
+        ToolId::Opencode => home.join(".local/share"),
         // Antigravity IDE: the machine's default userData on macOS (original login).
         ToolId::Antigravity => home.join("Library/Application Support/Antigravity IDE"),
     }
@@ -256,6 +261,8 @@ pub fn is_installed(tool_id: &ToolId) -> bool {
     match tool_id {
         ToolId::Claude => command_path("claude").is_some(),
         ToolId::Codex => command_path("codex").is_some(),
+        ToolId::Cursor => command_path(CURSOR_BIN).is_some(),
+        ToolId::Opencode => command_path("opencode").is_some(),
         ToolId::Antigravity => antigravity_ide_available(),
     }
 }
@@ -264,6 +271,8 @@ pub fn command_name(tool_id: &ToolId) -> &'static str {
     match tool_id {
         ToolId::Claude => "claude",
         ToolId::Codex => "codex",
+        ToolId::Cursor => CURSOR_BIN,
+        ToolId::Opencode => "opencode",
         ToolId::Antigravity => "antigravity-ide",
     }
 }
@@ -273,6 +282,8 @@ pub fn launch_login(tool_id: &ToolId) -> Result<()> {
         // Claude 2.x does NOT have `claude login` — it must be `claude auth login`.
         ToolId::Claude => run_login_command("claude", &["auth", "login"]),
         ToolId::Codex => run_login_command("codex", &["login"]),
+        ToolId::Cursor => run_login_command(CURSOR_BIN, &["login"]),
+        ToolId::Opencode => run_login_command("opencode", &["auth", "login"]),
         ToolId::Antigravity => {
             if Path::new("/Applications/Antigravity.app").exists() {
                 Command::new("open")
@@ -312,6 +323,10 @@ fn shared_session_names(tool_id: &ToolId) -> &'static [&'static str] {
     match tool_id {
         ToolId::Claude => &["projects", "history.jsonl"],
         ToolId::Codex => &["sessions", "history.jsonl"],
+        // Cursor keeps chats in ~/.cursor/chats but the launcher never moves HOME, so the
+        // machine's own chat history is already shared. opencode's sessions live in the profile
+        // (XDG_DATA_HOME) and are deliberately kept per account.
+        ToolId::Cursor | ToolId::Opencode => &[],
         ToolId::Antigravity => &[],
     }
 }
@@ -340,6 +355,10 @@ fn shared_config_names(tool_id: &ToolId) -> &'static [&'static str] {
         // held by the default process, which causes the WebSocket initialisation to time out
         // ("Reconnecting... 4/5"). Each account keeps its own memories and goals DBs.
         ToolId::Codex => &["config.toml", "rules", "skills", "memories"],
+        // Cursor: the launcher keeps the real HOME, so ~/.cursor (rules, mcp.json, model prefs)
+        // is already shared — nothing to symlink. opencode: config lives in XDG_CONFIG_HOME,
+        // which the launcher leaves untouched, so it is shared too.
+        ToolId::Cursor | ToolId::Opencode => &[],
         ToolId::Antigravity => &[],
     }
 }
@@ -625,6 +644,20 @@ pub fn launch_profile_login(
             &["login"],
             tool_id,
         ),
+        // opencode reads its credentials from `$XDG_DATA_HOME/opencode/auth.json`, so pointing
+        // XDG_DATA_HOME at the profile makes the login land inside it.
+        ToolId::Opencode => run_profile_login_command(
+            binary_path,
+            "XDG_DATA_HOME",
+            &profile,
+            &["auth", "login"],
+            tool_id,
+        ),
+        // Cursor has no config-dir variable: with `AGENT_CLI_CREDENTIAL_STORE=file` it writes
+        // `$HOME/.cursor/auth.json`, so the login runs with HOME pointed at the profile. HOME is
+        // overridden ONLY for this one-shot login — never for the launcher, where the agent runs
+        // the user's own shell commands and must keep the real HOME.
+        ToolId::Cursor => run_cursor_profile_login(binary_path, &profile),
         ToolId::Antigravity => launch_login(tool_id),
     }
 }
@@ -639,6 +672,8 @@ pub fn profile_has_credentials(tool_id: &ToolId, config_dir: &Path) -> bool {
         }
         // Codex stores the token in a file inside CODEX_HOME.
         ToolId::Codex => config_dir.join("auth.json").exists(),
+        ToolId::Cursor => cursor_profile_token(config_dir).is_some(),
+        ToolId::Opencode => opencode_profile_key(config_dir).is_some(),
         // Antigravity IDE: the token lives in the account's own userData state.vscdb.
         ToolId::Antigravity => antigravity_logged_in(config_dir),
     }
@@ -681,6 +716,8 @@ fn launcher_prefix(tool_id: &ToolId) -> Result<&'static str> {
     match tool_id {
         ToolId::Claude => Ok("claude-"),
         ToolId::Codex => Ok("codex-"),
+        ToolId::Cursor => Ok("cursor-agent-"),
+        ToolId::Opencode => Ok("opencode-"),
         ToolId::Antigravity => anyhow::bail!("Antigravity is a GUI app and has no custom command"),
     }
 }
@@ -728,6 +765,74 @@ pub fn launcher_name_collides_with_system(full_name: &str) -> bool {
 
 /// Create/overwrite the launcher for the account. Execs the real binary by absolute path
 /// (the ~/.local/bin/<binary> symlink stays stable across auto-update).
+/// The `cursor-agent` binary name (the CLI installs itself under this name, not `cursor`).
+pub const CURSOR_BIN: &str = "cursor-agent";
+
+/// Cursor's file-mode credential store inside an account profile: the login runs with
+/// `HOME=<profile>`, so the CLI writes `<profile>/.cursor/auth.json`.
+pub fn cursor_auth_file(profile: &Path) -> PathBuf {
+    profile.join(".cursor/auth.json")
+}
+
+/// The account's Cursor access token, if it has finished logging in.
+pub fn cursor_profile_token(profile: &Path) -> Option<String> {
+    let text = fs::read_to_string(cursor_auth_file(profile)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("accessToken")
+        .and_then(|token| token.as_str())
+        .filter(|token| !token.is_empty())
+        .map(ToString::to_string)
+}
+
+/// opencode keeps one credential file per data dir: `<profile>/opencode/auth.json`.
+pub fn opencode_auth_file(profile: &Path) -> PathBuf {
+    profile.join("opencode/auth.json")
+}
+
+/// The account's opencode Zen API key, if it has finished logging in.
+pub fn opencode_profile_key(profile: &Path) -> Option<String> {
+    let text = fs::read_to_string(opencode_auth_file(profile)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .pointer("/opencode-go/key")
+        .and_then(|key| key.as_str())
+        .filter(|key| !key.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Sign in to a Cursor account inside its own profile. `AGENT_CLI_CREDENTIAL_STORE=file` makes the
+/// CLI write `$HOME/.cursor/auth.json` instead of the login keychain, so pointing HOME at the
+/// profile keeps this account's token separate from every other one — and from the machine login.
+fn run_cursor_profile_login(command: &Path, profile: &Path) -> Result<()> {
+    fs::create_dir_all(profile.join(".cursor"))?;
+    let script = format!(
+        "echo '=== Sign in to Cursor CLI: follow the prompts, approve in your browser ==='; export HOME={dir}; export AGENT_CLI_CREDENTIAL_STORE=file; {cmd} login; echo; echo 'Done — return to AI Account Switcher (it will detect it); you can close this window.'",
+        dir = shell_quote(&profile.to_string_lossy()),
+        cmd = shell_quote(&command.to_string_lossy()),
+    );
+    open_terminal_script(&script)
+}
+
+/// The `export …` lines a per-account launcher needs so the CLI picks up that account only.
+fn launcher_env_body(tool_id: &ToolId, profile: &Path) -> Result<String> {
+    let dir = shell_quote(&profile.to_string_lossy());
+    Ok(match tool_id {
+        ToolId::Claude => format!("export CLAUDE_CONFIG_DIR={dir}\n"),
+        ToolId::Codex => format!("export CODEX_HOME={dir}\n"),
+        ToolId::Opencode => format!("export XDG_DATA_HOME={dir}\n"),
+        // Cursor has no config-dir variable, and overriding HOME here would break every shell
+        // command the agent runs (git, ssh, npm all read HOME). Instead the token is passed in
+        // directly and the credential store is kept in memory, so this run touches neither the
+        // login keychain nor another account's file.
+        ToolId::Cursor => format!(
+            "export AGENT_CLI_CREDENTIAL_STORE=memory\nCURSOR_AUTH_TOKEN=$(/usr/bin/sed -n 's/.*\"accessToken\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' {auth} 2>/dev/null)\nexport CURSOR_AUTH_TOKEN\n",
+            auth = shell_quote(&cursor_auth_file(profile).to_string_lossy()),
+        ),
+        ToolId::Antigravity => anyhow::bail!("Antigravity doesn't support custom commands"),
+    })
+}
+
 pub fn write_launcher(
     tool_id: &ToolId,
     store: &Store,
@@ -735,21 +840,16 @@ pub fn write_launcher(
     full_name: &str,
     real_binary: &Path,
 ) -> Result<()> {
-    let env_name = match tool_id {
-        ToolId::Claude => "CLAUDE_CONFIG_DIR",
-        ToolId::Codex => "CODEX_HOME",
-        ToolId::Antigravity => anyhow::bail!("Antigravity doesn't support custom commands"),
-    };
     let profile = store.account_dir(tool_id, account_id);
+    let body = launcher_env_body(tool_id, &profile)?;
 
     let dir = launcher_dir();
     fs::create_dir_all(&dir)?;
     let path = dir.join(full_name);
     let script = format!(
-        "#!/bin/sh\n{marker}\nexport {env}={dir}\nexec {bin} \"$@\"\n",
+        "#!/bin/sh\n{marker}\n{body}exec {bin} \"$@\"\n",
         marker = LAUNCHER_MARKER,
-        env = env_name,
-        dir = shell_quote(&profile.to_string_lossy()),
+        body = body,
         bin = shell_quote(&real_binary.to_string_lossy()),
     );
     fs::write(&path, script)?;
@@ -907,7 +1007,11 @@ pub fn write_api_launcher(
     let env_name = match tool_id {
         ToolId::Codex => "CODEX_HOME",
         ToolId::Claude => "CLAUDE_CONFIG_DIR",
-        ToolId::Antigravity => anyhow::bail!("Antigravity doesn't support API/proxy accounts"),
+        // API/proxy accounts only exist for the two CLIs that can be pointed at a gateway.
+        other => anyhow::bail!(
+            "{} doesn't support API/proxy accounts",
+            other.display_name()
+        ),
     };
     let profile = store.account_dir(tool_id, account_id);
 
@@ -985,26 +1089,7 @@ pub fn clear_active_profile(tool_id: &ToolId, store: &Store) -> Result<()> {
 /// Install (idempotently) the hook block into the shell rc so the bare command follows the selected account.
 /// Called on every switch — cheap and self-healing if the user accidentally deletes it.
 pub fn install_shell_hook(store: &Store) -> Result<()> {
-    let claude_active = store.active_profile_path(&ToolId::Claude);
-    let codex_active = store.active_profile_path(&ToolId::Codex);
-    // `aisw` is a shell function: it re-reads the active file on EVERY call then exports. Used to
-    // sync the new account into an already-open terminal without needing `source ~/.zshrc`.
-    // At shell startup we call it once → a new terminal lands on the right account automatically.
-    let block = format!(
-        "{begin}\n\
-         aisw() {{\n\
-        \x20 if [ -r {claude} ]; then export CLAUDE_CONFIG_DIR=\"$(cat {claude})\"; else unset CLAUDE_CONFIG_DIR; fi\n\
-        \x20 if [ -r {codex} ]; then export CODEX_HOME=\"$(cat {codex})\"; [ -r \"$CODEX_HOME/api_key\" ] && export OPENAI_API_KEY=\"$(cat \"$CODEX_HOME/api_key\")\"; else unset CODEX_HOME; fi\n\
-        \x20 [ -n \"$1\" ] && echo \"AI Account Switcher: synced the account for this terminal.\"\n\
-         }}\n\
-         aisw >/dev/null 2>&1\n\
-         {end}\n",
-        begin = HOOK_BEGIN,
-        end = HOOK_END,
-        claude = shell_quote(&claude_active.to_string_lossy()),
-        codex = shell_quote(&codex_active.to_string_lossy()),
-    );
-
+    let block = shell_hook_block(store);
     let home = home_dir();
     // zsh is the default shell on macOS; add bash if the user has ~/.bashrc.
     let mut targets = vec![home.join(".zshrc")];
@@ -1015,6 +1100,81 @@ pub fn install_shell_hook(store: &Store) -> Result<()> {
         upsert_block(&rc, &block)?;
     }
     Ok(())
+}
+
+/// The block written between the markers. Separate from the file I/O so it can be checked in tests.
+fn shell_hook_block(store: &Store) -> String {
+    let claude_active = store.active_profile_path(&ToolId::Claude);
+    let codex_active = store.active_profile_path(&ToolId::Codex);
+    let cursor_active = store.active_profile_path(&ToolId::Cursor);
+    let opencode_active = store.active_profile_path(&ToolId::Opencode);
+    // `aisw` is a shell function: it re-reads the active file on EVERY call then exports. Used to
+    // sync the new account into an already-open terminal without needing `source ~/.zshrc`.
+    // At shell startup we call it once → a new terminal lands on the right account automatically.
+    //
+    // OPENAI_API_KEY needs care: only API/proxy Codex accounts have one, so switching from such an
+    // account to an OAuth account (or to machine Default) must REMOVE the key — leaving it exported
+    // makes the CLI keep billing the previous account. It is dropped only when this hook is the one
+    // that set it (tracked in AISW_OPENAI_API_KEY), so a key the user exports themselves survives.
+    let block = format!(
+        "{begin}\n\
+         aisw() {{\n\
+        \x20 if [ -r {claude} ]; then export CLAUDE_CONFIG_DIR=\"$(cat {claude})\"; else unset CLAUDE_CONFIG_DIR; fi\n\
+        \x20 if [ -n \"${{AISW_OPENAI_API_KEY:-}}\" ] && [ \"${{OPENAI_API_KEY:-}}\" = \"$AISW_OPENAI_API_KEY\" ]; then unset OPENAI_API_KEY; fi\n\
+        \x20 unset AISW_OPENAI_API_KEY\n\
+        \x20 if [ -r {codex} ]; then export CODEX_HOME=\"$(cat {codex})\"; if [ -r \"$CODEX_HOME/api_key\" ]; then export OPENAI_API_KEY=\"$(cat \"$CODEX_HOME/api_key\")\"; export AISW_OPENAI_API_KEY=\"$OPENAI_API_KEY\"; fi; else unset CODEX_HOME; fi\n\
+        \x20 [ -n \"$1\" ] && echo \"AI Account Switcher: synced the account for this terminal.\"\n\
+         }}\n\
+         aisw >/dev/null 2>&1\n\
+         {cursor_fn}\
+         {opencode_fn}\
+         {end}\n",
+        begin = HOOK_BEGIN,
+        end = HOOK_END,
+        claude = shell_quote(&claude_active.to_string_lossy()),
+        codex = shell_quote(&codex_active.to_string_lossy()),
+        // Cursor and opencode are wrapped as shell FUNCTIONS instead of exported variables:
+        // XDG_DATA_HOME is read by unrelated apps, and Cursor's token has no business sitting in
+        // every process's environment. A function scopes both to the one command being run, and
+        // re-reads the active file on each call so a switch takes effect without a new terminal.
+        cursor_fn = cursor_shell_function(&cursor_active),
+        opencode_fn = opencode_shell_function(&opencode_active),
+    );
+    block
+}
+
+/// `cursor-agent` wrapper: pass the selected account's token for this invocation only, and keep
+/// the credential store in memory so the run can't overwrite the machine login.
+fn cursor_shell_function(active: &Path) -> String {
+    let active = shell_quote(&active.to_string_lossy());
+    format!(
+        "cursor-agent() {{\n\
+        \x20 if [ -r {active} ]; then\n\
+        \x20   __aisw_cur=\"$(cat {active})/.cursor/auth.json\"\n\
+        \x20   if [ -r \"$__aisw_cur\" ]; then\n\
+        \x20     AGENT_CLI_CREDENTIAL_STORE=memory \\\n\
+        \x20     CURSOR_AUTH_TOKEN=\"$(/usr/bin/sed -n 's/.*\"accessToken\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' \"$__aisw_cur\")\" \\\n\
+        \x20     command cursor-agent \"$@\"\n\
+        \x20     return $?\n\
+        \x20   fi\n\
+        \x20 fi\n\
+        \x20 command cursor-agent \"$@\"\n\
+         }}\n"
+    )
+}
+
+/// `opencode` wrapper: point XDG_DATA_HOME at the selected account for this invocation only.
+fn opencode_shell_function(active: &Path) -> String {
+    let active = shell_quote(&active.to_string_lossy());
+    format!(
+        "opencode() {{\n\
+        \x20 if [ -r {active} ]; then\n\
+        \x20   XDG_DATA_HOME=\"$(cat {active})\" command opencode \"$@\"\n\
+        \x20 else\n\
+        \x20   command opencode \"$@\"\n\
+        \x20 fi\n\
+         }}\n"
+    )
 }
 
 /// Replace the block between the markers (if present) or append; create the file if it doesn't exist.
@@ -1085,6 +1245,66 @@ fn run_login_command(binary: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hook is pasted into the user's ~/.zshrc, so a syntax error there breaks every new
+    /// terminal. Check the generated block actually parses.
+    #[test]
+    fn shell_hook_block_is_valid_shell() {
+        let root = std::env::temp_dir().join(format!("aisw_hook_{}", std::process::id()));
+        let store = Store::for_test(root.clone()).unwrap();
+        let block = shell_hook_block(&store);
+        let script = root.join("hook.sh");
+        fs::write(&script, &block).unwrap();
+
+        for shell in ["sh", "bash", "zsh"] {
+            let output = Command::new(shell).arg("-n").arg(&script).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{shell} rejected the hook: {}\n---\n{block}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Every managed CLI must be covered.
+        assert!(block.contains("CLAUDE_CONFIG_DIR"));
+        assert!(block.contains("CODEX_HOME"));
+        assert!(block.contains("XDG_DATA_HOME"));
+        assert!(block.contains("CURSOR_AUTH_TOKEN"));
+        // Cursor must never write into the shared credential store from a wrapped run.
+        assert!(block.contains("AGENT_CLI_CREDENTIAL_STORE=memory"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Each launcher is a standalone `sh` script — a quoting slip in the Cursor token extraction
+    /// would only show up when the user runs the command, so check the generated body parses.
+    #[test]
+    fn launcher_bodies_are_valid_shell() {
+        let root = std::env::temp_dir().join(format!("aisw_launcher_{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let profile = root.join("profile with space");
+        for tool_id in [
+            ToolId::Claude,
+            ToolId::Codex,
+            ToolId::Cursor,
+            ToolId::Opencode,
+        ] {
+            let body = launcher_env_body(&tool_id, &profile).unwrap();
+            let script = root.join(format!("{}.sh", tool_id.as_str()));
+            fs::write(&script, format!("#!/bin/sh\n{body}exec true \"$@\"\n")).unwrap();
+            let output = Command::new("sh").arg("-n").arg(&script).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{} launcher is not valid shell: {}\n---\n{body}",
+                tool_id.as_str(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Cursor must never persist into the shared credential store from a launcher run.
+        let cursor = launcher_env_body(&ToolId::Cursor, &profile).unwrap();
+        assert!(cursor.contains("AGENT_CLI_CREDENTIAL_STORE=memory"));
+        assert!(!cursor.contains("export HOME"));
+        assert!(launcher_env_body(&ToolId::Antigravity, &profile).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn launcher_name_enforces_prefix_and_charset() {
@@ -1173,7 +1393,7 @@ fn keychain_entries(tool_id: &ToolId) -> Vec<KeychainKey> {
                 },
             ]
         }
-        ToolId::Codex => vec![],
+        ToolId::Codex | ToolId::Cursor | ToolId::Opencode => vec![],
         // Antigravity IDE switches via --user-data-dir (the login lives in each userData's
         // state.vscdb) so there's NO need to swap the keychain.
         ToolId::Antigravity => vec![],

@@ -436,7 +436,8 @@ fn read_token(tool_id: &ToolId, config_dir: &Path) -> Option<String> {
     match tool_id {
         ToolId::Claude => quota::claude_oauth_token_fresh(config_dir),
         ToolId::Codex => quota::codex_access_token_fresh(config_dir),
-        ToolId::Antigravity => None,
+        // Priming opens a fresh 5-hour window, which only Claude and Codex have.
+        ToolId::Cursor | ToolId::Opencode | ToolId::Antigravity => None,
     }
 }
 
@@ -497,7 +498,7 @@ fn send_hi_http(tool_id: &ToolId, config_dir: &Path) -> Result<(), String> {
             }
             request.send()
         }
-        ToolId::Antigravity => return Err("antigravity unsupported".to_string()),
+        other => return Err(format!("{} unsupported", other.as_str())),
     };
 
     match response {

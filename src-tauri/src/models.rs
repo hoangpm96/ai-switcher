@@ -6,6 +6,8 @@ use std::path::PathBuf;
 pub enum ToolId {
     Claude,
     Codex,
+    Cursor,
+    Opencode,
     Antigravity,
 }
 
@@ -14,6 +16,8 @@ impl ToolId {
         match self {
             ToolId::Claude => "claude",
             ToolId::Codex => "codex",
+            ToolId::Cursor => "cursor",
+            ToolId::Opencode => "opencode",
             ToolId::Antigravity => "antigravity",
         }
     }
@@ -22,6 +26,8 @@ impl ToolId {
         match self {
             ToolId::Claude => "Claude Code",
             ToolId::Codex => "Codex",
+            ToolId::Cursor => "Cursor CLI",
+            ToolId::Opencode => "opencode",
             ToolId::Antigravity => "Antigravity IDE",
         }
     }
@@ -31,6 +37,8 @@ impl ToolId {
         match self {
             ToolId::Claude => "Claude",
             ToolId::Codex => "Codex",
+            ToolId::Cursor => "Cursor",
+            ToolId::Opencode => "opencode",
             ToolId::Antigravity => "Antigravity",
         }
     }
@@ -468,6 +476,73 @@ pub struct AppSnapshot {
     pub api_gateway: ApiGatewaySnapshot,
 }
 
+/// Saved geometry of the floating quota overlay window (screen coordinates, logical pixels).
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Default for OverlayRect {
+    fn default() -> Self {
+        Self {
+            x: 40.0,
+            y: 60.0,
+            // Tall enough for the default rows (the account in use per CLI + Cursor + opencode)
+            // without scrolling; the user resizes from there.
+            width: 288.0,
+            height: 330.0,
+        }
+    }
+}
+
+/// Settings for the always-on-top quota overlay (a second, frameless window).
+///
+/// `accounts` holds `"<tool>:<accountId>"` keys instead of bare account ids so the same id
+/// under two tools can never collide. An empty list means "show the account in use of every
+/// installed CLI", which is what a fresh install gets.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlaySettings {
+    /// Whether the overlay window is shown (restored on next app start).
+    pub enabled: bool,
+    /// `"<tool>:<accountId>"` rows to render. Empty = the active account of each CLI.
+    #[serde(default)]
+    pub accounts: Vec<String>,
+    /// Window background opacity, 0.25..1.0.
+    #[serde(default = "default_overlay_opacity")]
+    pub opacity: f64,
+    /// Hide the weekly bar and shrink each row to a single line.
+    #[serde(default)]
+    pub compact: bool,
+    /// Let clicks pass through to whatever is behind the overlay (view-only mode).
+    #[serde(default)]
+    pub click_through: bool,
+    /// Last position/size, so reopening puts it back where the user left it.
+    #[serde(default)]
+    pub rect: OverlayRect,
+}
+
+fn default_overlay_opacity() -> f64 {
+    0.9
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            accounts: Vec::new(),
+            opacity: default_overlay_opacity(),
+            compact: false,
+            click_through: false,
+            rect: OverlayRect::default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutoSwitchSetting {
@@ -791,6 +866,17 @@ impl TokenBreakdown {
         self.cache_read += other.cache_read;
         self.cache_creation += other.cache_creation;
     }
+
+    /// Per-field `self - already`, floored at zero. Used to top up a message whose usage was
+    /// partly counted in an earlier scan, so the same tokens are never added twice.
+    pub fn saturating_delta(&self, already: &TokenBreakdown) -> TokenBreakdown {
+        TokenBreakdown {
+            input: self.input.saturating_sub(already.input),
+            output: self.output.saturating_sub(already.output),
+            cache_read: self.cache_read.saturating_sub(already.cache_read),
+            cache_creation: self.cache_creation.saturating_sub(already.cache_creation),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -855,6 +941,11 @@ pub struct ToolUsage {
     pub sessions: Vec<SessionUsage>,
     /// Per-working-directory totals, highest cost/token usage first.
     pub projects: Vec<ProjectUsage>,
+    /// Models that produced tokens but have no price in the LiteLLM cache. When this is non-empty
+    /// every `*_cost_usd` above is a LOWER BOUND, not the full cost — the UI must say so instead of
+    /// presenting the number as complete.
+    #[serde(default)]
+    pub unpriced_models: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

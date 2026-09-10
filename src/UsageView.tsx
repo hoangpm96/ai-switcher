@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, BarChart3, ChevronDown, FolderKanban, LayoutDashboard, Loader2, RefreshCw } from "lucide-react";
 import { api } from "./tauri";
@@ -18,16 +18,32 @@ export function UsageView() {
   const [selected, setSelected] = useState<string>("all");
   const [range, setRange] = useState(30);
   const [view, setView] = useState<"overview" | "projects">("overview");
+  // A scan can take seconds, and `usage-changed` (or a range switch) can start another one while
+  // the first is still running. Only the newest request may write state, so a slow earlier scan
+  // can't overwrite fresher numbers — or update state after the tab is gone.
+  const requestSeq = useRef(0);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
+    const ticket = (requestSeq.current += 1);
     setBusy(true);
     setError(null);
     try {
-      setReport(await api.getUsage(range));
+      const next = await api.getUsage(range);
+      if (mounted.current && ticket === requestSeq.current) setReport(next);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (mounted.current && ticket === requestSeq.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setBusy(false);
+      if (mounted.current && ticket === requestSeq.current) setBusy(false);
     }
   }, [range]);
 
@@ -259,6 +275,14 @@ function ToolUsageSection({ tool, range, priceUnavailable }: { tool: ToolUsage; 
         </div>
       ) : (
         <>
+          {(tool.unpricedModels?.length ?? 0) > 0 && (
+            <p className="usageUnpriced" title={tool.unpricedModels.join(", ")}>
+              <AlertTriangle size={13} />
+              Chi phí dưới đây là mức tối thiểu — {tool.unpricedModels.length} model chưa có giá:{" "}
+              {tool.unpricedModels.slice(0, 3).join(", ")}
+              {tool.unpricedModels.length > 3 ? "…" : ""}
+            </p>
+          )}
           <div className="usageStats">
             <StatTile label="Total cost" value={formatUsd(tool.totalCostUsd)} sub={`${formatTokens(total(tool.total))} tokens`} big />
             <StatTile label="Today" value={formatUsd(tool.todayCostUsd)} sub={`${formatTokens(total(tool.today))} tokens`} />
@@ -463,9 +487,14 @@ function buildAllUsage(tools: ToolUsage[]): ToolUsage {
     .sort((a, b) => b.date.localeCompare(a.date))
     .slice(0, 20);
 
+  const unpricedModels = Array.from(
+    new Set(tools.flatMap((tool) => tool.unpricedModels ?? [])),
+  ).sort();
+
   return {
     toolId: "all",
     displayName: "All",
+    unpricedModels,
     estimate: tools.some((tool) => tool.estimate),
     total: sumTokens(tools.map((tool) => tool.total)),
     totalCostUsd: sumNullable(tools.map((tool) => tool.totalCostUsd)),

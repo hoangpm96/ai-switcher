@@ -1,4 +1,6 @@
-use crate::models::{Account, AccountState, ApiGatewayConfig, AutoSwitchSetting, ToolId, ToolSetup};
+use crate::models::{
+    Account, AccountState, ApiGatewayConfig, AutoSwitchSetting, OverlaySettings, ToolId, ToolSetup,
+};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,9 @@ pub struct StoredState {
     /// Local OpenAI/Anthropic-compatible proxy settings for the API tab.
     #[serde(default)]
     pub api_gateway: ApiGatewayConfig,
+    /// Always-on-top quota overlay window (which accounts, size/position, opacity).
+    #[serde(default)]
+    pub overlay: OverlaySettings,
 }
 
 fn default_threshold() -> f64 {
@@ -42,6 +47,7 @@ impl Default for StoredState {
             auto_switch_settings: BTreeMap::new(),
             tool_setups: BTreeMap::new(),
             api_gateway: ApiGatewayConfig::default(),
+            overlay: OverlaySettings::default(),
         }
     }
 }

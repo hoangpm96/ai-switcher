@@ -18,18 +18,32 @@
 - `store.rs`: persisted state paths and helpers.
 - `tools.rs`: CLI detection, profile login, symlinks, launchers, shell hook, delete cleanup.
 - `app_state.rs`: high-level account workflows: snapshot, add, switch, delete, refresh, auto-switch.
-- `quota.rs`: quota readers for Claude, Codex, Antigravity.
+- `quota.rs`: quota readers for Claude, Codex, Cursor CLI, opencode Zen, Antigravity.
+- `overlay.rs`: the always-on-top quota overlay window (second frameless window, label `overlay`).
 - `usage.rs`: scans Claude/Codex JSONL logs and builds the Usage tab report.
 - `pricing.rs`: LiteLLM price cache and model-price lookup.
 
 ## Account Model
 
 - Claude/Codex machine default accounts point at `~/.claude` / `~/.codex`.
+- Cursor CLI and opencode are managed the same way, with their own isolation mechanism:
+  - opencode: profile dir is an `XDG_DATA_HOME`; credentials land in `<profile>/opencode/auth.json`.
+  - Cursor: no config-dir variable exists. Login runs with `HOME=<profile>` +
+    `AGENT_CLI_CREDENTIAL_STORE=file`, which writes `<profile>/.cursor/auth.json`
+    (`accessToken` + `refreshToken`). Launchers must NOT move HOME (the agent runs the user's own
+    shell commands): they export `CURSOR_AUTH_TOKEN` from that file with
+    `AGENT_CLI_CREDENTIAL_STORE=memory` so the run can't touch the login keychain.
+  - Neither supports API/proxy accounts, the API gateway pool, token-usage scanning, or
+    auto-switch (no 5-hour window to react to).
 - Additional Claude/Codex accounts are profile dirs under app data and are selected by exporting:
   - `CLAUDE_CONFIG_DIR=<profile>`
   - `CODEX_HOME=<profile>`
 - The app does not wrap the real `claude`/`codex` binaries. It installs an idempotent shell hook in `~/.zshrc` and `~/.bashrc` if present.
-- Per-account launcher commands are separate files in `~/.local/bin`, e.g. `claude-work`, `codex-pro`.
+- Per-account launcher commands are separate files in `~/.local/bin`, e.g. `claude-work`, `codex-pro`,
+  `cursor-agent-work`, `opencode-alt`.
+- The bare `cursor-agent` / `opencode` commands follow the selected account via shell FUNCTIONS in
+  the hook (not exported variables): `XDG_DATA_HOME` and the Cursor token must stay scoped to that
+  one invocation.
 - Antigravity does not use profile env vars. It copy-swaps OAuth/profile keys inside the default IDE `state.vscdb`.
 
 ## Shared Config Rule
@@ -50,6 +64,7 @@
 
 - `src/App.tsx` is the main UI: tool tabs, account cards, modals, auto-switch settings.
 - `src/UsageView.tsx` renders token/cost usage.
+- `src/OverlayApp.tsx` + `src/overlay.css` render the floating quota overlay; `src/main.tsx` picks it by window label.
 - `src/tauri.ts` wraps invoke calls and contains mock data for browser/dev fallback.
 - `src/types.ts` mirrors Rust DTOs.
 

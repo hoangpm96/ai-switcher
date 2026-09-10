@@ -58,6 +58,8 @@ pub fn read_quota(tool_id: &ToolId, config_dir: &Path) -> QuotaInfo {
     let result = match tool_id {
         ToolId::Codex => read_codex_quota(config_dir),
         ToolId::Claude => read_claude_quota(config_dir),
+        ToolId::Cursor => read_cursor_quota(config_dir),
+        ToolId::Opencode => read_opencode_quota(config_dir),
         ToolId::Antigravity => read_antigravity_quota(),
     };
 
@@ -126,7 +128,16 @@ pub(crate) fn classify_five_hour(tool_id: &ToolId, window: &QuotaWindow) -> Wind
         // explicitly reports an empty window. Full-response errors are filtered by
         // `classify_window`; `read_live_five_hour` only reaches this branch after a successful API
         // response.
-        None if matches!(tool_id, ToolId::Claude) => WindowState::Primeable,
+        // …unless Claude explicitly reports the session limit as active. `is_active` flips to true
+        // the moment a window opens, before `resets_at` propagates, so trusting the null alone
+        // would let Prime fire an extra request into a window that is already running.
+        None if matches!(tool_id, ToolId::Claude) => {
+            if window.is_active == Some(true) {
+                WindowState::Anchored
+            } else {
+                WindowState::Primeable
+            }
+        }
         None => match window.percent_used {
             Some(p) if p <= 0.0 => WindowState::Primeable,
             _ => WindowState::Unknown,
@@ -151,7 +162,8 @@ pub(crate) fn classify_five_hour(tool_id: &ToolId, window: &QuotaWindow) -> Wind
                         WindowState::Anchored
                     }
                 }
-                ToolId::Antigravity => WindowState::Unknown,
+                // No 5-hour window to prime for these.
+                ToolId::Cursor | ToolId::Opencode | ToolId::Antigravity => WindowState::Unknown,
             }
         }
     }
@@ -556,7 +568,7 @@ fn claude_credentials_blob(config_dir: &Path) -> Option<String> {
     None
 }
 
-fn read_keychain_blob(service: &str) -> Option<String> {
+pub(crate) fn read_keychain_blob(service: &str) -> Option<String> {
     Command::new("security")
         .args(["find-generic-password", "-s", service, "-w"])
         .output()
@@ -582,21 +594,80 @@ pub(crate) fn claude_version() -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(crate) fn curl_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {
-    let mut command = Command::new("curl");
-    command
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--max-time")
-        .arg("20")
-        .arg("-w")
-        .arg("\n%{http_code}"); // append status code as last line
-    for (key, value) in headers {
-        command.arg("-H").arg(format!("{key}: {value}"));
+/// Render curl options as a config file (`curl --config -`). Used so that OAuth tokens travel
+/// through the child's STDIN instead of its argv, where any process running `ps -axww` could read
+/// them. `flags` are value-less switches (curl rejects `silent = "true"`); `options` take a value.
+fn curl_config(
+    url: &str,
+    headers: &[(&str, &str)],
+    flags: &[&str],
+    options: &[(&str, String)],
+) -> String {
+    fn escape(value: &str) -> String {
+        let mut out = String::with_capacity(value.len() + 2);
+        for ch in value.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                '\n' => out.push_str("\\n"),
+                other => out.push(other),
+            }
+        }
+        out
     }
-    command.arg(url);
 
-    let output = command.output().context("couldn't run curl")?;
+    let mut config = String::new();
+    for flag in flags {
+        config.push_str(flag);
+        config.push('\n');
+    }
+    for (key, value) in options {
+        config.push_str(&format!("{key} = \"{}\"\n", escape(value)));
+    }
+    for (key, value) in headers {
+        config.push_str(&format!(
+            "header = \"{}\"\n",
+            escape(&format!("{key}: {value}"))
+        ));
+    }
+    config.push_str(&format!("url = \"{}\"\n", escape(url)));
+    config
+}
+
+/// Run curl with its options fed through stdin (see `curl_config`).
+fn run_curl(config: String) -> Result<std::process::Output> {
+    use std::io::Write;
+    let mut child = Command::new("curl")
+        .arg("--config")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("couldn't run curl")?;
+    child
+        .stdin
+        .take()
+        .context("couldn't write curl options")?
+        .write_all(config.as_bytes())
+        .context("couldn't write curl options")?;
+    child.wait_with_output().context("couldn't run curl")
+}
+
+pub(crate) fn curl_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {
+    let config = curl_config(
+        url,
+        headers,
+        &["silent", "show-error"],
+        &[
+            ("max-time", "20".to_string()),
+            // append status code as last line
+            ("write-out", "\n%{http_code}".to_string()),
+        ],
+    );
+    let output = run_curl(config)?;
     let full = String::from_utf8_lossy(&output.stdout);
     // Split off the status code appended by -w.
     let (body, status_str) = full
@@ -614,22 +685,18 @@ pub(crate) fn curl_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {
     Ok(body.to_owned())
 }
 
-fn curl_post(url: &str, headers: &[(&str, &str)], body: &str) -> Result<String> {
-    let mut command = Command::new("curl");
-    command
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--fail")
-        .arg("--max-time")
-        .arg("10")
-        .arg("-X")
-        .arg("POST");
-    for (key, value) in headers {
-        command.arg("-H").arg(format!("{key}: {value}"));
-    }
-    command.arg("--data").arg(body).arg(url);
-
-    let output = command.output().context("couldn't run curl")?;
+pub(crate) fn curl_post(url: &str, headers: &[(&str, &str)], body: &str) -> Result<String> {
+    let config = curl_config(
+        url,
+        headers,
+        &["silent", "show-error", "fail"],
+        &[
+            ("max-time", "10".to_string()),
+            ("request", "POST".to_string()),
+            ("data", body.to_string()),
+        ],
+    );
+    let output = run_curl(config)?;
     if !output.status.success() {
         anyhow::bail!("HTTP request failed");
     }
@@ -883,11 +950,225 @@ fn read_codex_rollout_quota() -> Result<QuotaInfo> {
 /// Auto-prime's confirmation step needs the truth straight from the provider right after
 /// sending "hi" — the Claude cache (60s) or the Codex rollout file (only updated by the CLI)
 /// would otherwise return a stale `reset_at`.
+// ---------------------------------------------------------------------------
+// Cursor CLI
+//
+// The dashboard's own endpoint reports the billing period's included usage:
+//   POST https://cursor.com/api/usage-summary
+//   Cookie: WorkosCursorSessionToken=<anything>::<accessToken>
+// It refuses state-changing requests without a matching Origin, and the id in front of `::` is
+// not validated (verified 2026-09-10) — only the token is, so no user id lookup is needed.
+// ---------------------------------------------------------------------------
+
+/// Placeholder for the id half of the session cookie: the server only validates the token.
+const CURSOR_COOKIE_USER: &str = "cli";
+
+/// Where an account keeps its Cursor token. Accounts added by the app log in with
+/// `HOME=<profile>` + the file credential store, so the token is at `<profile>/.cursor/auth.json`;
+/// the machine default's `config_dir` IS `~/.cursor`, so it sits directly inside; and a machine
+/// default that logged in normally has it in the login keychain instead.
+fn cursor_token(config_dir: &Path) -> Option<String> {
+    if let Some(token) = crate::tools::cursor_profile_token(config_dir) {
+        return Some(token);
+    }
+    // An app-managed profile always owns a `.cursor/` dir (created when its login starts). Falling
+    // back to the machine keychain from there would show the DEFAULT account's quota on someone
+    // else's card, so only the machine default may read the keychain.
+    if config_dir.join(".cursor").exists() {
+        return None;
+    }
+    read_json_field(&config_dir.join("auth.json"), "accessToken")
+        .or_else(|| read_keychain_blob("cursor-access-token"))
+}
+
+fn read_json_field(path: &Path, field: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get(field)
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
+/// Ask the CLI to refresh this account's token in place. Runs with `HOME=<profile>` and the file
+/// credential store so the refreshed pair is written back to `<profile>/.cursor/auth.json` — this
+/// is a plain status read, NOT an agent run, so the HOME override can't reach the user's shell.
+fn cursor_refresh_profile_token(config_dir: &Path) -> Option<String> {
+    if !crate::tools::cursor_auth_file(config_dir).exists() {
+        return None; // machine default / keychain login: nothing for us to refresh
+    }
+    let binary = crate::tools::command_path(crate::tools::CURSOR_BIN)?;
+    let _ = Command::new(binary)
+        .arg("status")
+        .env("HOME", config_dir)
+        .env("AGENT_CLI_CREDENTIAL_STORE", "file")
+        .output();
+    crate::tools::cursor_profile_token(config_dir)
+}
+
+fn read_cursor_quota(config_dir: &Path) -> Result<QuotaInfo> {
+    let token = cursor_token(config_dir)
+        .context("Not signed in — add the account again to sign in to Cursor")?;
+    let body = match cursor_usage_summary(&token) {
+        Ok(body) => body,
+        // A 401/403 usually just means the access token aged out; the CLI can renew it from the
+        // refresh token it stored next to it, so try that once before reporting failure.
+        Err(error) if is_auth_error(&error.to_string()) => {
+            let fresh = cursor_refresh_profile_token(config_dir)
+                .context("Cursor session expired — add the account again to sign in")?;
+            cursor_usage_summary(&fresh).context("Couldn't read Cursor usage")?
+        }
+        Err(error) => return Err(error).context("Couldn't read Cursor usage"),
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("Unexpected Cursor usage response")?;
+    Ok(cursor_quota_from_value(&value))
+}
+
+fn cursor_usage_summary(token: &str) -> Result<String> {
+    let cookie = format!("WorkosCursorSessionToken={CURSOR_COOKIE_USER}%3A%3A{token}");
+    curl_post(
+        "https://cursor.com/api/usage-summary",
+        &[
+            ("Cookie", cookie.as_str()),
+            ("Content-Type", "application/json"),
+            ("Origin", "https://cursor.com"),
+        ],
+        "{}",
+    )
+}
+
+fn is_auth_error(message: &str) -> bool {
+    message.contains("401") || message.contains("403") || message.contains("HTTP request failed")
+}
+
+fn cursor_quota_from_value(value: &serde_json::Value) -> QuotaInfo {
+    let reset = value
+        .get("billingCycleEnd")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let unlimited = value
+        .get("isUnlimited")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let percent = |pointer: &str| -> Option<f64> {
+        if unlimited {
+            return Some(0.0);
+        }
+        value
+            .pointer(pointer)
+            .and_then(|v| v.as_f64())
+            .map(|used| used.clamp(0.0, 100.0))
+    };
+    let window = |label: &str, percent: Option<f64>| QuotaWindow {
+        label: label.to_string(),
+        percent_used: percent,
+        reset_at: reset.clone(),
+        is_active: None,
+    };
+
+    let total = percent("/individualUsage/plan/totalPercentUsed");
+    let auto = percent("/individualUsage/plan/autoPercentUsed");
+    let api = percent("/individualUsage/plan/apiPercentUsed");
+
+    QuotaInfo {
+        five_hour: window("Included usage", total),
+        weekly: window("Named models (API)", api),
+        models: Some(vec![
+            window("Included usage", total),
+            window("Auto models", auto),
+            window("Named models (API)", api),
+        ]),
+        plan: value
+            .get("membershipType")
+            .and_then(|v| v.as_str())
+            .map(plan_label),
+        rate_limit_reset_credits: None,
+        prime_available: None,
+        updated_at: Some(chrono::Utc::now().to_rfc3339()),
+        error: None,
+    }
+}
+
+/// `pro_plus` → `Pro+`, `pro` → `Pro`.
+fn plan_label(raw: &str) -> String {
+    let mut label = String::new();
+    for (index, word) in raw.replace('_', " ").split_whitespace().enumerate() {
+        if word.eq_ignore_ascii_case("plus") {
+            label.push('+');
+            continue;
+        }
+        if index > 0 {
+            label.push(' ');
+        }
+        let mut chars = word.chars();
+        if let Some(first) = chars.next() {
+            label.extend(first.to_uppercase());
+            label.push_str(chars.as_str());
+        }
+    }
+    label
+}
+
+// ---------------------------------------------------------------------------
+// opencode (Zen "Go" subscription)
+//
+//   GET https://opencode.ai/zen/go/v1/usage   Authorization: Bearer <api key>
+// → { usage: { rolling|weekly|monthly: { percent, resetsAt } } }
+// The API key is per data dir, so each account profile has its own.
+// ---------------------------------------------------------------------------
+
+fn read_opencode_quota(config_dir: &Path) -> Result<QuotaInfo> {
+    let key = crate::tools::opencode_profile_key(config_dir)
+        .context("Not signed in — add the account again to sign in to opencode")?;
+    let authorization = format!("Bearer {key}");
+    let body = curl_get(
+        "https://opencode.ai/zen/go/v1/usage",
+        &[("Authorization", authorization.as_str())],
+    )
+    .context("Couldn't read opencode usage")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("Unexpected opencode usage response")?;
+    Ok(opencode_quota_from_value(&value))
+}
+
+fn opencode_quota_from_value(value: &serde_json::Value) -> QuotaInfo {
+    let window = |key: &str, label: &str| QuotaWindow {
+        label: label.to_string(),
+        percent_used: value
+            .pointer(&format!("/usage/{key}/percent"))
+            .and_then(|v| v.as_f64())
+            .map(|percent| percent.clamp(0.0, 100.0)),
+        reset_at: value
+            .pointer(&format!("/usage/{key}/resetsAt"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        is_active: None,
+    };
+    let rolling = window("rolling", "Rolling");
+    let weekly = window("weekly", "Weekly");
+    let monthly = window("monthly", "Monthly");
+
+    QuotaInfo {
+        five_hour: rolling.clone(),
+        weekly: weekly.clone(),
+        models: Some(vec![rolling, weekly, monthly]),
+        plan: Some("Go".to_string()),
+        rate_limit_reset_credits: None,
+        prime_available: None,
+        updated_at: Some(chrono::Utc::now().to_rfc3339()),
+        error: None,
+    }
+}
+
 pub(crate) fn read_live_five_hour(
     tool_id: &ToolId,
     config_dir: &Path,
 ) -> std::result::Result<QuotaWindow, LiveQuotaError> {
     match tool_id {
+        // Only the 5-hour-window tools can be primed; the rest never reach this path.
+        ToolId::Cursor | ToolId::Opencode => Err(LiveQuotaError::Unsupported),
         ToolId::Claude => {
             invalidate_claude_cache(config_dir);
             let quota = read_claude_quota(config_dir).map_err(|e| classify_live_quota_error(&e))?;
@@ -1595,6 +1876,22 @@ mod tests {
             Some("2026-06-05T03:00:00.033953+00:00")
         );
         assert!(quota.error.is_none());
+    }
+
+    #[test]
+    fn curl_config_keeps_secrets_off_the_command_line() {
+        let config = curl_config(
+            "https://example.com/usage",
+            &[("Authorization", "Bearer se\"cret")],
+            &["silent", "show-error"],
+            &[("max-time", "20".to_string())],
+        );
+        // Value-less switches must stay bare — `silent = "true"` makes curl reject the file.
+        assert!(config.starts_with("silent\nshow-error\n"));
+        assert!(config.contains("max-time = \"20\"\n"));
+        // The quote inside the header value is escaped the way curl's parser expects.
+        assert!(config.contains("header = \"Authorization: Bearer se\\\"cret\"\n"));
+        assert!(config.ends_with("url = \"https://example.com/usage\"\n"));
     }
 
     #[test]
