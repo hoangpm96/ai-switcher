@@ -71,7 +71,8 @@ const demoResetCredits: RateLimitResetCredits = {
 const demoOverlaySettings: OverlaySettings = {
   enabled: false,
   accounts: [],
-  opacity: 0.9,
+  opacity: 0.45,
+  hoverOpacity: 1,
   compact: false,
   clickThrough: false,
   rect: { x: 40, y: 60, width: 288, height: 330 },

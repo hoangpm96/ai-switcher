@@ -5,6 +5,59 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-10
+
+### Added
+
+- **Floating quota overlay.** A frameless, always-on-top window that keeps the quota bars visible
+  while you work in a terminal or editor. It can be dragged, resized from the bottom-right grip,
+  and stays on screen across Spaces and full-screen apps. Toggle it from the menu bar or Settings;
+  it reopens where you left it.
+- **The overlay fades out of the way.** It sits faint over whatever is underneath and becomes solid
+  while the pointer is over it, with both levels adjustable. In click-through mode — where clicks
+  pass straight through to the app behind — the pointer is tracked by the app, so hover-to-reveal
+  still works.
+- **Pick what the overlay shows.** Any combination of accounts across tools; picking nothing shows
+  the account each CLI is currently using.
+- **Cursor CLI and opencode are now managed like Claude Code and Codex** — multiple accounts, a
+  per-account command, switching the plain command, and per-account quota:
+  - Cursor reports included / auto-model / named-model usage for the billing period, plus the plan.
+  - opencode reports its rolling, weekly, and monthly Zen windows.
+  - Each account signs in to its own profile, so tokens never mix: opencode via `XDG_DATA_HOME`,
+    Cursor via an isolated credential file that its launcher passes in per invocation (the plain
+    `HOME` is never moved, so the agent's own shell commands keep working).
+- **Claude accounts show their plan** — Pro, Max 5x, Max 20x, or a team seat with the limits it
+  actually gets (Team Max 5x), next to the quota bars, in the overlay and in the menu bar.
+- **Unpriced models are called out in Usage.** When a model has no entry in the price data, the
+  costs shown are marked as a lower bound instead of quietly omitting it.
+
+### Fixed
+
+- **The account in use is now read from the active-profile file, not from account state.** An
+  account that hit 100% is marked exhausted, which previously made auto-switch skip the very case
+  it exists for, and let a delete leave the plain command pointing at a removed profile.
+- **Switching away from an API/proxy Codex account clears `OPENAI_API_KEY`.** An already-open
+  terminal used to keep the previous account's key exported.
+- **Streamed answers through the local API gateway are forwarded as they arrive.** Whole responses
+  were buffered first, which delayed every token and let a long answer grow memory without a bound;
+  non-streaming responses now have a size cap, and upstream connections have timeouts.
+- **Token usage is no longer double-counted** when a Claude message is rewritten across two scans,
+  and the gateway's usage file is written atomically under a lock.
+- **Anthropic streaming usage keeps its input and cache counts** (they arrive in a different event
+  than the output count).
+- **OAuth tokens no longer appear in the process list** — quota requests pass their headers to curl
+  over stdin instead of the command line.
+- **Prime is no longer offered for a Claude window that is already active** but has not published
+  its reset time yet.
+- **Creating an account can't be double-submitted**, refresh failures surface instead of silently
+  stopping the spinner, and a slow background refresh can no longer overwrite the result of a
+  switch or delete.
+- **The tool's own profile folder can't be chosen as its default config folder**, which used to
+  break every other account's shared config when that account was deleted.
+- **A Cursor account is no longer reported out of quota** when only its named-model API allowance is
+  spent — Composer, Auto and Grok keep drawing from the rest of the plan, so that sub-limit is shown
+  as a detail row instead of marking the account exhausted.
+
 ## [0.7.2] - 2026-07-12
 
 ### Added

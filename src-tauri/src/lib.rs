@@ -511,14 +511,12 @@ pub fn run() {
             // Menu-bar (tray) icon for quick account switching without opening the window.
             tray::create(app.handle())?;
 
-            // Reopen the floating quota overlay if it was left on last time.
-            if app
-                .state::<ManagedState>()
-                .overlay_settings()
-                .map(|settings| settings.enabled)
-                .unwrap_or(false)
-            {
-                let _ = overlay::show(app.handle());
+            // Reopen the floating quota overlay if it was left on last time. Going through
+            // `apply` (not `show`) also restores click-through and starts the pointer watcher.
+            if let Ok(settings) = app.state::<ManagedState>().overlay_settings() {
+                if settings.enabled {
+                    overlay::apply(app.handle(), &settings);
+                }
             }
 
             // First quota read for every CLI, off the startup path so a slow network can't

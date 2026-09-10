@@ -1115,11 +1115,8 @@ impl ManagedState {
     /// Persist overlay settings coming from the UI. Values are clamped here (not in the UI) so a
     /// hand-edited `state.json` can't produce an invisible or off-screen overlay.
     pub fn save_overlay_settings(&self, mut next: OverlaySettings) -> Result<OverlaySettings> {
-        next.opacity = if next.opacity.is_finite() {
-            next.opacity.clamp(0.25, 1.0)
-        } else {
-            1.0
-        };
+        next.opacity = clamp_opacity(next.opacity, 0.45);
+        next.hover_opacity = clamp_opacity(next.hover_opacity, 1.0);
         // Order matters (it's the row order), so keep the first occurrence of each key.
         let mut seen = std::collections::HashSet::new();
         next.accounts.retain(|key| seen.insert(key.clone()));
@@ -2444,6 +2441,16 @@ fn is_installed_resolved(data: &StoredState, tool_id: &ToolId) -> bool {
 /// NOT inferred from `state==Active` (an exhausted account is still the one the plain command uses,
 /// but its state is Exhausted, so inferring from state would be wrong). Empty/missing file = machine Default.
 /// Antigravity is copy-swap (no active file), so it still follows `state==Active`.
+/// Keep an overlay opacity usable: never fully invisible (the user could not find it again) and
+/// never above solid. A non-finite value from a hand-edited state file falls back to `fallback`.
+fn clamp_opacity(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.15, 1.0)
+    } else {
+        fallback
+    }
+}
+
 /// Resolve symlinks/`..` so two paths that name the same folder compare equal. Falls back to the
 /// path as given when it doesn't exist yet (canonicalize fails on missing paths).
 fn canonical_path(path: &std::path::Path) -> std::path::PathBuf {

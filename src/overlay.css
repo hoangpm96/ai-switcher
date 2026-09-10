@@ -14,8 +14,8 @@ html.ovWindow #root {
 }
 
 .ovRoot {
-  /* --ov-alpha is set inline from the saved opacity setting. */
-  --ov-alpha: 0.9;
+  /* --ov-opacity is set inline: the idle level, or the hover level while pointed at. */
+  --ov-opacity: 1;
   --ov-text: #f4efe8;
   --ov-text-2: #b7ac9d;
   --ov-text-3: #8a8073;
@@ -31,9 +31,13 @@ html.ovWindow #root {
   overflow: hidden;
   border-radius: 12px;
   border: 1px solid var(--ov-line);
-  background: rgba(16, 14, 12, var(--ov-alpha));
+  background: rgba(16, 14, 12, 0.92);
   -webkit-backdrop-filter: blur(18px) saturate(150%);
   backdrop-filter: blur(18px) saturate(150%);
+  /* Fading the whole panel (not just its background) is what makes the app underneath readable
+     through it. Fast enough to feel attached to the pointer, slow enough not to flicker. */
+  opacity: var(--ov-opacity);
+  transition: opacity 0.16s ease-out;
   color: var(--ov-text);
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
   font-size: 11px;

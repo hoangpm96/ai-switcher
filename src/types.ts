@@ -60,8 +60,10 @@ export interface OverlaySettings {
   enabled: boolean;
   /** `"<tool>:<accountId>"` rows to render. Empty = the account in use of each CLI. */
   accounts: string[];
-  /** Background opacity, 0.25..1. */
+  /** Opacity while the pointer is elsewhere, 0.15..1 — low enough to see through. */
   opacity: number;
+  /** Opacity while the pointer is over the overlay, 0.15..1. */
+  hoverOpacity: number;
   /** One line per account (weekly bar hidden). */
   compact: boolean;
   /** Clicks pass through to the app behind the overlay. */

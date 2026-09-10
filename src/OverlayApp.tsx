@@ -25,7 +25,8 @@ const REFRESHABLE_TOOLS: ToolId[] = ["claude", "codex", "cursor", "opencode"];
 const defaultSettings: OverlaySettings = {
   enabled: true,
   accounts: [],
-  opacity: 0.9,
+  opacity: 0.45,
+  hoverOpacity: 1,
   compact: false,
   clickThrough: false,
   rect: { x: 40, y: 60, width: 288, height: 330 },
@@ -100,6 +101,10 @@ export function OverlayApp() {
   const [settings, setSettings] = useState<OverlaySettings>(defaultSettings);
   const [showSettings, setShowSettings] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // Ghost mode: the overlay sits faint over whatever is underneath and only becomes solid while
+  // the pointer is on it. In click-through mode the window gets no mouse events at all, so the
+  // backend samples the pointer and pushes the state in via `overlay-hover` instead.
+  const [hovered, setHovered] = useState(false);
   // Bumped on a timer so the "resets in …" labels count down without refetching quota.
   const [, setTick] = useState(0);
   const mounted = useRef(true);
@@ -125,6 +130,14 @@ export function OverlayApp() {
   // The backend pushes a snapshot after a switch / background refresh / auto-switch.
   useEffect(() => {
     const unlisten = listen<AppSnapshot>("snapshot-changed", (event) => setSnapshot(event.payload));
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Pointer state pushed from the backend while clicks pass through the window.
+  useEffect(() => {
+    const unlisten = listen<boolean>("overlay-hover", (event) => setHovered(event.payload));
     return () => {
       void unlisten.then((fn) => fn());
     };
@@ -188,8 +201,17 @@ export function OverlayApp() {
     [snapshot, settings.accounts],
   );
 
+  // Reading the settings needs the panel fully legible, whatever the idle opacity is.
+  const solid = hovered || showSettings;
+  const opacity = solid ? settings.hoverOpacity : settings.opacity;
+
   return (
-    <div className="ovRoot" style={{ "--ov-alpha": settings.opacity } as React.CSSProperties}>
+    <div
+      className="ovRoot"
+      style={{ "--ov-opacity": opacity } as React.CSSProperties}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
       <header className="ovBar" data-tauri-drag-region>
         <span className="ovTitle" data-tauri-drag-region>
           Quota
@@ -368,20 +390,35 @@ function OverlaySettingsPanel({
       </label>
       {settings.clickThrough && (
         <p className="ovHint">
-          Overlay sẽ không nhận chuột nữa. Tắt lại ở Settings trong cửa sổ chính.
+          Chuột xuyên qua nhưng overlay vẫn sáng lên khi rê tới. Tắt lại ở Settings trong cửa sổ
+          chính (overlay không bấm được nữa).
         </p>
       )}
       <label className="ovOpt ovSlider">
-        Độ mờ
+        Lúc rảnh
         <input
           type="range"
-          min={25}
+          min={15}
           max={100}
           step={5}
           value={Math.round(settings.opacity * 100)}
           onChange={(event) => onChange({ ...settings, opacity: Number(event.target.value) / 100 })}
         />
         <span>{Math.round(settings.opacity * 100)}%</span>
+      </label>
+      <label className="ovOpt ovSlider">
+        Khi rê chuột
+        <input
+          type="range"
+          min={15}
+          max={100}
+          step={5}
+          value={Math.round(settings.hoverOpacity * 100)}
+          onChange={(event) =>
+            onChange({ ...settings, hoverOpacity: Number(event.target.value) / 100 })
+          }
+        />
+        <span>{Math.round(settings.hoverOpacity * 100)}%</span>
       </label>
     </div>
   );

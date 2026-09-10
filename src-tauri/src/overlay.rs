@@ -10,9 +10,17 @@
 
 use crate::app_state::ManagedState;
 use crate::models::{OverlayRect, OverlaySettings};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub const LABEL: &str = "overlay";
+
+/// Generation counter for the hover watcher below. Bumping it retires the running thread.
+static HOVER_WATCH: AtomicU64 = AtomicU64::new(0);
+
+/// How often the click-through hover watcher samples the pointer.
+const HOVER_POLL: Duration = Duration::from_millis(140);
 
 /// Opens the overlay (or focuses/reveals it if it already exists).
 pub fn show(app: &AppHandle) -> tauri::Result<()> {
@@ -70,7 +78,89 @@ pub fn apply(app: &AppHandle, settings: &OverlaySettings) {
     if let Some(window) = app.get_webview_window(LABEL) {
         let _ = window.set_ignore_cursor_events(settings.click_through);
     }
+    sync_hover_watch(app, settings);
     let _ = app.emit("overlay-settings-changed", settings);
+}
+
+/// Start or stop the pointer watcher.
+///
+/// The overlay fades in when the pointer is over it. Normally the webview's own mouse events do
+/// that for free — but in click-through mode the window ignores the cursor entirely, so no DOM
+/// event ever arrives. There the app samples the pointer position instead and pushes the hover
+/// state in, which is what makes "clicks pass through" and "brighten when I point at it" work at
+/// the same time.
+fn sync_hover_watch(app: &AppHandle, settings: &OverlaySettings) {
+    // Any running watcher belongs to the previous settings — retire it.
+    let generation = HOVER_WATCH.fetch_add(1, Ordering::SeqCst) + 1;
+    if !(settings.enabled && settings.click_through) {
+        // Leaving click-through: drop any stale "hovered" state the watcher pushed.
+        let _ = app.emit("overlay-hover", false);
+        return;
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut last = None;
+        loop {
+            if HOVER_WATCH.load(Ordering::SeqCst) != generation {
+                return; // superseded by a newer settings change
+            }
+            let Some(window) = app.get_webview_window(LABEL) else {
+                return; // overlay closed
+            };
+            let hovered = pointer_is_over(&app, &window).unwrap_or(false);
+            if last != Some(hovered) {
+                last = Some(hovered);
+                let _ = app.emit("overlay-hover", hovered);
+            }
+            std::thread::sleep(HOVER_POLL);
+        }
+    });
+}
+
+/// Whether the pointer currently sits inside the overlay's frame (physical pixels, so no scale
+/// conversion is needed — both readings come from the same coordinate space).
+fn pointer_is_over(app: &AppHandle, window: &tauri::WebviewWindow) -> tauri::Result<bool> {
+    let cursor = app.cursor_position()?;
+    let origin = window.outer_position()?;
+    let size = window.outer_size()?;
+    Ok(rect_contains(
+        (origin.x as f64, origin.y as f64),
+        (size.width as f64, size.height as f64),
+        (cursor.x, cursor.y),
+    ))
+}
+
+/// Point-in-rect on the screen's physical pixel grid. Kept separate so the containment maths can
+/// be tested without a real window (a sign slip here would silently disable hover-to-reveal).
+fn rect_contains(origin: (f64, f64), size: (f64, f64), point: (f64, f64)) -> bool {
+    point.0 >= origin.0
+        && point.1 >= origin.1
+        && point.0 < origin.0 + size.0
+        && point.1 < origin.1 + size.1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rect_contains;
+
+    #[test]
+    fn hover_rect_covers_the_window_and_nothing_else() {
+        let origin = (100.0, 50.0);
+        let size = (280.0, 330.0);
+        // inside: top-left corner, middle, and just short of the far edge
+        assert!(rect_contains(origin, size, (100.0, 50.0)));
+        assert!(rect_contains(origin, size, (240.0, 200.0)));
+        assert!(rect_contains(origin, size, (379.9, 379.9)));
+        // outside on every side, including the exclusive far edge
+        assert!(!rect_contains(origin, size, (99.0, 200.0)));
+        assert!(!rect_contains(origin, size, (240.0, 49.0)));
+        assert!(!rect_contains(origin, size, (380.0, 200.0)));
+        assert!(!rect_contains(origin, size, (240.0, 380.0)));
+        // a second monitor to the left uses negative coordinates
+        assert!(rect_contains((-900.0, -200.0), size, (-800.0, -100.0)));
+        assert!(!rect_contains((-900.0, -200.0), size, (-1000.0, -100.0)));
+    }
 }
 
 /// Keeps a restored position on an actually-connected monitor. Unplugging the external display the

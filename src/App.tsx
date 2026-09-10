@@ -1077,8 +1077,8 @@ function OverlaySettingsBar({
         <div className="wakeText">
           <strong>Hiện overlay</strong>
           <span className="muted">
-            Luôn nổi trên cùng, kéo để di chuyển, kéo góc dưới phải để đổi kích thước. Bật/tắt nhanh
-            ở menu bar.
+            Luôn nổi trên cùng, kéo để di chuyển, kéo góc dưới phải để đổi kích thước. Mặc định mờ
+            để không che tầm nhìn, rê chuột vào là rõ lại. Bật/tắt nhanh ở menu bar.
           </span>
         </div>
         <button onClick={() => void save({ ...settings, enabled: !settings.enabled })}>
@@ -1127,10 +1127,10 @@ function OverlaySettingsBar({
           Cho chuột xuyên qua
         </label>
         <label className="overlayOpacity">
-          Độ mờ
+          Độ mờ lúc rảnh
           <input
             type="range"
-            min={25}
+            min={15}
             max={100}
             step={5}
             value={Math.round(settings.opacity * 100)}
@@ -1139,6 +1139,20 @@ function OverlaySettingsBar({
             }
           />
           <span>{Math.round(settings.opacity * 100)}%</span>
+        </label>
+        <label className="overlayOpacity">
+          Khi rê chuột vào
+          <input
+            type="range"
+            min={15}
+            max={100}
+            step={5}
+            value={Math.round(settings.hoverOpacity * 100)}
+            onChange={(event) =>
+              void save({ ...settings, hoverOpacity: Number(event.target.value) / 100 })
+            }
+          />
+          <span>{Math.round(settings.hoverOpacity * 100)}%</span>
         </label>
       </div>
     </div>

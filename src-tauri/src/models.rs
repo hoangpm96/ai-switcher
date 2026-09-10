@@ -512,9 +512,14 @@ pub struct OverlaySettings {
     /// `"<tool>:<accountId>"` rows to render. Empty = the active account of each CLI.
     #[serde(default)]
     pub accounts: Vec<String>,
-    /// Window background opacity, 0.25..1.0.
+    /// Opacity while the pointer is elsewhere, 0.15..1.0. Low values let the overlay sit on top
+    /// of whatever the user is reading without getting in the way.
     #[serde(default = "default_overlay_opacity")]
     pub opacity: f64,
+    /// Opacity while the pointer is over the overlay, 0.15..1.0. Normally higher than `opacity`:
+    /// point at it to read the numbers, move away and it fades back out.
+    #[serde(default = "default_overlay_hover_opacity")]
+    pub hover_opacity: f64,
     /// Hide the weekly bar and shrink each row to a single line.
     #[serde(default)]
     pub compact: bool,
@@ -527,7 +532,11 @@ pub struct OverlaySettings {
 }
 
 fn default_overlay_opacity() -> f64 {
-    0.9
+    0.45
+}
+
+fn default_overlay_hover_opacity() -> f64 {
+    1.0
 }
 
 impl Default for OverlaySettings {
@@ -536,6 +545,7 @@ impl Default for OverlaySettings {
             enabled: false,
             accounts: Vec::new(),
             opacity: default_overlay_opacity(),
+            hover_opacity: default_overlay_hover_opacity(),
             compact: false,
             click_through: false,
             rect: OverlayRect::default(),
