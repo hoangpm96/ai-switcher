@@ -68,6 +68,14 @@ pub fn read_quota(tool_id: &ToolId, config_dir: &Path) -> QuotaInfo {
         ToolId::Antigravity => QuotaInfo::with_message("Open Antigravity IDE to read quota"),
         _ => QuotaInfo::with_message(format!("Couldn't read quota: {e:#}")),
     });
+    // A Claude plan label comes from the stored credential, not the usage response, so it stays
+    // available even when that request failed (stale token) — the row reads "Pro · couldn't read
+    // quota" instead of dropping the plan. Only on the error path: the happy path already set it.
+    if matches!(tool_id, ToolId::Claude) && quota.error.is_some() {
+        quota.plan = claude_credentials_value(config_dir)
+            .as_ref()
+            .and_then(claude_plan);
+    }
     // Tell the UI whether "Prime ngay" should be offered for this account. Computed centrally
     // here (one place, one clock read) rather than in each endpoint parser.
     quota.prime_available = prime_available_for(tool_id, &quota);
@@ -236,7 +244,12 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
         }
     }
 
-    let token = claude_oauth_token_fresh(config_dir)
+    // One credential read serves both the request (accessToken) and the plan label
+    // (subscriptionType / rateLimitTier) — a second read would hit the keychain again.
+    let credentials = claude_credentials_value(config_dir);
+    let token = credentials
+        .as_ref()
+        .and_then(claude_access_token)
         .context("couldn't get Claude's OAuth token")?;
     let version = claude_version().unwrap_or_else(|| "0.0.0".to_string());
     let user_agent = format!("claude-code/{version}");
@@ -259,7 +272,7 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
 
     let value: serde_json::Value =
         serde_json::from_str(&body).context("Claude usage response is not JSON")?;
-    let quota = quota_from_claude_usage(&value)?;
+    let quota = quota_from_claude_usage(&value, credentials.as_ref())?;
 
     if let Ok(mut guard) = CLAUDE_CACHE.lock() {
         guard.insert(cache_key, (Instant::now(), quota.clone()));
@@ -267,7 +280,10 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
     Ok(quota)
 }
 
-fn quota_from_claude_usage(value: &serde_json::Value) -> Result<QuotaInfo> {
+fn quota_from_claude_usage(
+    value: &serde_json::Value,
+    credentials: Option<&serde_json::Value>,
+) -> Result<QuotaInfo> {
     let session_active = claude_session_is_active(value);
     let five_hour = claude_window("5-hour limit", value.get("five_hour"), session_active);
     let weekly = claude_window("Weekly limit", value.get("seven_day"), None);
@@ -280,7 +296,7 @@ fn quota_from_claude_usage(value: &serde_json::Value) -> Result<QuotaInfo> {
         five_hour,
         weekly,
         models: None,
-        plan: claude_plan(value),
+        plan: credentials.and_then(claude_plan),
         rate_limit_reset_credits: None,
         // Overwritten centrally by `read_quota` via `prime_available_for`.
         prime_available: None,
@@ -289,23 +305,73 @@ fn quota_from_claude_usage(value: &serde_json::Value) -> Result<QuotaInfo> {
     })
 }
 
-/// Best-effort plan label from Claude's usage payload. The endpoint isn't documented to
-/// always carry one, so try a few likely keys and ignore if absent.
-fn claude_plan(value: &serde_json::Value) -> Option<String> {
-    for key in [
-        "subscription_type",
-        "plan",
-        "plan_type",
-        "tier",
-        "account_type",
-    ] {
-        if let Some(raw) = value.get(key).and_then(serde_json::Value::as_str) {
-            if let Some(plan) = pretty_plan(raw) {
-                return Some(plan);
-            }
+/// Plan label for a Claude account, read from the stored credential.
+///
+/// `GET /api/oauth/usage` carries NO plan/tier/subscription field at all (verified live
+/// 2026-09-10) — unlike Codex's `plan_type` or Antigravity's `planInfo.planName` — so the label
+/// comes from the credential blob instead: `claudeAiOauth.subscriptionType` ("pro" / "max" /
+/// "team") plus `claudeAiOauth.rateLimitTier` ("default_claude_max_5x" / "..._20x"), which is the
+/// only thing that separates Max 5x from Max 20x. (`GET /api/oauth/profile` returns the same via
+/// `organization.organization_type` + `rate_limit_tier`, but that would cost an extra request.)
+fn claude_plan(credentials: &serde_json::Value) -> Option<String> {
+    let oauth = credentials.get("claudeAiOauth")?;
+    let field = |key: &str| {
+        oauth
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(|raw| raw.trim().to_lowercase())
+    };
+    let subscription = field("subscriptionType")?;
+    let tier = field("rateLimitTier").unwrap_or_default();
+    match subscription.as_str() {
+        "" | "free" | "unknown" => None,
+        // "team" / "enterprise" alone says who pays, not what the seat gets — the limits behind it
+        // (Max 5x, Pro, ...) live in `rateLimitTier`, so show both: "Team Max 5x".
+        "team" | "enterprise" => {
+            let org = if subscription == "team" {
+                "Team"
+            } else {
+                "Enterprise"
+            };
+            Some(match tier_plan(&tier) {
+                Some(seat) => format!("{org} {seat}"),
+                None => org.to_string(),
+            })
         }
+        "max" => Some(max_label(&tier)),
+        "pro" => Some("Pro".to_string()),
+        other => pretty_plan(other),
+    }
+}
+
+/// The plan a `rateLimitTier` implies: `default_claude_max_20x` → "Max 20x",
+/// `default_claude_pro` → "Pro". The generic personal tier (`default_claude_ai`) implies none.
+fn tier_plan(tier: &str) -> Option<String> {
+    if tier.contains("max") {
+        return Some(max_label(tier));
+    }
+    if tier.contains("pro") {
+        return Some("Pro".to_string());
     }
     None
+}
+
+/// "Max 20x" when the tier names a multiplier, plain "Max" otherwise.
+fn max_label(tier: &str) -> String {
+    match tier_multiplier(tier) {
+        Some(multiplier) => format!("Max {multiplier}"),
+        None => "Max".to_string(),
+    }
+}
+
+/// The `5x` / `20x` suffix of a rate-limit tier like `default_claude_max_20x`, if it has one.
+fn tier_multiplier(tier: &str) -> Option<&str> {
+    let last = tier.rsplit('_').next()?;
+    let digits = last.strip_suffix('x')?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(last)
 }
 
 fn claude_window(
@@ -342,9 +408,17 @@ fn claude_session_is_active(value: &serde_json::Value) -> Option<bool> {
 }
 
 pub(crate) fn claude_oauth_token(config_dir: &Path) -> Option<String> {
-    let raw = claude_credentials_blob(config_dir)?;
-    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    value
+    claude_access_token(&claude_credentials_value(config_dir)?)
+}
+
+/// The stored credential blob (keychain, or the seeded file) parsed as JSON.
+fn claude_credentials_value(config_dir: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&claude_credentials_blob(config_dir)?).ok()
+}
+
+/// `claudeAiOauth.accessToken` out of a parsed credential blob.
+fn claude_access_token(credentials: &serde_json::Value) -> Option<String> {
+    credentials
         .get("claudeAiOauth")
         .and_then(|oauth| oauth.get("accessToken"))
         .and_then(serde_json::Value::as_str)
@@ -1868,7 +1942,7 @@ mod tests {
     fn parses_claude_oauth_usage() {
         let body = r#"{"five_hour":{"utilization":4.0,"resets_at":"2026-05-31T11:00:00.033919+00:00"},"seven_day":{"utilization":14.0,"resets_at":"2026-06-05T03:00:00.033953+00:00"},"seven_day_sonnet":{"utilization":0.0,"resets_at":null},"extra_usage":{"is_enabled":false}}"#;
         let value: serde_json::Value = serde_json::from_str(body).unwrap();
-        let quota = quota_from_claude_usage(&value).unwrap();
+        let quota = quota_from_claude_usage(&value, None).unwrap();
         assert_eq!(quota.five_hour.percent_used, Some(4.0));
         assert_eq!(quota.weekly.percent_used, Some(14.0));
         assert_eq!(
@@ -1876,6 +1950,69 @@ mod tests {
             Some("2026-06-05T03:00:00.033953+00:00")
         );
         assert!(quota.error.is_none());
+        // The usage payload has no plan field at all, so without a credential there is no label.
+        assert_eq!(quota.plan, None);
+    }
+
+    #[test]
+    fn claude_plan_label_comes_from_the_stored_credential() {
+        let blob = |subscription: &str, tier: &str| {
+            serde_json::json!({
+                "claudeAiOauth": { "subscriptionType": subscription, "rateLimitTier": tier }
+            })
+        };
+        let label = |subscription: &str, tier: &str| claude_plan(&blob(subscription, tier));
+
+        assert_eq!(
+            label("max", "default_claude_max_20x").as_deref(),
+            Some("Max 20x")
+        );
+        assert_eq!(
+            label("max", "default_claude_max_5x").as_deref(),
+            Some("Max 5x")
+        );
+        assert_eq!(label("max", "").as_deref(), Some("Max"));
+        assert_eq!(label("pro", "default_claude_ai").as_deref(), Some("Pro"));
+        // A seat on a team/enterprise plan shows the limits it actually gets, not just who pays.
+        assert_eq!(
+            label("team", "default_claude_max_5x").as_deref(),
+            Some("Team Max 5x")
+        );
+        assert_eq!(
+            label("team", "default_claude_pro").as_deref(),
+            Some("Team Pro")
+        );
+        assert_eq!(label("team", "default_claude_ai").as_deref(), Some("Team"));
+        assert_eq!(
+            label("enterprise", "default_claude_max_20x").as_deref(),
+            Some("Enterprise Max 20x")
+        );
+        assert_eq!(label("free", ""), None);
+        assert_eq!(
+            claude_plan(&serde_json::json!({ "claudeAiOauth": {} })),
+            None
+        );
+        assert_eq!(claude_plan(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn claude_quota_takes_its_plan_from_the_credential() {
+        let body = r#"{"five_hour":{"utilization":9.0,"resets_at":"2026-09-10T08:09:59.890933+00:00"},"seven_day":{"utilization":17.0,"resets_at":"2026-09-14T17:59:59.890962+00:00"}}"#;
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let credentials = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "x",
+                "subscriptionType": "max",
+                "rateLimitTier": "default_claude_max_5x"
+            }
+        });
+        let quota = quota_from_claude_usage(&value, Some(&credentials)).unwrap();
+        assert_eq!(quota.plan.as_deref(), Some("Max 5x"));
+        assert_eq!(
+            claude_access_token(&credentials).as_deref(),
+            Some("x"),
+            "the same blob feeds the request token"
+        );
     }
 
     #[test]

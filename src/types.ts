@@ -28,7 +28,11 @@ export interface QuotaInfo {
   weekly: QuotaWindow;
   /** Per-model quota detail (Antigravity). Absent for Claude/Codex. */
   models?: QuotaWindow[] | null;
-  /** Subscription plan label (e.g. "Plus", "Pro", "Max"). Absent when the API omits it. */
+  /**
+   * Subscription plan label — Claude "Pro" / "Max 5x" / "Max 20x" / "Team Max 5x" (from the
+   * stored credential, since the usage endpoint has no plan field), Codex "Plus" / "Pro",
+   * Antigravity "Pro". Absent on a free plan or when the source omits it.
+   */
   plan?: string | null;
   /** Codex usage-limit reset credits, including expiry rows when the detail endpoint is available. */
   rateLimitResetCredits?: RateLimitResetCredits | null;

@@ -31,10 +31,12 @@ const quota = (
   week: number | null,
   error: string | null = null,
   rateLimitResetCredits?: RateLimitResetCredits,
+  plan?: string,
 ) => ({
   fiveHour: { label: "5-hour limit", percentUsed: five, resetAt: "2026-05-31T15:30:00Z" },
   weekly: { label: "Weekly limit", percentUsed: week, resetAt: "2026-06-02T00:00:00Z" },
   rateLimitResetCredits,
+  plan,
   updatedAt: "2026-05-31T08:00:00Z",
   error,
 });
@@ -127,18 +129,18 @@ const demoSnapshot: AppSnapshot = {
         {
           id: "default-claude", toolId: "claude", name: "Machine default", state: "idle",
           fingerprint: "default", createdAt: "2026-05-20T10:00:00Z", updatedAt: "2026-05-31T08:00:00Z",
-          lastUsedAt: null, quota: quota(32, 18), launcherCommand: null, isDefault: true,
+          lastUsedAt: null, quota: quota(32, 18, null, undefined, "Max 5x"), launcherCommand: null, isDefault: true,
         },
         {
           id: "c2", toolId: "claude", name: "Work", state: "active", fingerprint: "profile:c2",
           createdAt: "2026-05-21T10:00:00Z", updatedAt: "2026-05-30T08:00:00Z",
-          lastUsedAt: "2026-05-29T19:10:00Z", quota: quota(82, 70),
+          lastUsedAt: "2026-05-29T19:10:00Z", quota: quota(82, 70, null, undefined, "Team Max 5x"),
           launcherCommand: "claude-work", isDefault: false,
         },
         {
           id: "c3", toolId: "claude", name: "Client", state: "exhausted", fingerprint: "profile:c3",
           createdAt: "2026-05-22T10:00:00Z", updatedAt: "2026-05-31T06:00:00Z",
-          lastUsedAt: "2026-05-31T05:00:00Z", quota: quota(100, 96),
+          lastUsedAt: "2026-05-31T05:00:00Z", quota: quota(100, 96, null, undefined, "Pro"),
           launcherCommand: "claude-client", isDefault: false,
         },
       ],
