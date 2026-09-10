@@ -176,11 +176,11 @@ const demoSnapshot: AppSnapshot = {
           lastUsedAt: null, launcherCommand: null, isDefault: true,
           quota: {
             fiveHour: { label: "Included usage", percentUsed: 35, resetAt: "2026-09-27T17:05:49Z" },
-            weekly: { label: "Named models (API)", percentUsed: 100, resetAt: "2026-09-27T17:05:49Z" },
+            weekly: { label: "Billing cycle", percentUsed: null, resetAt: "2026-09-27T17:05:49Z" },
             models: [
               { label: "Included usage", percentUsed: 35, resetAt: "2026-09-27T17:05:49Z" },
               { label: "Auto models", percentUsed: 29, resetAt: "2026-09-27T17:05:49Z" },
-              { label: "Named models (API)", percentUsed: 100, resetAt: "2026-09-27T17:05:49Z" },
+              { label: "External models (API)", percentUsed: 100, resetAt: "2026-09-27T17:05:49Z" },
             ],
             plan: "Pro+", updatedAt: "2026-09-10T08:00:00Z", error: null,
           },
@@ -191,11 +191,11 @@ const demoSnapshot: AppSnapshot = {
           lastUsedAt: "2026-09-10T07:00:00Z", launcherCommand: "cursor-agent-work", isDefault: false,
           quota: {
             fiveHour: { label: "Included usage", percentUsed: 12, resetAt: "2026-09-30T00:00:00Z" },
-            weekly: { label: "Named models (API)", percentUsed: 4, resetAt: "2026-09-30T00:00:00Z" },
+            weekly: { label: "Billing cycle", percentUsed: null, resetAt: "2026-09-30T00:00:00Z" },
             models: [
               { label: "Included usage", percentUsed: 12, resetAt: "2026-09-30T00:00:00Z" },
               { label: "Auto models", percentUsed: 15, resetAt: "2026-09-30T00:00:00Z" },
-              { label: "Named models (API)", percentUsed: 4, resetAt: "2026-09-30T00:00:00Z" },
+              { label: "External models (API)", percentUsed: 4, resetAt: "2026-09-30T00:00:00Z" },
             ],
             plan: "Pro", updatedAt: "2026-09-10T08:00:00Z", error: null,
           },

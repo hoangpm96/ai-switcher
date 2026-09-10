@@ -1146,13 +1146,25 @@ fn cursor_quota_from_value(value: &serde_json::Value) -> QuotaInfo {
     let auto = percent("/individualUsage/plan/autoPercentUsed");
     let api = percent("/individualUsage/plan/apiPercentUsed");
 
+    // Only `totalPercentUsed` gates the account. It measures the whole pot the plan can spend
+    // (`breakdown.included + bonus`), which is what Cursor's own models — Composer, Auto, Grok —
+    // draw from. `apiPercentUsed` is a SUB-LIMIT for externally-named models (Cursor calls them
+    // "named models"): it reads 100% as soon as the included API allowance is gone, while Composer
+    // and Auto keep working off the rest of the pot. Putting it in a top-level window made
+    // `is_exhausted` mark the account "Out of quota" at 100% API even with 65% of the pot left, so
+    // it stays a detail row only. Cursor bills per month, so there is no second window to report.
     QuotaInfo {
         five_hour: window("Included usage", total),
-        weekly: window("Named models (API)", api),
+        weekly: QuotaWindow {
+            label: "Billing cycle".to_string(),
+            percent_used: None,
+            reset_at: reset.clone(),
+            is_active: None,
+        },
         models: Some(vec![
             window("Included usage", total),
             window("Auto models", auto),
-            window("Named models (API)", api),
+            window("External models (API)", api),
         ]),
         plan: value
             .get("membershipType")
@@ -2013,6 +2025,41 @@ mod tests {
             Some("x"),
             "the same blob feeds the request token"
         );
+    }
+
+    #[test]
+    fn cursor_api_sublimit_stays_a_detail_row() {
+        // Shape of a live Pro+ response: the included API allowance is spent (100%) while only 35%
+        // of the whole pot (included + bonus) is gone, so Composer/Auto/Grok still run.
+        let body = r#"{"billingCycleStart":"2026-08-27T17:05:49.000Z","billingCycleEnd":"2026-09-27T17:05:49.000Z","membershipType":"pro_plus","limitType":"user","isUnlimited":false,"individualUsage":{"plan":{"enabled":true,"used":7000,"limit":7000,"remaining":0,"breakdown":{"included":7000,"bonus":38864,"total":45864},"autoPercentUsed":29.028333333333332,"apiPercentUsed":100,"totalPercentUsed":35.01068702290077},"onDemand":{"enabled":false,"used":0,"limit":null,"remaining":null}},"teamUsage":{}}"#;
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let quota = cursor_quota_from_value(&value);
+
+        assert!((quota.five_hour.percent_used.unwrap() - 35.010_687).abs() < 1e-6);
+        // The 100% API sub-limit must NOT land in a top-level window: `is_exhausted` takes the max
+        // of the two and would report "Out of quota" with two thirds of the pot still spendable.
+        assert_eq!(quota.weekly.percent_used, None);
+        assert_eq!(
+            quota.five_hour.reset_at.as_deref(),
+            Some("2026-09-27T17:05:49.000Z")
+        );
+        assert_eq!(quota.plan.as_deref(), Some("Pro+"));
+
+        let models = quota.models.expect("cursor reports its three rows");
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[1].label, "Auto models");
+        assert!((models[1].percent_used.unwrap() - 29.028_333).abs() < 1e-6);
+        assert_eq!(models[2].label, "External models (API)");
+        assert_eq!(models[2].percent_used, Some(100.0));
+    }
+
+    #[test]
+    fn cursor_unlimited_plan_reads_as_unused() {
+        let body = r#"{"billingCycleEnd":"2026-09-27T17:05:49.000Z","membershipType":"enterprise","isUnlimited":true,"individualUsage":{"plan":{"apiPercentUsed":100,"totalPercentUsed":80}}}"#;
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let quota = cursor_quota_from_value(&value);
+        assert_eq!(quota.five_hour.percent_used, Some(0.0));
+        assert_eq!(quota.plan.as_deref(), Some("Enterprise"));
     }
 
     #[test]
