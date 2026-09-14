@@ -16,9 +16,10 @@ use app_state::ManagedState;
 use models::{
     AddAccountInput, AddApiAccountInput, ApiUsageReport, AppSnapshot, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
-    DeleteApiGatewayKeyInput, DetectionReport, OverlayRect, OverlaySettings, RenameAccountInput,
-    SaveApiGatewayComboInput, PrimeNowInput, SetApiGatewayAccountInput, SetLauncherInput,
-    SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId, UsageReport,
+    DeleteApiGatewayKeyInput, DetectionReport, OverlayRect, OverlaySettings, PrimeNowInput,
+    RenameAccountInput, SaveApiGatewayComboInput, SetAccountHiddenInput, SetApiGatewayAccountInput,
+    SetLauncherInput, SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId,
+    UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -118,6 +119,17 @@ fn set_launcher(
     input: SetLauncherInput,
 ) -> Result<AppSnapshot, String> {
     state.set_launcher(input).map_err(display_error)
+}
+
+#[tauri::command]
+fn set_account_hidden(
+    app: tauri::AppHandle,
+    state: State<'_, ManagedState>,
+    input: SetAccountHiddenInput,
+) -> Result<AppSnapshot, String> {
+    let snapshot = state.set_account_hidden(input).map_err(display_error)?;
+    tray::rebuild(&app);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -478,6 +490,7 @@ pub fn run() {
             rename_account,
             switch_account,
             set_launcher,
+            set_account_hidden,
             delete_account,
             accept_disclaimer,
             antigravity_new_login,

@@ -4,9 +4,9 @@ use crate::models::{
     ApiUsageReport, AppSnapshot, AutoSwitchSetting, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, OverlayRect, OverlaySettings, QuotaInfo,
-    RenameAccountInput,
-    SaveApiGatewayComboInput, SetApiGatewayAccountInput, SetLauncherInput, SetToolSetupInput,
-    StartApiGatewayInput, SwitchAccountInput, ToolId, ToolStatus, UsageReport,
+    RenameAccountInput, SaveApiGatewayComboInput, SetAccountHiddenInput, SetApiGatewayAccountInput,
+    SetLauncherInput, SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId,
+    ToolStatus, UsageReport,
 };
 use crate::quota::read_quota;
 use crate::store::{normalize_account_states, Store, StoredState};
@@ -72,28 +72,31 @@ impl ManagedState {
             Err(_) => return,
         };
         let mut changed = false;
-        for tool_id in [ToolId::Claude, ToolId::Codex] {
+        for tool_id in [ToolId::Claude, ToolId::Codex, ToolId::Cursor, ToolId::Opencode] {
             let valid_dirs: Vec<std::path::PathBuf> = data
                 .accounts
                 .iter()
-                .filter(|a| a.tool_id == tool_id && !a.is_default)
+                .filter(|a| a.tool_id == tool_id && !a.is_default && !a.hidden)
                 .map(|a| self.store.account_dir(&tool_id, &a.id))
                 .collect();
 
             // Seed the onboarding flag + link the shared session for every profile (idempotent)
             // — ensures accounts logged in from a previous session also skip the wizard and
-            // share the session store with Default.
-            for account in data
-                .accounts
-                .iter()
-                .filter(|a| a.tool_id == tool_id && !a.is_default)
-            {
-                let dir = self.store.account_dir(&tool_id, &account.id);
-                crate::tools::seed_onboarding(&tool_id, &dir);
-                if let Some(default_dir) = configured_default_config_dir(&data, &tool_id) {
-                    link_shared_sessions_to(&tool_id, &dir, &default_dir);
-                    if account.api_provider.is_none() {
-                        link_shared_config_to(&tool_id, &dir, &default_dir);
+            // share the session store with Default. Hidden accounts keep healthy profiles so
+            // unhiding them later still shares config/sessions.
+            if matches!(tool_id, ToolId::Claude | ToolId::Codex) {
+                for account in data
+                    .accounts
+                    .iter()
+                    .filter(|a| a.tool_id == tool_id && !a.is_default)
+                {
+                    let dir = self.store.account_dir(&tool_id, &account.id);
+                    crate::tools::seed_onboarding(&tool_id, &dir);
+                    if let Some(default_dir) = configured_default_config_dir(&data, &tool_id) {
+                        link_shared_sessions_to(&tool_id, &dir, &default_dir);
+                        if account.api_provider.is_none() {
+                            link_shared_config_to(&tool_id, &dir, &default_dir);
+                        }
                     }
                 }
             }
@@ -446,6 +449,7 @@ impl ManagedState {
                     quota: None,
                     launcher_command: launcher,
                     is_default: false,
+                    hidden: false,
                     avatar_url: None,
                     api_provider: Some(ApiProvider {
                         base_url,
@@ -703,6 +707,7 @@ impl ManagedState {
                 .iter()
                 .filter(|account| {
                     matches!(account.tool_id, ToolId::Claude | ToolId::Codex)
+                        && !account.hidden
                         && account.api_provider.is_none()
                         && account.state != AccountState::NeedsLogin
                 })
@@ -831,7 +836,7 @@ impl ManagedState {
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             data.accounts
                 .iter()
-                .filter(|a| a.state == AccountState::NeedsLogin && !a.is_default)
+                .filter(|a| a.state == AccountState::NeedsLogin && !a.is_default && !a.hidden)
                 .map(|a| (a.tool_id.clone(), a.id.clone()))
                 .collect()
         };
@@ -865,6 +870,7 @@ impl ManagedState {
                 .iter()
                 .filter(|a| {
                     a.tool_id == tool_id
+                        && !a.hidden
                         && a.state != AccountState::NeedsLogin
                         && a.api_provider.is_none()
                 })
@@ -986,6 +992,7 @@ impl ManagedState {
                 .find(|a| {
                     a.tool_id == *tool_id
                         && a.id == account_id
+                        && !a.hidden
                         && a.state != AccountState::NeedsLogin
                         && a.api_provider.is_none()
                 })
@@ -1212,6 +1219,9 @@ impl ManagedState {
                 .iter()
                 .find(|a| a.id == account_id && a.tool_id == tool_id)
                 .ok_or_else(|| anyhow::anyhow!("Không tìm thấy tài khoản"))?;
+            if account.hidden {
+                anyhow::bail!("This account is hidden — unhide it first");
+            }
             // Token renewal only applies to Claude subscription (OAuth) accounts. Codex owns its own
             // ~8-day token lifecycle, and API-proxy accounts have no OAuth token to refresh.
             if account.tool_id != ToolId::Claude || account.api_provider.is_some() {
@@ -1267,6 +1277,9 @@ impl ManagedState {
                 .iter()
                 .find(|a| a.id == account_id && a.tool_id == tool_id)
                 .ok_or_else(|| anyhow::anyhow!("Không tìm thấy tài khoản"))?;
+            if account.hidden {
+                anyhow::bail!("This account is hidden — unhide it first");
+            }
             if !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some()) {
                 anyhow::bail!(
                     "Tài khoản này không hỗ trợ prime (chỉ Claude/Codex đăng nhập subscription)"
@@ -1406,7 +1419,7 @@ impl ManagedState {
         if !matches!(tool_id, ToolId::Claude | ToolId::Codex) {
             return Ok(());
         }
-        let target_id = {
+        let target = {
             let data = self
                 .data
                 .lock()
@@ -1420,22 +1433,31 @@ impl ManagedState {
                     .iter()
                     .find(|a| a.tool_id == *tool_id && a.id == id)
             });
-            // No account in use, or the one in use still has quota → no switch needed.
-            match active {
+            // Hidden accounts are treated as not added — leave them if the bare command still
+            // points there. Otherwise only switch when the account in use has hit the threshold.
+            let replacement = match active {
+                Some(active) if active.hidden => {
+                    best_replacement(&data.accounts, tool_id, threshold, Some(&active.id))
+                }
                 Some(active) if max_percent_used(active) >= threshold => {
                     best_replacement(&data.accounts, tool_id, threshold, Some(&active.id))
-                        .map(|a| a.id.clone())
                 }
                 _ => None,
-            }
+            };
+            replacement.map(|account| (account.id.clone(), account.is_default))
         };
 
-        let Some(target_id) = target_id else {
+        let Some((target_id, target_is_default)) = target else {
             return Ok(());
         };
 
-        write_active_profile(tool_id, &self.store, &target_id)
-            .context("Auto-switch failed while writing the active profile")?;
+        if target_is_default {
+            clear_active_profile(tool_id, &self.store)
+                .context("Auto-switch failed while clearing the active profile")?;
+        } else {
+            write_active_profile(tool_id, &self.store, &target_id)
+                .context("Auto-switch failed while writing the active profile")?;
+        }
         install_shell_hook(&self.store).context("Auto-switch failed while installing the hook")?;
 
         let switched_name = {
@@ -1593,6 +1615,7 @@ impl ManagedState {
                 quota: Some(quota),
                 launcher_command: None,
                 is_default: false,
+                hidden: false,
                 avatar_url: None,
                 api_provider: None,
             });
@@ -1664,6 +1687,7 @@ impl ManagedState {
                 )),
                 launcher_command: Some(full_launcher),
                 is_default: false,
+                hidden: false,
                 avatar_url: None,
                 api_provider: None,
             });
@@ -1773,6 +1797,7 @@ impl ManagedState {
                 quota: None,
                 launcher_command: full_launcher,
                 is_default: false,
+                hidden: false,
                 avatar_url: None,
                 api_provider: Some(ApiProvider {
                     base_url,
@@ -1837,6 +1862,9 @@ impl ManagedState {
             if is_virtual_api_account(account) {
                 anyhow::bail!("Local API accounts are managed from the API tab");
             }
+            if account.hidden {
+                anyhow::bail!("This account is hidden — unhide it first");
+            }
             (
                 account.launcher_command.clone(),
                 account
@@ -1888,7 +1916,7 @@ impl ManagedState {
             }
         }
         if let Some(old) = old_launcher.filter(|old| old != &full) {
-            remove_launcher(&old);
+            let _ = remove_launcher(&old);
         }
 
         {
@@ -1909,6 +1937,119 @@ impl ManagedState {
         self.snapshot()
     }
 
+    /// Hide an account (treat as not added: drop launcher, leave the list, cannot be selected)
+    /// or unhide it (restore launcher, back on the list). Profile/credentials stay on disk.
+    pub fn set_account_hidden(&self, input: SetAccountHiddenInput) -> Result<AppSnapshot> {
+        if input.hidden {
+            self.hide_account(&input.tool_id, &input.account_id)
+        } else {
+            self.unhide_account(&input.tool_id, &input.account_id)
+        }
+    }
+
+    fn hide_account(&self, tool_id: &ToolId, account_id: &str) -> Result<AppSnapshot> {
+        let (launcher, was_active) = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let account = data
+                .accounts
+                .iter()
+                .find(|a| a.tool_id == *tool_id && a.id == account_id)
+                .context("Account not found")?;
+            if account.is_default {
+                anyhow::bail!("Can't hide the machine default account");
+            }
+            if is_virtual_api_account(account) {
+                anyhow::bail!("Local API accounts are managed from the API tab");
+            }
+            if account.hidden {
+                drop(data);
+                return self.snapshot();
+            }
+            let was_active =
+                active_account_id_for(&self.store, tool_id, &data.accounts).as_deref()
+                    == Some(account_id);
+            (account.launcher_command.clone(), was_active)
+        };
+
+        // The bare command must not keep pointing at a hidden profile.
+        if was_active
+            && matches!(
+                tool_id,
+                ToolId::Claude | ToolId::Codex | ToolId::Cursor | ToolId::Opencode
+            )
+        {
+            clear_active_profile(tool_id, &self.store)
+                .context("Couldn't clear the account in use — nothing was hidden")?;
+            install_shell_hook(&self.store)
+                .context("Couldn't update the shell hook — nothing was hidden")?;
+        }
+
+        if let Some(name) = launcher {
+            remove_launcher(&name)
+                .context("Couldn't remove the account's command — nothing was hidden")?;
+        }
+
+        {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let overlay_key = format!("{}:{account_id}", tool_id.as_str());
+            data.overlay.accounts.retain(|key| key != &overlay_key);
+            if was_active {
+                let default_id = data
+                    .accounts
+                    .iter()
+                    .find(|a| a.tool_id == *tool_id && a.is_default)
+                    .map(|a| a.id.clone());
+                normalize_account_states(&mut data.accounts, tool_id, default_id.as_deref());
+            }
+            if let Some(account) = data
+                .accounts
+                .iter_mut()
+                .find(|a| a.tool_id == *tool_id && a.id == account_id)
+            {
+                account.hidden = true;
+                account.updated_at = now();
+            }
+            self.store.save(&data)?;
+        }
+        self.snapshot()
+    }
+
+    fn unhide_account(&self, tool_id: &ToolId, account_id: &str) -> Result<AppSnapshot> {
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        let restored = data
+            .accounts
+            .iter()
+            .find(|a| a.tool_id == *tool_id && a.id == account_id)
+            .cloned()
+            .context("Account not found")?;
+        if !restored.hidden {
+            drop(data);
+            return self.snapshot();
+        }
+        restore_launcher_file(&restored, &self.store, &data)
+            .context("Couldn't restore the account's command — it stayed hidden")?;
+        if let Some(account) = data
+            .accounts
+            .iter_mut()
+            .find(|a| a.tool_id == *tool_id && a.id == account_id)
+        {
+            account.hidden = false;
+            account.updated_at = now();
+        }
+        self.store.save(&data)?;
+        drop(data);
+        self.snapshot()
+    }
+
     /// Switch = pick the account for the PLAIN `claude`/`codex` command (via shell hook +
     /// active file, WITHOUT wrapping the binary). Antigravity still copy-swaps credentials.
     pub fn switch_account(&self, input: SwitchAccountInput) -> Result<AppSnapshot> {
@@ -1922,6 +2063,9 @@ impl ManagedState {
                 .iter()
                 .find(|account| account.tool_id == input.tool_id && account.id == input.account_id)
                 .context("Failed to switch account — kept the previous account")?;
+            if account.hidden {
+                anyhow::bail!("This account is hidden — unhide it first");
+            }
             (account.is_default, account.state.clone())
         };
 
@@ -2032,7 +2176,7 @@ impl ManagedState {
 
         delete_account_files(&tool_id, &self.store, &account_id)?;
         if let Some(name) = launcher {
-            remove_launcher(&name);
+            let _ = remove_launcher(&name);
         }
 
         {
@@ -2268,6 +2412,7 @@ fn migrate_defaults(accounts: &mut Vec<Account>) {
             )),
             launcher_command: None,
             is_default: true,
+            hidden: false,
             avatar_url: None,
             api_provider: None,
         });
@@ -2365,6 +2510,7 @@ fn redacted_api_gateway_config(data: &StoredState) -> ApiGatewayConfig {
         .iter()
         .filter(|account| matches!(account.tool_id, ToolId::Claude | ToolId::Codex))
         .filter(|account| account.api_provider.is_none())
+        .filter(|account| !account.hidden)
     {
         let stored = data
             .api_gateway
@@ -2464,7 +2610,8 @@ fn active_account_id_for(store: &Store, tool_id: &ToolId, accounts: &[Account]) 
         return accounts
             .iter()
             .find(|account| {
-                antigravity_saved_token(store, &account.id).as_deref() == Some(current.as_str())
+                !account.hidden
+                    && antigravity_saved_token(store, &account.id).as_deref() == Some(current.as_str())
             })
             .map(|account| account.id.clone());
     }
@@ -2479,7 +2626,8 @@ fn active_account_id_for(store: &Store, tool_id: &ToolId, accounts: &[Account]) 
         Some(target) => accounts
             .iter()
             .find(|account| {
-                !account.is_default
+                !account.hidden
+                    && !account.is_default
                     && store.account_dir(tool_id, &account.id).to_string_lossy() == target
             })
             .map(|account| account.id.clone()),
@@ -2516,6 +2664,7 @@ fn best_replacement<'a>(
         .iter()
         .filter(|account| {
             &account.tool_id == tool_id
+                && !account.hidden
                 && Some(account.id.as_str()) != excluded_account_id
                 && !matches!(account.state, AccountState::NeedsLogin)
                 && max_percent_used(account) < threshold
@@ -2523,6 +2672,33 @@ fn best_replacement<'a>(
                 && account.quota.as_ref().is_some_and(|q| q.error.is_none())
         })
         .min_by(|left, right| max_percent_used(left).total_cmp(&max_percent_used(right)))
+}
+
+/// Recreate the per-account launcher after unhiding. Missing binary path is a no-op — the
+/// account is visible again and the user can set the command from the card.
+fn restore_launcher_file(account: &Account, store: &Store, data: &StoredState) -> Result<()> {
+    let Some(name) = account.launcher_command.as_deref() else {
+        return Ok(());
+    };
+    if matches!(account.tool_id, ToolId::Antigravity) {
+        return Ok(());
+    }
+    let Some(binary) = configured_binary_path(data, &account.tool_id) else {
+        return Ok(());
+    };
+    if let Some(api) = &account.api_provider {
+        write_api_launcher(
+            &account.tool_id,
+            store,
+            &account.id,
+            name,
+            &api.model,
+            api.bypass,
+            &binary,
+        )
+    } else {
+        write_launcher(&account.tool_id, store, &account.id, name, &binary)
+    }
 }
 
 fn validate_name(
@@ -2755,4 +2931,51 @@ mod tests {
         assert_eq!(local_time_label_from_iso("nope"), "nope");
     }
 
+    fn test_account(id: &str, hidden: bool, percent: f64) -> Account {
+        Account {
+            id: id.to_string(),
+            tool_id: ToolId::Claude,
+            name: id.to_string(),
+            state: AccountState::Idle,
+            fingerprint: format!("profile:{id}"),
+            created_at: "2026-09-14T00:00:00Z".to_string(),
+            updated_at: "2026-09-14T00:00:00Z".to_string(),
+            last_used_at: None,
+            quota: Some(QuotaInfo {
+                five_hour: crate::models::QuotaWindow {
+                    label: "5-hour".into(),
+                    percent_used: Some(percent),
+                    reset_at: None,
+                    is_active: None,
+                },
+                weekly: crate::models::QuotaWindow {
+                    label: "weekly".into(),
+                    percent_used: Some(percent),
+                    reset_at: None,
+                    is_active: None,
+                },
+                models: None,
+                plan: None,
+                rate_limit_reset_credits: None,
+                prime_available: None,
+                updated_at: None,
+                error: None,
+            }),
+            launcher_command: None,
+            is_default: false,
+            hidden,
+            avatar_url: None,
+            api_provider: None,
+        }
+    }
+
+    #[test]
+    fn best_replacement_skips_hidden_accounts() {
+        let accounts = vec![
+            test_account("hidden-plenty", true, 0.0),
+            test_account("visible-used", false, 40.0),
+        ];
+        let best = best_replacement(&accounts, &ToolId::Claude, 100.0, None).unwrap();
+        assert_eq!(best.id, "visible-used");
+    }
 }

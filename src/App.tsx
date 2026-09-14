@@ -9,6 +9,8 @@ import {
   ChevronDown,
   CircleHelp,
   Copy,
+  Eye,
+  EyeOff,
   HardDrive,
   Info,
   KeyRound,
@@ -178,6 +180,7 @@ export function App() {
   const [autoSwitchBanner, setAutoSwitchBanner] = useState<string | null>(null);
   const [version, setVersion] = useState("");
   const [setupPrompted, setSetupPrompted] = useState<Set<ToolId>>(new Set());
+  const [showHidden, setShowHidden] = useState(false);
 
   useEffect(() => {
     getVersion()
@@ -333,6 +336,8 @@ export function App() {
     () => snapshot.tools.find((tool) => tool.id === selectedTool) ?? snapshot.tools[0],
     [selectedTool, snapshot.tools],
   );
+  const visibleAccounts = currentTool?.accounts.filter((account) => !account.hidden) ?? [];
+  const hiddenAccounts = currentTool?.accounts.filter((account) => account.hidden) ?? [];
   const currentAutoSwitch = currentTool
     ? snapshot.autoSwitchSettings[currentTool.id] ?? {
         enabled: snapshot.autoSwitch,
@@ -432,6 +437,7 @@ export function App() {
     if (!tool) return;
     // Fire all account refreshes in parallel so each card updates independently.
     for (const account of tool.accounts) {
+      if (account.hidden) continue;
       if (account.state !== "needs-login" && !account.apiProvider) {
         void refreshOneAccount(selectedTool, account.id);
       }
@@ -706,14 +712,14 @@ export function App() {
             )}
 
             <div className="accountGrid">
-              {currentTool.accounts.length === 0 ? (
+              {visibleAccounts.length === 0 ? (
                 <div className="empty">
                   <KeyRound />
                   <strong>No accounts yet</strong>
                   <span>Click Add account to log in a new account (each account gets its own command).</span>
                 </div>
               ) : (
-                currentTool.accounts.map((account) => (
+                visibleAccounts.map((account) => (
                   <AccountCard
                     key={account.id}
                     account={account}
@@ -756,6 +762,18 @@ export function App() {
                       const ok = await copyToClipboard(text);
                       notify(ok ? `Copied: ${text}` : "Couldn't access the clipboard.", ok ? "success" : "error");
                     }}
+                    onHide={() =>
+                      run(
+                        `hide-${account.id}`,
+                        () =>
+                          api.setAccountHidden({
+                            toolId: currentTool.id,
+                            accountId: account.id,
+                            hidden: true,
+                          }),
+                        `Hidden: ${account.name}`,
+                      )
+                    }
                     onDelete={() =>
                       run("delete", () => api.deleteAccount(currentTool.id, account.id))
                     }
@@ -767,6 +785,61 @@ export function App() {
                 ))
               )}
             </div>
+            {hiddenAccounts.length > 0 && (
+              <div className="hiddenAccounts">
+                <button
+                  type="button"
+                  className="hiddenAccountsToggle"
+                  onClick={() => setShowHidden((open) => !open)}
+                >
+                  {showHidden ? <Eye size={14} /> : <EyeOff size={14} />}
+                  Hidden accounts ({hiddenAccounts.length})
+                </button>
+                {showHidden && (
+                  <ul className="hiddenAccountList">
+                    {hiddenAccounts.map((account) => (
+                      <li key={account.id} className="hiddenAccountRow">
+                        <div>
+                          <strong>{account.name}</strong>
+                          {account.launcherCommand && (
+                            <small>Command {account.launcherCommand} returns when unhidden</small>
+                          )}
+                        </div>
+                        <div className="hiddenAccountActions">
+                          <button
+                            onClick={() =>
+                              run(
+                                `unhide-${account.id}`,
+                                () =>
+                                  api.setAccountHidden({
+                                    toolId: currentTool.id,
+                                    accountId: account.id,
+                                    hidden: false,
+                                  }),
+                                `Unhidden: ${account.name}`,
+                              )
+                            }
+                            disabled={busy !== null}
+                          >
+                            <Eye size={14} /> Unhide
+                          </button>
+                          <button
+                            className="iconButton danger"
+                            onClick={() =>
+                              run("delete", () => api.deleteAccount(currentTool.id, account.id))
+                            }
+                            disabled={busy !== null}
+                            title="Delete"
+                          >
+                            <Trash2 />
+                          </button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
           </section>
         )}
       </div>
@@ -1054,12 +1127,14 @@ function OverlaySettingsBar({
 
   const picked = new Set(settings.accounts);
   const rows = snapshot.tools.flatMap((tool) =>
-    tool.accounts.map((account) => ({
-      key: `${tool.id}:${account.id}`,
-      toolName: tool.name,
-      account,
-      active: tool.activeAccountId === account.id,
-    })),
+    tool.accounts
+      .filter((account) => !account.hidden)
+      .map((account) => ({
+        key: `${tool.id}:${account.id}`,
+        toolName: tool.name,
+        account,
+        active: tool.activeAccountId === account.id,
+      })),
   );
 
   const toggleAccount = (key: string) => {
@@ -1335,6 +1410,7 @@ function ApiGatewayView({
           tool.accounts
             .filter(
               (account) =>
+                !account.hidden &&
                 !account.apiProvider &&
                 account.fingerprint !== "api-local" &&
                 account.state !== "needs-login",
@@ -2228,6 +2304,7 @@ function AccountCard({
   onRename,
   onSetLauncher,
   onCopy,
+  onHide,
   onDelete,
   onRefreshQuota,
   refreshingQuota,
@@ -2242,6 +2319,7 @@ function AccountCard({
   onRename: () => void;
   onSetLauncher: () => void;
   onCopy: (text: string) => void;
+  onHide: () => void;
   onDelete: () => void;
   onRefreshQuota: () => void;
   refreshingQuota: boolean;
@@ -2393,6 +2471,16 @@ function AccountCard({
             title="Rename"
           >
             <Pencil />
+          </button>
+        )}
+        {!account.isDefault && !isVirtualApi && (
+          <button
+            className="iconButton"
+            onClick={onHide}
+            disabled={busy !== null}
+            title="Hide from the list and disable its command so it can't be used by mistake"
+          >
+            <EyeOff />
           </button>
         )}
         {!account.isDefault && !isVirtualApi && (
@@ -3167,7 +3255,7 @@ function CandidateList({
 }
 
 function activeLabel(tool: ToolStatus) {
-  const account = tool.accounts.find((item) => item.id === tool.activeAccountId);
+  const account = tool.accounts.find((item) => item.id === tool.activeAccountId && !item.hidden);
   const name = !account || account.isDefault ? "Machine default" : account.name;
   // Antigravity is a GUI app with no "bare command", so use different wording.
   return tool.id === "antigravity" ? `Using: ${name}` : `Bare command = ${name}`;

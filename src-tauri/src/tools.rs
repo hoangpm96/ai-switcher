@@ -858,11 +858,13 @@ pub fn write_launcher(
 }
 
 /// Delete the launcher (only if it really is one of the app's launchers).
-pub fn remove_launcher(name: &str) {
+pub fn remove_launcher(name: &str) -> Result<()> {
     let path = launcher_path(name);
     if path.exists() && is_our_launcher(&path) {
-        let _ = fs::remove_file(path);
+        fs::remove_file(&path)
+            .with_context(|| format!("Couldn't remove the account's command '{name}'"))?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

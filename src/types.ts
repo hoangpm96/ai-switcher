@@ -94,6 +94,8 @@ export interface Account {
   launcherCommand: string | null;
   /** true for Machine default (~/.claude / ~/.codex) — read-only. */
   isDefault: boolean;
+  /** Hidden accounts stay saved but are treated as not added until unhidden. */
+  hidden?: boolean;
   /** Google avatar (Antigravity only) — shown instead of the fingerprint. */
   avatarUrl?: string | null;
   /** Present when the account runs through an external API/proxy gateway (no quota). */
@@ -302,6 +304,12 @@ export interface SetLauncherInput {
   toolId: ToolId;
   accountId: string;
   name: string;
+}
+
+export interface SetAccountHiddenInput {
+  toolId: ToolId;
+  accountId: string;
+  hidden: boolean;
 }
 
 export interface PrimeNowInput {

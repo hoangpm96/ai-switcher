@@ -439,6 +439,11 @@ pub struct Account {
     /// true for the "Machine default" account pointing at ~/.claude (~/.codex) — read-only.
     #[serde(default)]
     pub is_default: bool,
+    /// Hidden accounts stay on disk (credentials, profile) but are treated as not added:
+    /// they leave the list, lose their launcher command, and cannot be switched to / auto-switched
+    /// / used by the API gateway until unhidden.
+    #[serde(default)]
+    pub hidden: bool,
     /// The account's Google avatar (Antigravity only) — shown instead of the
     /// confusing fingerprint. Computed when building the snapshot, not stored in state.json.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -847,6 +852,14 @@ pub struct SetLauncherInput {
     pub name: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountHiddenInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    pub hidden: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Token usage tracking (Usage tab) — aggregates token counts + cost from the
 // CLIs' local JSONL logs. Claude's logs undercount badly (see usage.rs), so its
@@ -966,4 +979,27 @@ pub struct UsageReport {
     /// "live" (just fetched), "cached" (LiteLLM cache on disk), or "unavailable".
     pub price_status: String,
     pub price_updated_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_hidden_defaults_to_false_on_old_state() {
+        let json = r#"{
+            "id": "c2",
+            "toolId": "claude",
+            "name": "Work",
+            "state": "idle",
+            "fingerprint": "profile:c2",
+            "createdAt": "2026-05-21T10:00:00Z",
+            "updatedAt": "2026-05-30T08:00:00Z",
+            "lastUsedAt": null,
+            "quota": null
+        }"#;
+        let account: Account = serde_json::from_str(json).unwrap();
+        assert!(!account.hidden);
+        assert!(!account.is_default);
+    }
 }

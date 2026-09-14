@@ -17,6 +17,7 @@ import type {
   SaveApiGatewayComboInput,
   SetApiGatewayAccountInput,
   SetLauncherInput,
+  SetAccountHiddenInput,
   SetToolSetupInput,
   StartApiGatewayInput,
   SwitchAccountInput,
@@ -538,6 +539,24 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   if (command === "add_api_account") {
     return structuredClone(demoSnapshot) as T;
   }
+  if (command === "set_account_hidden") {
+    const input = args?.input as SetAccountHiddenInput | undefined;
+    if (input) {
+      for (const tool of demoSnapshot.tools) {
+        if (tool.id !== input.toolId) continue;
+        const account = tool.accounts.find((item) => item.id === input.accountId);
+        if (!account || account.isDefault) continue;
+        account.hidden = input.hidden;
+        if (input.hidden && tool.activeAccountId === account.id) {
+          account.state = account.state === "needs-login" ? "needs-login" : "idle";
+          const fallback = tool.accounts.find((item) => item.isDefault && !item.hidden);
+          tool.activeAccountId = fallback?.id ?? null;
+          if (fallback) fallback.state = "active";
+        }
+      }
+    }
+    return structuredClone(demoSnapshot) as T;
+  }
   if (command === "accept_disclaimer") {
     demoSnapshot.disclaimerAccepted = true;
     return structuredClone(demoSnapshot) as T;
@@ -564,6 +583,8 @@ export const api = {
   renameAccount: (input: RenameAccountInput) => invoke<AppSnapshot>("rename_account", { input }),
   switchAccount: (input: SwitchAccountInput) => invoke<AppSnapshot>("switch_account", { input }),
   setLauncher: (input: SetLauncherInput) => invoke<AppSnapshot>("set_launcher", { input }),
+  setAccountHidden: (input: SetAccountHiddenInput) =>
+    invoke<AppSnapshot>("set_account_hidden", { input }),
   deleteAccount: (toolId: ToolId, accountId: string) =>
     invoke<AppSnapshot>("delete_account", { toolId, accountId }),
   acceptDisclaimer: () => invoke<AppSnapshot>("accept_disclaimer"),

@@ -50,16 +50,18 @@ interface Row {
 /** Every account the overlay could show, in tab order. */
 function allRows(snapshot: AppSnapshot): Row[] {
   return snapshot.tools.flatMap((tool) =>
-    tool.accounts.map((account) => ({
-      key: rowKey(tool.id, account.id),
-      toolLabel: toolShortNames[tool.id],
-      name: account.name,
-      quota: account.quota,
-      active: tool.activeAccountId === account.id,
-      isApi: Boolean(account.apiProvider),
-      // Default view: the account each CLI is actually using right now.
-      defaultShown: tool.activeAccountId === account.id && tool.id !== "antigravity",
-    })),
+    tool.accounts
+      .filter((account) => !account.hidden)
+      .map((account) => ({
+        key: rowKey(tool.id, account.id),
+        toolLabel: toolShortNames[tool.id],
+        name: account.name,
+        quota: account.quota,
+        active: tool.activeAccountId === account.id,
+        isApi: Boolean(account.apiProvider),
+        // Default view: the account each CLI is actually using right now.
+        defaultShown: tool.activeAccountId === account.id && tool.id !== "antigravity",
+      })),
   );
 }
 

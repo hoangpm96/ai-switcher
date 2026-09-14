@@ -182,6 +182,9 @@ fn append_tool_section(app: &AppHandle, menu: &Menu<Wry>, tool: &ToolStatus) -> 
     }
 
     for account in &tool.accounts {
+        if account.hidden {
+            continue;
+        }
         let is_active = Some(account.id.as_str()) == tool.active_account_id.as_deref()
             || account.state == AccountState::Active;
         let needs_login = account.state == AccountState::NeedsLogin;
