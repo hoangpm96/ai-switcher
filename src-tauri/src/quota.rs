@@ -1029,13 +1029,37 @@ fn read_codex_rollout_quota() -> Result<QuotaInfo> {
 //
 // The dashboard's own endpoint reports the billing period's included usage:
 //   POST https://cursor.com/api/usage-summary
-//   Cookie: WorkosCursorSessionToken=<anything>::<accessToken>
-// It refuses state-changing requests without a matching Origin, and the id in front of `::` is
-// not validated (verified 2026-09-10) — only the token is, so no user id lookup is needed.
+//   Cookie: WorkosCursorSessionToken=<userId>::<accessToken>
+// It refuses state-changing requests without a matching Origin, and the id in front of `::` must
+// match the token's own subject: a `cli` placeholder worked on 2026-09-10 but returns 401
+// `not_authenticated` since (re-verified 2026-09-18), so the id is read out of the token itself.
 // ---------------------------------------------------------------------------
 
-/// Placeholder for the id half of the session cookie: the server only validates the token.
-const CURSOR_COOKIE_USER: &str = "cli";
+/// The id half of the session cookie, taken from the access token's own `sub` claim and
+/// percent-encoded (`auth0|user_x` carries a `|`). Cursor rejects any other id, so a token whose
+/// payload we can't parse has no usable cookie at all.
+fn cursor_cookie_user(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let subject = claims.get("sub").and_then(|v| v.as_str())?;
+    Some(percent_encode(subject))
+}
+
+/// Percent-encode everything outside the unreserved set — enough for a cookie value.
+fn percent_encode(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
 
 /// Where an account keeps its Cursor token. Accounts added by the app log in with
 /// `HOME=<profile>` + the file credential store, so the token is at `<profile>/.cursor/auth.json`;
@@ -1101,7 +1125,9 @@ fn read_cursor_quota(config_dir: &Path) -> Result<QuotaInfo> {
 }
 
 fn cursor_usage_summary(token: &str) -> Result<String> {
-    let cookie = format!("WorkosCursorSessionToken={CURSOR_COOKIE_USER}%3A%3A{token}");
+    let user = cursor_cookie_user(token)
+        .context("Cursor token isn't in the expected format — add the account again to sign in")?;
+    let cookie = format!("WorkosCursorSessionToken={user}%3A%3A{token}");
     curl_post(
         "https://cursor.com/api/usage-summary",
         &[
@@ -2025,6 +2051,21 @@ mod tests {
             Some("x"),
             "the same blob feeds the request token"
         );
+    }
+
+    #[test]
+    fn cursor_cookie_id_comes_from_the_token_subject() {
+        // Payload of a real session token: {"sub":"auth0|user_01ABC","aud":"https://cursor.com"}.
+        // Cursor 401s on any id that isn't the token's own subject, and the `|` must be escaped.
+        let token =
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhdXRoMHx1c2VyXzAxQUJDIiwiYXVkIjoiaHR0cHM6Ly9jdXJzb3IuY29tIn0.sig";
+        assert_eq!(
+            cursor_cookie_user(token).as_deref(),
+            Some("auth0%7Cuser_01ABC")
+        );
+        // Anything we can't read a subject out of has no usable cookie.
+        assert_eq!(cursor_cookie_user("not-a-jwt"), None);
+        assert_eq!(cursor_cookie_user("a.eyJ4IjoxfQ.c"), None);
     }
 
     #[test]

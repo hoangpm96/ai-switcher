@@ -5,6 +5,22 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-18
+
+### Added
+
+- **Hide accounts you do not want used by mistake.** A hidden account leaves the list, gives up its
+  launcher command, and is skipped by auto-switch, the overlay, the tray menu, and the API gateway
+  until you unhide it.
+
+### Fixed
+
+- **Cursor accounts showing "Couldn't read quota" while the CLI kept working.** Cursor's usage
+  endpoint used to ignore the account id in front of the session token, so the app sent a fixed
+  placeholder. It now checks that id against the token and rejects anything else, which turned every
+  Cursor card into a read failure even though the token was still valid and `cursor-agent` ran fine.
+  The id is now read from the token itself.
+
 ## [0.8.0] - 2026-09-10
 
 ### Added
