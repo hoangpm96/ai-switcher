@@ -188,6 +188,7 @@ fn append_tool_section(app: &AppHandle, menu: &Menu<Wry>, tool: &ToolStatus) -> 
         let is_active = Some(account.id.as_str()) == tool.active_account_id.as_deref()
             || account.state == AccountState::Active;
         let needs_login = account.state == AccountState::NeedsLogin;
+        let locked = account.is_locked();
         let id = format!("{SWITCH_PREFIX}{}:{}", tool.id.as_str(), account.id);
         let label = account_label(account);
 
@@ -208,7 +209,7 @@ fn append_tool_section(app: &AppHandle, menu: &Menu<Wry>, tool: &ToolStatus) -> 
                 app,
                 id,
                 label,
-                !needs_login,
+                !needs_login && !locked,
                 None::<&str>,
             )?)?;
         }
@@ -228,6 +229,10 @@ fn account_label(account: &Account) -> String {
         }
     } else if account.api_provider.is_some() {
         trailer.push("API".to_string());
+    }
+
+    if account.is_locked() {
+        trailer.push("Locked".to_string());
     }
 
     if trailer.is_empty() {

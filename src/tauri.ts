@@ -18,6 +18,7 @@ import type {
   SetApiGatewayAccountInput,
   SetLauncherInput,
   SetAccountHiddenInput,
+  SetWeeklyLockInput,
   SetToolSetupInput,
   StartApiGatewayInput,
   SwitchAccountInput,
@@ -557,6 +558,23 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
     }
     return structuredClone(demoSnapshot) as T;
   }
+  if (command === "set_weekly_lock") {
+    const input = args?.input as SetWeeklyLockInput | undefined;
+    const tool = demoSnapshot.tools.find((item) => item.id === input?.toolId);
+    const account = tool?.accounts.find((item) => item.id === input?.accountId);
+    if (input && tool && account && !account.isDefault) {
+      const weekly = account.quota?.weekly.percentUsed ?? null;
+      const locked = input.enabled && weekly !== null && weekly >= input.threshold;
+      account.weeklyLock = { enabled: input.enabled, threshold: input.threshold, locked };
+      if (locked && tool.activeAccountId === account.id) {
+        const fallback = tool.accounts.find((item) => item.isDefault);
+        account.state = "idle";
+        tool.activeAccountId = fallback?.id ?? null;
+        if (fallback) fallback.state = "active";
+      }
+    }
+    return structuredClone(demoSnapshot) as T;
+  }
   if (command === "accept_disclaimer") {
     demoSnapshot.disclaimerAccepted = true;
     return structuredClone(demoSnapshot) as T;
@@ -585,6 +603,7 @@ export const api = {
   setLauncher: (input: SetLauncherInput) => invoke<AppSnapshot>("set_launcher", { input }),
   setAccountHidden: (input: SetAccountHiddenInput) =>
     invoke<AppSnapshot>("set_account_hidden", { input }),
+  setWeeklyLock: (input: SetWeeklyLockInput) => invoke<AppSnapshot>("set_weekly_lock", { input }),
   deleteAccount: (toolId: ToolId, accountId: string) =>
     invoke<AppSnapshot>("delete_account", { toolId, accountId }),
   acceptDisclaimer: () => invoke<AppSnapshot>("accept_disclaimer"),

@@ -96,6 +96,8 @@ export interface Account {
   isDefault: boolean;
   /** Hidden accounts stay saved but are treated as not added until unhidden. */
   hidden?: boolean;
+  /** Reserve-quota lock on the weekly window (absent = never configured). */
+  weeklyLock?: WeeklyLock | null;
   /** Google avatar (Antigravity only) — shown instead of the fingerprint. */
   avatarUrl?: string | null;
   /** Present when the account runs through an external API/proxy gateway (no quota). */
@@ -304,6 +306,22 @@ export interface SetLauncherInput {
   toolId: ToolId;
   accountId: string;
   name: string;
+}
+
+export interface WeeklyLock {
+  /** Auto-lock armed. Unlocking by hand turns it off. */
+  enabled: boolean;
+  /** Weekly % used at which the account locks. */
+  threshold: number;
+  /** Currently locked: no command, can't be used until unlocked or the week resets. */
+  locked: boolean;
+}
+
+export interface SetWeeklyLockInput {
+  toolId: ToolId;
+  accountId: string;
+  enabled: boolean;
+  threshold: number;
 }
 
 export interface SetAccountHiddenInput {

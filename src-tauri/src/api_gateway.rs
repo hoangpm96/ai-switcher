@@ -474,6 +474,7 @@ fn has_enabled_account(data: &StoredState, tool_id: &ToolId) -> bool {
     data.accounts.iter().any(|account| {
         &account.tool_id == tool_id
             && !account.hidden
+            && !account.is_locked()
             && account.api_provider.is_none()
             && !matches!(account.state, AccountState::NeedsLogin)
             && gateway_account_enabled(data, tool_id, &account.id)
@@ -655,6 +656,7 @@ fn available_candidates(
         for account in data.accounts.iter().filter(|account| {
             account.tool_id == tool_id
                 && !account.hidden
+                && !account.is_locked()
                 && account.api_provider.is_none()
                 && !matches!(account.state, AccountState::NeedsLogin)
                 && gateway_account_enabled(data, &tool_id, &account.id)
@@ -2777,6 +2779,7 @@ mod tests {
             launcher_command: None,
             is_default: false,
             hidden: false,
+            weekly_lock: None,
             avatar_url: None,
             api_provider: None,
         }

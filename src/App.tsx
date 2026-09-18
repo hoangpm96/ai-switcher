@@ -16,6 +16,8 @@ import {
   KeyRound,
   Layers,
   Loader2,
+  Lock,
+  LockOpen,
   LogIn,
   Pencil,
   Plus,
@@ -174,7 +176,9 @@ export function App() {
   const [busy, setBusy] = useState<string | null>(null);
   const [refreshingAccounts, setRefreshingAccounts] = useState<Set<string>>(new Set());
   const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
-  const [dialog, setDialog] = useState<"add" | "rename" | "launcher" | "setup" | null>(null);
+  const [dialog, setDialog] = useState<
+    "add" | "rename" | "launcher" | "weeklyLock" | "setup" | null
+  >(null);
   const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
   const [switchNotice, setSwitchNotice] = useState<string | null>(null);
   const [autoSwitchBanner, setAutoSwitchBanner] = useState<string | null>(null);
@@ -758,6 +762,23 @@ export function App() {
                       setSelectedAccount(account);
                       setDialog("launcher");
                     }}
+                    onWeeklyLock={() => {
+                      setSelectedAccount(account);
+                      setDialog("weeklyLock");
+                    }}
+                    onUnlock={() =>
+                      run(
+                        `unlock-${account.id}`,
+                        () =>
+                          api.setWeeklyLock({
+                            toolId: currentTool.id,
+                            accountId: account.id,
+                            enabled: false,
+                            threshold: account.weeklyLock?.threshold ?? 80,
+                          }),
+                        `Unlocked: ${account.name} — auto-lock stays off until you turn it back on`,
+                      )
+                    }
                     onCopy={async (text) => {
                       const ok = await copyToClipboard(text);
                       notify(ok ? `Copied: ${text}` : "Couldn't access the clipboard.", ok ? "success" : "error");
@@ -894,6 +915,32 @@ export function App() {
             if (
               await run("launcher", () =>
                 api.setLauncher({ toolId: currentTool.id, accountId: selectedAccount.id, name }),
+              )
+            ) {
+              setDialog(null);
+            }
+          }}
+        />
+      )}
+
+      {dialog === "weeklyLock" && currentTool && selectedAccount && (
+        <WeeklyLockDialog
+          account={selectedAccount}
+          onClose={() => setDialog(null)}
+          onSubmit={async (enabled, threshold) => {
+            if (
+              await run(
+                "weeklyLock",
+                () =>
+                  api.setWeeklyLock({
+                    toolId: currentTool.id,
+                    accountId: selectedAccount.id,
+                    enabled,
+                    threshold,
+                  }),
+                enabled
+                  ? `${selectedAccount.name} locks at ${threshold}% weekly`
+                  : `Auto-lock off: ${selectedAccount.name}`,
               )
             ) {
               setDialog(null);
@@ -2303,6 +2350,8 @@ function AccountCard({
   onSwitch,
   onRename,
   onSetLauncher,
+  onWeeklyLock,
+  onUnlock,
   onCopy,
   onHide,
   onDelete,
@@ -2318,6 +2367,8 @@ function AccountCard({
   onSwitch: () => void;
   onRename: () => void;
   onSetLauncher: () => void;
+  onWeeklyLock: () => void;
+  onUnlock: () => void;
   onCopy: (text: string) => void;
   onHide: () => void;
   onDelete: () => void;
@@ -2332,6 +2383,9 @@ function AccountCard({
   const isActive = account.id === tool.activeAccountId || account.state === "active";
   const exhausted = account.state === "exhausted";
   const needsLogin = account.state === "needs-login";
+  const weeklyLock = account.weeklyLock;
+  const locked = weeklyLock?.locked === true;
+  const canWeeklyLock = supportsWeeklyLock(tool.id) && !account.isDefault && !isApi;
 
   const canPrime = (tool.id === "claude" || tool.id === "codex") && !isApi;
   // "Prime ngay": let the user open a new 5h window on demand, for the case where there's no live
@@ -2341,11 +2395,14 @@ function AccountCard({
   // can mean "fully ended" (offer) rather than "unknown" (hide). `primeAvailable === true` means
   // ended-or-unanchored; undefined means unknown/read-error → hide. Still hidden when login is
   // needed. The backend's D2 stays the real guard; this just shows the button at the right time.
-  const showPrimeNow = canPrime && account.quota?.primeAvailable === true && !needsLogin;
+  const showPrimeNow =
+    canPrime && account.quota?.primeAvailable === true && !needsLogin && !locked;
   const primingNow = busy === `prime:${account.id}`;
 
   return (
-    <article className={`account ${isActive ? "active" : ""} ${exhausted ? "exhausted" : ""}`}>
+    <article
+      className={`account ${isActive ? "active" : ""} ${exhausted ? "exhausted" : ""} ${locked ? "locked" : ""}`}
+    >
       <div className="accountTop">
         <div className="accountIdentity">
           {isAntigravity &&
@@ -2393,9 +2450,23 @@ function AccountCard({
         </div>
         <div className="badgeRow">
           {isApi && <span className="badge api">{isVirtualApi ? "Local API" : "API"}</span>}
-          <span className={`badge ${badgeClass(account.state)}`}>
-            {exhausted ? "Out of quota" : isActive ? "In use" : stateLabel(account.state)}
-          </span>
+          {weeklyLock?.enabled && !locked && (
+            <span
+              className="badge lockArmed"
+              title={`Locks automatically once the weekly limit reaches ${weeklyLock.threshold}%`}
+            >
+              <Lock /> {weeklyLock.threshold}%
+            </span>
+          )}
+          {locked ? (
+            <span className="badge lockedBadge">
+              <Lock /> Locked
+            </span>
+          ) : (
+            <span className={`badge ${badgeClass(account.state)}`}>
+              {exhausted ? "Out of quota" : isActive ? "In use" : stateLabel(account.state)}
+            </span>
+          )}
         </div>
       </div>
 
@@ -2425,6 +2496,19 @@ function AccountCard({
         </button>
       )}
 
+      {locked && (
+        <div className="lockedNotice">
+          <Lock />
+          <span>
+            Locked at {weeklyLock!.threshold}% weekly to save quota — its command is off. It unlocks
+            when the weekly limit resets.
+          </span>
+          <button onClick={onUnlock} disabled={busy !== null}>
+            <LockOpen /> Unlock
+          </button>
+        </div>
+      )}
+
       {needsLogin && (
         <div className="pendingLogin">
           <Loader2 className="spin" />
@@ -2437,7 +2521,7 @@ function AccountCard({
       )}
 
       <div className="cardActions">
-        <button onClick={onSwitch} disabled={isActive || needsLogin || busy !== null}>
+        <button onClick={onSwitch} disabled={isActive || needsLogin || locked || busy !== null}>
           <RotateCcw /> Use
         </button>
         {!isApi && !needsLogin && (
@@ -2457,10 +2541,20 @@ function AccountCard({
           <button
             className="iconButton"
             onClick={onSetLauncher}
-            disabled={needsLogin || busy !== null}
+            disabled={needsLogin || locked || busy !== null}
             title="Custom command"
           >
             <Terminal />
+          </button>
+        )}
+        {canWeeklyLock && (
+          <button
+            className={`iconButton ${weeklyLock?.enabled ? "lockOn" : ""}`}
+            onClick={onWeeklyLock}
+            disabled={needsLogin || busy !== null}
+            title="Weekly lock — lock this account at a weekly limit to save its quota"
+          >
+            <Lock />
           </button>
         )}
         {!account.isDefault && !isVirtualApi && (
@@ -3005,6 +3099,101 @@ function AddDialog({
           <button className="primary" onClick={isApi ? submitApi : submit} disabled={submitting}>
             {submitting && <Loader2 className="spin" size={14} />}
             {isApi ? "Create account" : isCli ? "Create & login" : "Save this account"}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+/** Tools whose quota has a weekly window the lock can watch (mirrors `supports_weekly_lock`). */
+function supportsWeeklyLock(toolId: ToolId) {
+  return toolId === "claude" || toolId === "codex" || toolId === "opencode";
+}
+
+function WeeklyLockDialog({
+  account,
+  onClose,
+  onSubmit,
+}: {
+  account: Account;
+  onClose: () => void;
+  onSubmit: (enabled: boolean, threshold: number) => Promise<void>;
+}) {
+  const [enabled, setEnabled] = useState(account.weeklyLock?.enabled ?? true);
+  const [threshold, setThreshold] = useState(String(account.weeklyLock?.threshold ?? 80));
+  const value = Number(threshold);
+  const valid = Number.isFinite(value) && value >= 1 && value <= 100;
+  const weekly = account.quota?.weekly.percentUsed;
+  const locksNow = enabled && valid && weekly != null && weekly >= value;
+
+  return (
+    <div className="modalBackdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+        <h2>Weekly lock · {account.name}</h2>
+        <p className="modalSub">
+          Save this account's quota: once its weekly limit reaches the threshold it's locked — its
+          command is removed and it can't be used, switched to, or picked by auto-switch or the API
+          gateway. It unlocks by itself when the weekly limit resets. Unlocking by hand turns this
+          off until you enable it again.
+        </p>
+        <div className="autoSwitchMain">
+          <div className="autoSwitchText">
+            <strong>Lock automatically</strong>
+            <small>
+              Weekly used now: {weekly != null ? `${Math.round(weekly)}%` : "unknown"}
+            </small>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={enabled}
+            className={`switchTrack ${enabled ? "on" : ""}`}
+            onClick={() => setEnabled(!enabled)}
+          >
+            <span className="switchThumb" />
+          </button>
+        </div>
+        {enabled && (
+          <>
+            <div className="autoSwitchOpts">
+              <span>Lock at</span>
+              {[50, 70, 80, 90].map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  className={`pill ${value === preset ? "active" : ""}`}
+                  onClick={() => setThreshold(String(preset))}
+                >
+                  {preset}%
+                </button>
+              ))}
+            </div>
+            <label>
+              <span className="labelRow">Weekly limit (%)</span>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={threshold}
+                onChange={(event) => setThreshold(event.target.value)}
+              />
+            </label>
+            {locksNow && (
+              <p className="modalSub warnText">
+                Already at {Math.round(weekly!)}% this week — it will lock as soon as you save.
+              </p>
+            )}
+          </>
+        )}
+        <div className="modalActions">
+          <button onClick={onClose}>Cancel</button>
+          <button
+            className="primary"
+            disabled={enabled && !valid}
+            onClick={() => onSubmit(enabled, valid ? value : account.weeklyLock?.threshold ?? 80)}
+          >
+            Save
           </button>
         </div>
       </section>

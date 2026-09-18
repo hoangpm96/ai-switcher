@@ -5,8 +5,8 @@ use crate::models::{
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, OverlayRect, OverlaySettings, QuotaInfo,
     RenameAccountInput, SaveApiGatewayComboInput, SetAccountHiddenInput, SetApiGatewayAccountInput,
-    SetLauncherInput, SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId,
-    ToolStatus, UsageReport,
+    SetLauncherInput, SetToolSetupInput, SetWeeklyLockInput, StartApiGatewayInput,
+    SwitchAccountInput, ToolId, ToolStatus, UsageReport, WeeklyLock,
 };
 use crate::quota::read_quota;
 use crate::store::{normalize_account_states, Store, StoredState};
@@ -450,6 +450,7 @@ impl ManagedState {
                     launcher_command: launcher,
                     is_default: false,
                     hidden: false,
+                    weekly_lock: None,
                     avatar_url: None,
                     api_provider: Some(ApiProvider {
                         base_url,
@@ -918,13 +919,14 @@ impl ManagedState {
         };
 
         // Phase 3: write all quotas back — brief lock.
-        let exhausted_accounts: Vec<Account> = {
+        let (exhausted_accounts, lock_changes): (Vec<Account>, Vec<(String, bool)>) = {
             let mut data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             let timestamp = now();
             let mut exhausted = Vec::new();
+            let mut lock_changes = Vec::new();
             for (account_id, quota) in results {
                 if let Some(account) = data
                     .accounts
@@ -947,10 +949,13 @@ impl ManagedState {
                     if account.state == AccountState::Exhausted && !was_exhausted {
                         exhausted.push(account.clone());
                     }
+                    if let Some(lock) = weekly_lock_transition(account) {
+                        lock_changes.push((account_id, lock));
+                    }
                 }
             }
             self.store.save(&data)?;
-            exhausted
+            (exhausted, lock_changes)
         };
 
         if let Some(app) = app {
@@ -958,6 +963,7 @@ impl ManagedState {
                 notify_exhausted(app, account);
             }
         }
+        self.apply_weekly_lock_changes(&tool_id, lock_changes, app);
 
         let setting = {
             let data = self
@@ -1006,12 +1012,13 @@ impl ManagedState {
         let quota = read_quota(tool_id, &config_dir);
 
         // Phase 3: write back — brief lock.
-        let exhausted: Option<Account> = {
+        let (exhausted, lock_change): (Option<Account>, Option<bool>) = {
             let mut data = self
                 .data
                 .lock()
                 .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
             let mut result = None;
+            let mut lock_change = None;
             if let Some(account) = data
                 .accounts
                 .iter_mut()
@@ -1032,14 +1039,19 @@ impl ManagedState {
                 if account.state == AccountState::Exhausted && !was_exhausted {
                     result = Some(account.clone());
                 }
+                lock_change = weekly_lock_transition(account);
             }
             self.store.save(&data)?;
-            result
+            (result, lock_change)
         };
 
         if let (Some(app), Some(account)) = (app, exhausted) {
             notify_exhausted(app, &account);
         }
+        let lock_changes = lock_change
+            .map(|lock| vec![(account_id.to_string(), lock)])
+            .unwrap_or_default();
+        self.apply_weekly_lock_changes(tool_id, lock_changes, app);
 
         let setting = {
             let data = self
@@ -1280,6 +1292,9 @@ impl ManagedState {
             if account.hidden {
                 anyhow::bail!("This account is hidden — unhide it first");
             }
+            if account.is_locked() {
+                anyhow::bail!("This account is locked to save its weekly quota — unlock it first");
+            }
             if !crate::prime::is_prime_eligible(&account.tool_id, account.api_provider.is_some()) {
                 anyhow::bail!(
                     "Tài khoản này không hỗ trợ prime (chỉ Claude/Codex đăng nhập subscription)"
@@ -1433,10 +1448,10 @@ impl ManagedState {
                     .iter()
                     .find(|a| a.tool_id == *tool_id && a.id == id)
             });
-            // Hidden accounts are treated as not added — leave them if the bare command still
+            // Hidden / weekly-locked accounts are off limits — leave them if the bare command still
             // points there. Otherwise only switch when the account in use has hit the threshold.
             let replacement = match active {
-                Some(active) if active.hidden => {
+                Some(active) if active.hidden || active.is_locked() => {
                     best_replacement(&data.accounts, tool_id, threshold, Some(&active.id))
                 }
                 Some(active) if max_percent_used(active) >= threshold => {
@@ -1616,6 +1631,7 @@ impl ManagedState {
                 launcher_command: None,
                 is_default: false,
                 hidden: false,
+                weekly_lock: None,
                 avatar_url: None,
                 api_provider: None,
             });
@@ -1688,6 +1704,7 @@ impl ManagedState {
                 launcher_command: Some(full_launcher),
                 is_default: false,
                 hidden: false,
+                weekly_lock: None,
                 avatar_url: None,
                 api_provider: None,
             });
@@ -1798,6 +1815,7 @@ impl ManagedState {
                 launcher_command: full_launcher,
                 is_default: false,
                 hidden: false,
+                weekly_lock: None,
                 avatar_url: None,
                 api_provider: Some(ApiProvider {
                     base_url,
@@ -1864,6 +1882,9 @@ impl ManagedState {
             }
             if account.hidden {
                 anyhow::bail!("This account is hidden — unhide it first");
+            }
+            if account.is_locked() {
+                anyhow::bail!("This account is locked to save its weekly quota — unlock it first");
             }
             (
                 account.launcher_command.clone(),
@@ -2035,8 +2056,10 @@ impl ManagedState {
             drop(data);
             return self.snapshot();
         }
-        restore_launcher_file(&restored, &self.store, &data)
-            .context("Couldn't restore the account's command — it stayed hidden")?;
+        if !restored.is_locked() {
+            restore_launcher_file(&restored, &self.store, &data)
+                .context("Couldn't restore the account's command — it stayed hidden")?;
+        }
         if let Some(account) = data
             .accounts
             .iter_mut()
@@ -2048,6 +2071,192 @@ impl ManagedState {
         self.store.save(&data)?;
         drop(data);
         self.snapshot()
+    }
+
+    /// Arm / disarm the weekly reserve-quota lock. Disarming unlocks the account (manual unlock);
+    /// arming checks the current weekly usage right away, so it can lock immediately.
+    pub fn set_weekly_lock(&self, input: SetWeeklyLockInput) -> Result<AppSnapshot> {
+        if !input.threshold.is_finite() || !(1.0..=100.0).contains(&input.threshold) {
+            anyhow::bail!("The weekly limit must be between 1% and 100%");
+        }
+        let change = {
+            let mut data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let account = data
+                .accounts
+                .iter_mut()
+                .find(|a| a.tool_id == input.tool_id && a.id == input.account_id)
+                .context("Account not found")?;
+            if !supports_weekly_lock(&account.tool_id) {
+                anyhow::bail!("This tool has no weekly limit to watch");
+            }
+            if account.is_default {
+                anyhow::bail!("Can't lock the machine default account — the plain command falls back to it");
+            }
+            if account.api_provider.is_some() {
+                anyhow::bail!("API accounts have no quota to watch");
+            }
+            let was_locked = account.is_locked();
+            account.weekly_lock = Some(WeeklyLock {
+                enabled: input.enabled,
+                threshold: input.threshold,
+                locked: was_locked,
+            });
+            account.updated_at = now();
+            let change = if input.enabled {
+                weekly_lock_transition(account)
+            } else if was_locked {
+                Some(false)
+            } else {
+                None
+            };
+            self.store.save(&data)?;
+            change
+        };
+        match change {
+            Some(true) => self.lock_account(&input.tool_id, &input.account_id)?,
+            Some(false) => self.unlock_account(&input.tool_id, &input.account_id)?,
+            None => {}
+        }
+        self.snapshot()
+    }
+
+    /// Apply the lock/unlock decisions from a quota refresh. Failures are reported but never fail
+    /// the refresh itself — the next refresh retries.
+    fn apply_weekly_lock_changes(
+        &self,
+        tool_id: &ToolId,
+        changes: Vec<(String, bool)>,
+        app: Option<&AppHandle>,
+    ) {
+        for (account_id, lock) in changes {
+            let result = if lock {
+                self.lock_account(tool_id, &account_id)
+            } else {
+                self.unlock_account(tool_id, &account_id)
+            };
+            if let Err(err) = result {
+                eprintln!("weekly lock: couldn't update {account_id}: {err:#}");
+                continue;
+            }
+            let Some(app) = app else { continue };
+            let Some(account) = self.data.lock().ok().and_then(|data| {
+                data.accounts
+                    .iter()
+                    .find(|a| a.tool_id == *tool_id && a.id == account_id)
+                    .cloned()
+            }) else {
+                continue;
+            };
+            notify_weekly_lock(app, &account, lock);
+        }
+    }
+
+    /// Lock: drop the launcher and move the plain command off this account. Profile and
+    /// credentials stay; quota keeps refreshing so the weekly reset can unlock it.
+    fn lock_account(&self, tool_id: &ToolId, account_id: &str) -> Result<()> {
+        let (launcher, was_active, replacement) = {
+            let data = self
+                .data
+                .lock()
+                .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+            let account = data
+                .accounts
+                .iter()
+                .find(|a| a.tool_id == *tool_id && a.id == account_id)
+                .context("Account not found")?;
+            let was_active =
+                active_account_id_for(&self.store, tool_id, &data.accounts).as_deref()
+                    == Some(account_id);
+            let replacement = if was_active {
+                best_replacement(&data.accounts, tool_id, 100.0, Some(account_id))
+                    .map(|a| (a.id.clone(), a.is_default))
+            } else {
+                None
+            };
+            (account.launcher_command.clone(), was_active, replacement)
+        };
+
+        // The plain command must not keep running a locked account: hand it to the healthiest
+        // other account, or back to the machine default.
+        let new_active_id = if was_active {
+            match &replacement {
+                Some((id, false)) => {
+                    write_active_profile(tool_id, &self.store, id)
+                        .context("Couldn't move the account in use — nothing was locked")?;
+                }
+                _ => clear_active_profile(tool_id, &self.store)
+                    .context("Couldn't clear the account in use — nothing was locked")?,
+            }
+            install_shell_hook(&self.store)
+                .context("Couldn't update the shell hook — nothing was locked")?;
+            replacement.map(|(id, _)| id)
+        } else {
+            None
+        };
+
+        if let Some(name) = launcher {
+            remove_launcher(&name)
+                .context("Couldn't remove the account's command — nothing was locked")?;
+        }
+
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        if was_active {
+            let active_id = new_active_id.or_else(|| {
+                data.accounts
+                    .iter()
+                    .find(|a| a.tool_id == *tool_id && a.is_default)
+                    .map(|a| a.id.clone())
+            });
+            normalize_account_states(&mut data.accounts, tool_id, active_id.as_deref());
+        }
+        if let Some(account) = data
+            .accounts
+            .iter_mut()
+            .find(|a| a.tool_id == *tool_id && a.id == account_id)
+        {
+            if let Some(lock) = account.weekly_lock.as_mut() {
+                lock.locked = true;
+            }
+            account.updated_at = now();
+        }
+        self.store.save(&data)?;
+        Ok(())
+    }
+
+    /// Unlock: bring the launcher back (unless the account is also hidden).
+    fn unlock_account(&self, tool_id: &ToolId, account_id: &str) -> Result<()> {
+        let mut data = self
+            .data
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state lock poisoned"))?;
+        let account = data
+            .accounts
+            .iter()
+            .find(|a| a.tool_id == *tool_id && a.id == account_id)
+            .cloned()
+            .context("Account not found")?;
+        if !account.hidden {
+            restore_launcher_file(&account, &self.store, &data)
+                .context("Couldn't restore the account's command — it stayed locked")?;
+        }
+        if let Some(account) = data
+            .accounts
+            .iter_mut()
+            .find(|a| a.tool_id == *tool_id && a.id == account_id)
+        {
+            if let Some(lock) = account.weekly_lock.as_mut() {
+                lock.locked = false;
+            }
+            account.updated_at = now();
+        }
+        self.store.save(&data)?;
+        Ok(())
     }
 
     /// Switch = pick the account for the PLAIN `claude`/`codex` command (via shell hook +
@@ -2065,6 +2274,9 @@ impl ManagedState {
                 .context("Failed to switch account — kept the previous account")?;
             if account.hidden {
                 anyhow::bail!("This account is hidden — unhide it first");
+            }
+            if account.is_locked() {
+                anyhow::bail!("This account is locked to save its weekly quota — unlock it first");
             }
             (account.is_default, account.state.clone())
         };
@@ -2413,6 +2625,7 @@ fn migrate_defaults(accounts: &mut Vec<Account>) {
             launcher_command: None,
             is_default: true,
             hidden: false,
+            weekly_lock: None,
             avatar_url: None,
             api_provider: None,
         });
@@ -2665,6 +2878,7 @@ fn best_replacement<'a>(
         .filter(|account| {
             &account.tool_id == tool_id
                 && !account.hidden
+                && !account.is_locked()
                 && Some(account.id.as_str()) != excluded_account_id
                 && !matches!(account.state, AccountState::NeedsLogin)
                 && max_percent_used(account) < threshold
@@ -2672,6 +2886,25 @@ fn best_replacement<'a>(
                 && account.quota.as_ref().is_some_and(|q| q.error.is_none())
         })
         .min_by(|left, right| max_percent_used(left).total_cmp(&max_percent_used(right)))
+}
+
+/// Tools whose quota has a weekly window to lock on.
+fn supports_weekly_lock(tool_id: &ToolId) -> bool {
+    matches!(tool_id, ToolId::Claude | ToolId::Codex | ToolId::Opencode)
+}
+
+/// What the weekly reserve lock should do after a fresh quota read: `Some(true)` lock,
+/// `Some(false)` unlock (the weekly window reset below the threshold), `None` leave as is.
+/// A failed or partial quota read never changes the lock.
+fn weekly_lock_transition(account: &Account) -> Option<bool> {
+    let lock = account.weekly_lock.as_ref().filter(|lock| lock.enabled)?;
+    let quota = account.quota.as_ref().filter(|quota| quota.error.is_none())?;
+    let used = quota.weekly.percent_used?;
+    match (lock.locked, used >= lock.threshold) {
+        (false, true) => Some(true),
+        (true, false) => Some(false),
+        _ => None,
+    }
 }
 
 /// Recreate the per-account launcher after unhiding. Missing binary path is a no-op — the
@@ -2837,6 +3070,31 @@ fn notify_exhausted(app: &AppHandle, account: &Account) {
         .show();
 }
 
+fn notify_weekly_lock(app: &AppHandle, account: &Account, locked: bool) {
+    let (title, body) = if locked {
+        let used = account
+            .quota
+            .as_ref()
+            .and_then(|quota| quota.weekly.percent_used)
+            .map(|percent| format!("{}%", percent.round() as i64))
+            .unwrap_or_else(|| "the limit".to_string());
+        (
+            "Account locked",
+            format!(
+                "{} reached {used} of its weekly quota — locked to save the rest. Unlock it on its card to keep using it.",
+                account.name
+            ),
+        )
+    } else {
+        (
+            "Account unlocked",
+            format!("{}'s weekly quota reset — unlocked and ready to use.", account.name),
+        )
+    };
+    let _ = app.notification().builder().title(title).body(&body).show();
+    let _ = app.emit("auto-switched", body);
+}
+
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -2964,9 +3222,61 @@ mod tests {
             launcher_command: None,
             is_default: false,
             hidden,
+            weekly_lock: None,
             avatar_url: None,
             api_provider: None,
         }
+    }
+
+    fn with_weekly(mut account: Account, weekly: Option<f64>, lock: WeeklyLock) -> Account {
+        if let Some(quota) = account.quota.as_mut() {
+            quota.weekly.percent_used = weekly;
+        }
+        account.weekly_lock = Some(lock);
+        account
+    }
+
+    fn lock(enabled: bool, threshold: f64, locked: bool) -> WeeklyLock {
+        WeeklyLock { enabled, threshold, locked }
+    }
+
+    #[test]
+    fn weekly_lock_locks_at_threshold() {
+        let account = with_weekly(test_account("a", false, 10.0), Some(80.0), lock(true, 80.0, false));
+        assert_eq!(weekly_lock_transition(&account), Some(true));
+    }
+
+    #[test]
+    fn weekly_lock_stays_below_threshold() {
+        let account = with_weekly(test_account("a", false, 10.0), Some(79.0), lock(true, 80.0, false));
+        assert_eq!(weekly_lock_transition(&account), None);
+    }
+
+    #[test]
+    fn weekly_lock_unlocks_after_weekly_reset() {
+        let account = with_weekly(test_account("a", false, 10.0), Some(2.0), lock(true, 80.0, true));
+        assert_eq!(weekly_lock_transition(&account), Some(false));
+    }
+
+    #[test]
+    fn weekly_lock_ignores_disarmed_and_unknown_quota() {
+        let off = with_weekly(test_account("a", false, 10.0), Some(95.0), lock(false, 80.0, false));
+        assert_eq!(weekly_lock_transition(&off), None);
+        let unknown = with_weekly(test_account("b", false, 10.0), None, lock(true, 80.0, true));
+        assert_eq!(weekly_lock_transition(&unknown), None);
+        let mut failed = with_weekly(test_account("c", false, 10.0), Some(0.0), lock(true, 80.0, true));
+        failed.quota.as_mut().unwrap().error = Some("network".into());
+        assert_eq!(weekly_lock_transition(&failed), None);
+    }
+
+    #[test]
+    fn best_replacement_skips_locked_accounts() {
+        let accounts = vec![
+            with_weekly(test_account("locked-plenty", false, 0.0), Some(0.0), lock(true, 80.0, true)),
+            test_account("open-used", false, 40.0),
+        ];
+        let best = best_replacement(&accounts, &ToolId::Claude, 100.0, None).unwrap();
+        assert_eq!(best.id, "open-used");
     }
 
     #[test]

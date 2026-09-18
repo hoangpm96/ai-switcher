@@ -18,8 +18,8 @@ use models::{
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, OverlayRect, OverlaySettings, PrimeNowInput,
     RenameAccountInput, SaveApiGatewayComboInput, SetAccountHiddenInput, SetApiGatewayAccountInput,
-    SetLauncherInput, SetToolSetupInput, StartApiGatewayInput, SwitchAccountInput, ToolId,
-    UsageReport,
+    SetLauncherInput, SetToolSetupInput, SetWeeklyLockInput, StartApiGatewayInput,
+    SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -128,6 +128,17 @@ fn set_account_hidden(
     input: SetAccountHiddenInput,
 ) -> Result<AppSnapshot, String> {
     let snapshot = state.set_account_hidden(input).map_err(display_error)?;
+    tray::rebuild(&app);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn set_weekly_lock(
+    app: tauri::AppHandle,
+    state: State<'_, ManagedState>,
+    input: SetWeeklyLockInput,
+) -> Result<AppSnapshot, String> {
+    let snapshot = state.set_weekly_lock(input).map_err(display_error)?;
     tray::rebuild(&app);
     Ok(snapshot)
 }
@@ -491,6 +502,7 @@ pub fn run() {
             switch_account,
             set_launcher,
             set_account_hidden,
+            set_weekly_lock,
             delete_account,
             accept_disclaimer,
             antigravity_new_login,

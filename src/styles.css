@@ -2994,3 +2994,72 @@ div.quotaError .linkBtn {
 .cmdChip.bare:hover {
   opacity: 1;
 }
+
+/* ── Weekly lock (reserve quota) ─────────────────────────────────── */
+.account.locked {
+  border-color: transparent;
+  box-shadow: 0 0 0 1.5px var(--line-strong), var(--edge), var(--shadow-card);
+}
+
+.account.locked .quotaBox {
+  opacity: 0.6;
+}
+
+.badge.lockArmed,
+.badge.lockedBadge {
+  align-items: center;
+  display: inline-flex;
+  gap: 4px;
+}
+
+.badge.lockArmed {
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+
+.badge.lockedBadge {
+  background: var(--text);
+  color: var(--surface);
+}
+
+.badge.lockArmed svg,
+.badge.lockedBadge svg {
+  height: 11px;
+  width: 11px;
+}
+
+.lockedNotice {
+  align-items: center;
+  background: var(--surface-2);
+  border-radius: 8px;
+  color: var(--text-2);
+  display: flex;
+  font-size: 12px;
+  gap: 8px;
+  line-height: 1.4;
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+}
+
+.lockedNotice > svg {
+  flex: none;
+  height: 15px;
+  width: 15px;
+}
+
+.lockedNotice button {
+  flex: none;
+  margin-left: auto;
+}
+
+.iconButton.lockOn {
+  color: var(--accent);
+}
+
+.modal .autoSwitchOpts {
+  margin-top: 0;
+}
+
+.warnText {
+  color: var(--amber);
+}

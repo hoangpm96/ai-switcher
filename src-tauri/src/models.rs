@@ -444,6 +444,11 @@ pub struct Account {
     /// / used by the API gateway until unhidden.
     #[serde(default)]
     pub hidden: bool,
+    /// Reserve-quota lock: once the weekly window reaches the threshold the account is locked
+    /// (stays on the list, but loses its launcher and can't be switched to / auto-switched / used
+    /// by the gateway) until the weekly window resets or the user unlocks it by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_lock: Option<WeeklyLock>,
     /// The account's Google avatar (Antigravity only) — shown instead of the
     /// confusing fingerprint. Computed when building the snapshot, not stored in state.json.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,6 +457,25 @@ pub struct Account {
     /// subscription login. Such accounts have no quota (the gateway exposes none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_provider: Option<ApiProvider>,
+}
+
+impl Account {
+    /// Locked by the weekly reserve-quota setting — not usable until unlocked.
+    pub fn is_locked(&self) -> bool {
+        self.weekly_lock.as_ref().is_some_and(|lock| lock.locked)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WeeklyLock {
+    /// Auto-lock is armed. Unlocking by hand turns it off; re-enabling checks again.
+    pub enabled: bool,
+    /// Weekly % used at which the account locks.
+    pub threshold: f64,
+    /// Currently locked.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -850,6 +874,15 @@ pub struct SetLauncherInput {
     pub tool_id: ToolId,
     pub account_id: String,
     pub name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetWeeklyLockInput {
+    pub tool_id: ToolId,
+    pub account_id: String,
+    pub enabled: bool,
+    pub threshold: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
