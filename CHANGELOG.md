@@ -5,6 +5,17 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-09-18
+
+### Added
+
+- **Weekly lock to save an account's quota.** Each Claude, Codex, and opencode account can lock
+  itself once its weekly limit reaches a threshold you pick (e.g. 80%). A locked account stays on the
+  list but gives up its launcher command, and switching, Prime, auto-switch, the tray menu, and the
+  API gateway all skip it. If the plain command was on it, the command moves to the healthiest other
+  account. It unlocks by itself when the weekly limit resets. Unlocking by hand lets you use up the
+  rest of the quota and turns the lock off until you enable it again.
+
 ## [0.9.0] - 2026-09-18
 
 ### Added
