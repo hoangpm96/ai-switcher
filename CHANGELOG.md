@@ -5,6 +5,18 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-09-30
+
+### Added
+
+- **Claude usage by account.** The Usage tab has a new Accounts view that splits Claude token usage
+  and cost by the subscription login that actually ran each session (read from the session logs),
+  so shared history across accounts is no longer lumped together. Each account shows its tokens,
+  cost, sessions, last activity, per-model and per-project breakdown; pick several to compare or
+  add them up. Accounts removed from the app keep their name and are marked "Removed", and older
+  sessions that cannot be attributed are grouped as "Unknown account" so totals still match the
+  Overview.
+
 ## [0.10.0] - 2026-09-18
 
 ### Added
