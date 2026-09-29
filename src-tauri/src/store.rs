@@ -31,6 +31,10 @@ pub struct StoredState {
     /// Always-on-top quota overlay window (which accounts, size/position, opacity).
     #[serde(default)]
     pub overlay: OverlaySettings,
+    /// Claude organization uuid → who it is (email, app account names). Kept when an account is
+    /// deleted so the Usage tab can still name usage of removed accounts.
+    #[serde(default)]
+    pub claude_orgs: BTreeMap<String, crate::models::ClaudeOrgRecord>,
 }
 
 fn default_threshold() -> f64 {
@@ -48,6 +52,7 @@ impl Default for StoredState {
             tool_setups: BTreeMap::new(),
             api_gateway: ApiGatewayConfig::default(),
             overlay: OverlaySettings::default(),
+            claude_orgs: BTreeMap::new(),
         }
     }
 }

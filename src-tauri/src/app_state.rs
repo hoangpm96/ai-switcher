@@ -1,14 +1,14 @@
 use crate::models::{
     Account, AccountState, AddAccountInput, AddApiAccountInput, ApiGatewayAccount, ApiGatewayCombo,
     ApiGatewayConfig, ApiGatewayKey, ApiGatewayServerState, ApiGatewaySnapshot, ApiProvider,
-    ApiUsageReport, AppSnapshot, AutoSwitchSetting, CreateApiGatewayKeyInput,
+    ApiUsageReport, AppSnapshot, AutoSwitchSetting, ClaudeOrgRecord, CreateApiGatewayKeyInput,
     CreateApiGatewayKeyResult, CreateVirtualApiAccountInput, DeleteApiGatewayComboInput,
     DeleteApiGatewayKeyInput, DetectionReport, OverlayRect, OverlaySettings, QuotaInfo,
     RenameAccountInput, SaveApiGatewayComboInput, SetAccountHiddenInput, SetApiGatewayAccountInput,
     SetLauncherInput, SetToolSetupInput, SetWeeklyLockInput, StartApiGatewayInput,
-    SwitchAccountInput, ToolId, ToolStatus, UsageReport, WeeklyLock,
+    SwitchAccountInput, ToolId, ToolStatus, UsageOrgLabel, UsageReport, WeeklyLock,
 };
-use crate::quota::read_quota;
+use crate::quota::{read_claude_profile, read_quota, ClaudeProfileIdentity};
 use crate::store::{normalize_account_states, Store, StoredState};
 use crate::tools::{
     antigravity_capture, antigravity_current_token, antigravity_new_login, antigravity_open_ide,
@@ -24,6 +24,23 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
+
+/// Re-verify an account's Claude org at most this often — a profile dir can be re-logged into a
+/// different subscription, after which new sessions mark usage with a different `credential_org`.
+const CLAUDE_ORG_RECHECK: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+/// Backoff after a failed `/api/oauth/profile` lookup (logged out, expired token, offline) so a
+/// broken account isn't retried on every usage scan.
+const CLAUDE_ORG_FAIL_RETRY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// account_id → last successful org lookup in THIS process (the registry itself persists lookups
+/// across restarts, so per-process timestamps are enough).
+static CLAUDE_ORG_LAST_OK: Mutex<std::collections::BTreeMap<String, std::time::Instant>> =
+    Mutex::new(std::collections::BTreeMap::new());
+/// Set while `resolve_claude_orgs` runs, so overlapping usage reports don't duplicate lookups.
+static CLAUDE_ORG_RESOLVING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// account_id → last failed org lookup, for the retry backoff above.
+static CLAUDE_ORG_LAST_FAIL: Mutex<std::collections::BTreeMap<String, std::time::Instant>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 pub struct ManagedState {
     pub store: Store,
@@ -788,16 +805,26 @@ impl ManagedState {
     /// dir on the machine, aggregate per tool, and price it via the LiteLLM cache. Antigravity
     /// is excluded (no token logs). Cheap to call repeatedly thanks to the per-file cursor cache.
     pub fn usage_report(&self, range_days: u32) -> UsageReport {
+        // Bring the org registry up to date first so marker-attributed usage lands under the
+        // right label. Throttled per account — normally a no-op. Runs before taking the scan lock
+        // so its HTTP calls never hold up a concurrent report.
+        self.resolve_claude_orgs();
         let _scan = self
             .usage_scan
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let org_labels = self
+            .data
+            .lock()
+            .map(|data| claude_org_labels(&data.claude_orgs, &data.accounts))
+            .unwrap_or_default();
         crate::usage::build_report(
             &self.store.usage_cache_path(),
             &self.store.price_cache_path(),
             &self.config_dirs(&ToolId::Claude),
             &self.config_dirs(&ToolId::Codex),
             range_days,
+            &org_labels,
         )
     }
 
@@ -824,6 +851,132 @@ impl ManagedState {
             }
         }
         dirs
+    }
+
+    /// Refresh the persistent Claude-org registry (`data.claude_orgs`): for every eligible Claude
+    /// account that isn't in the registry yet — or hasn't been verified recently — fetch
+    /// `/api/oauth/profile` and record which organization (= `credential_org` marker uuid) the
+    /// login belongs to. Best-effort like a quota refresh: failures are throttled and swallowed,
+    /// never surfaced to the caller.
+    fn resolve_claude_orgs(&self) {
+        // One lookup round at a time: a second report arriving mid-round just uses the registry
+        // as it stands instead of firing the same HTTP calls again.
+        if CLAUDE_ORG_RESOLVING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                CLAUDE_ORG_RESOLVING.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _release = Release;
+        // Phase 1: pick accounts needing a lookup — brief lock, no I/O.
+        let targets: Vec<(String, String, std::path::PathBuf)> = {
+            let Ok(data) = self.data.lock() else {
+                return;
+            };
+            let last_ok = CLAUDE_ORG_LAST_OK
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            let last_fail = CLAUDE_ORG_LAST_FAIL
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            let default_dir = resolved_default_config_dir(&data, &ToolId::Claude);
+            data.accounts
+                .iter()
+                .filter(|account| {
+                    account.tool_id == ToolId::Claude
+                        && account.api_provider.is_none()
+                        && !is_virtual_api_account(account)
+                })
+                .filter(|account| {
+                    let unregistered = !data.claude_orgs.values().any(|record| {
+                        record.account_ids.iter().any(|id| id == &account.id)
+                    });
+                    let stale = last_ok
+                        .get(&account.id)
+                        .is_none_or(|instant| instant.elapsed() >= CLAUDE_ORG_RECHECK);
+                    if !unregistered && !stale {
+                        return false;
+                    }
+                    last_fail
+                        .get(&account.id)
+                        .is_none_or(|instant| instant.elapsed() >= CLAUDE_ORG_FAIL_RETRY)
+                })
+                .map(|account| {
+                    (
+                        account.id.clone(),
+                        account.name.clone(),
+                        account_config_dir_with_default(&self.store, account, &default_dir),
+                    )
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            return;
+        }
+
+        // Phase 2: fetch profiles in parallel — no mutex held.
+        let results: Vec<_> = {
+            let handles: Vec<_> = targets
+                .into_iter()
+                .map(|(account_id, account_name, config_dir)| {
+                    std::thread::spawn(move || {
+                        let identity = read_claude_profile(&config_dir);
+                        (account_id, account_name, identity)
+                    })
+                })
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        };
+
+        // Record outcomes for the recheck/failure windows before touching the data lock.
+        if let (Ok(mut last_ok), Ok(mut last_fail)) =
+            (CLAUDE_ORG_LAST_OK.lock(), CLAUDE_ORG_LAST_FAIL.lock())
+        {
+            let instant = std::time::Instant::now();
+            for (account_id, _, result) in &results {
+                if result.is_ok() {
+                    last_ok.insert(account_id.clone(), instant);
+                    last_fail.remove(account_id);
+                } else {
+                    last_fail.insert(account_id.clone(), instant);
+                }
+            }
+        }
+
+        // Phase 3: upsert into the registry + save once — brief lock.
+        let Ok(mut data) = self.data.lock() else {
+            return;
+        };
+        let timestamp = now();
+        let mut changed = false;
+        for (account_id, name, result) in results {
+            let Ok(identity) = result else {
+                continue;
+            };
+            // The account may have been renamed or deleted while the HTTP calls were in flight;
+            // prefer the live name, fall back to the one captured in Phase 1.
+            let account_name = data
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .map(|account| account.name.clone())
+                .unwrap_or(name);
+            changed |= upsert_claude_org(
+                &mut data.claude_orgs,
+                &identity,
+                &account_id,
+                &account_name,
+                &timestamp,
+            );
+        }
+        if changed {
+            let _ = self.store.save(&data);
+        }
     }
 
     /// Scan EVERY account in `NeedsLogin`: any that already has a token (the user finished
@@ -1852,8 +2005,21 @@ impl ManagedState {
             if is_virtual_api_account(account) {
                 anyhow::bail!("Local API accounts are managed from the API tab");
             }
-            account.name = name;
+            account.name = name.clone();
             account.updated_at = now();
+            // Keep the org registry's stored name fresh too — usage labels prefer the live name
+            // anyway, but the record is what survives if the account is later deleted.
+            for record in data.claude_orgs.values_mut() {
+                if let Some(index) = record
+                    .account_ids
+                    .iter()
+                    .position(|id| id == &input.account_id)
+                {
+                    if index < record.account_names.len() {
+                        record.account_names[index] = name.clone();
+                    }
+                }
+            }
             self.store.save(&data)?;
         }
 
@@ -2334,7 +2500,7 @@ impl ManagedState {
     }
 
     pub fn delete_account(&self, tool_id: ToolId, account_id: String) -> Result<AppSnapshot> {
-        let (launcher, was_active) = {
+        let (launcher, was_active, pending_org_lookup) = {
             let data = self
                 .data
                 .lock()
@@ -2354,7 +2520,25 @@ impl ManagedState {
             let was_active =
                 active_account_id_for(&self.store, &tool_id, &data.accounts).as_deref()
                     == Some(account_id.as_str());
-            (account.launcher_command.clone(), was_active)
+            // If this Claude OAuth account was never resolved to its org, remember enough to look
+            // it up BEFORE the profile/credentials are removed — the registry then keeps its name
+            // for usage the account already produced.
+            let pending_org_lookup = if tool_id == ToolId::Claude
+                && account.api_provider.is_none()
+                && !is_virtual_api_account(account)
+                && !data.claude_orgs.values().any(|record| {
+                    record.account_ids.iter().any(|id| id == &account.id)
+                })
+            {
+                let default_dir = resolved_default_config_dir(&data, &tool_id);
+                Some((
+                    account.name.clone(),
+                    account_config_dir_with_default(&self.store, account, &default_dir),
+                ))
+            } else {
+                None
+            };
+            (account.launcher_command.clone(), was_active, pending_org_lookup)
         };
 
         // Refuse if this account's folder is the tool's configured default config dir — other
@@ -2384,6 +2568,19 @@ impl ManagedState {
                 .context("Couldn't clear the account in use — nothing was deleted")?;
             install_shell_hook(&self.store)
                 .context("Couldn't update the shell hook — nothing was deleted")?;
+        }
+
+        // Best-effort: resolve the org this account is logged into before its credentials go
+        // away, so the Usage tab can still attribute its past sessions by name. An HTTP failure
+        // or a missing token must never block the delete.
+        if let Some((name, config_dir)) = pending_org_lookup {
+            if let Ok(identity) = read_claude_profile(&config_dir) {
+                if let Ok(mut data) = self.data.lock() {
+                    if upsert_claude_org(&mut data.claude_orgs, &identity, &account_id, &name, &now()) {
+                        let _ = self.store.save(&data);
+                    }
+                }
+            }
         }
 
         delete_account_files(&tool_id, &self.store, &account_id)?;
@@ -2980,6 +3177,118 @@ fn virtual_api_name(tool_id: &ToolId) -> &'static str {
     }
 }
 
+/// Record that `account_id` is logged into the org `identity` describes. An account maps to at
+/// most one org, so it's first removed from any OTHER record (a re-login into another
+/// subscription); `account_ids`/`account_names` stay aligned by position. Missing email/org-name
+/// in a fresh profile never erases values already stored. Returns whether the registry changed.
+fn upsert_claude_org(
+    registry: &mut std::collections::BTreeMap<String, ClaudeOrgRecord>,
+    identity: &ClaudeProfileIdentity,
+    account_id: &str,
+    account_name: &str,
+    now: &str,
+) -> bool {
+    let mut changed = false;
+    for (org_uuid, record) in registry.iter_mut() {
+        if org_uuid == &identity.org_uuid {
+            continue;
+        }
+        if let Some(index) = record.account_ids.iter().position(|id| id == account_id) {
+            record.account_ids.remove(index);
+            if index < record.account_names.len() {
+                record.account_names.remove(index);
+            }
+            changed = true;
+        }
+    }
+    let record = registry.entry(identity.org_uuid.clone()).or_default();
+    // A hand-edited/older record can have fewer names than ids — pad so index writes below hold.
+    if record.account_names.len() < record.account_ids.len() {
+        record
+            .account_names
+            .resize(record.account_ids.len(), String::new());
+        changed = true;
+    }
+    if identity.email.is_some() && record.email != identity.email {
+        record.email = identity.email.clone();
+        changed = true;
+    }
+    if identity.org_name.is_some() && record.organization_name != identity.org_name {
+        record.organization_name = identity.org_name.clone();
+        changed = true;
+    }
+    match record.account_ids.iter().position(|id| id == account_id) {
+        Some(index) => {
+            if record.account_names[index] != account_name {
+                record.account_names[index] = account_name.to_string();
+                changed = true;
+            }
+        }
+        None => {
+            record.account_ids.push(account_id.to_string());
+            record.account_names.push(account_name.to_string());
+            changed = true;
+        }
+    }
+    if record.last_seen != now {
+        record.last_seen = now.to_string();
+        changed = true;
+    }
+    changed
+}
+
+/// How `usage::build_report` should label each known org. `label` prefers the login email, then
+/// the organization name, then a short uuid; `account_names` uses each account's CURRENT name
+/// (renames don't rewrite the registry eagerly), falling back to the stored name once the account
+/// is gone. `removed` = none of the record's ids is an eligible current Claude account.
+fn claude_org_labels(
+    registry: &std::collections::BTreeMap<String, ClaudeOrgRecord>,
+    accounts: &[Account],
+) -> std::collections::BTreeMap<String, UsageOrgLabel> {
+    registry
+        .iter()
+        .map(|(org_uuid, record)| {
+            let label = record
+                .email
+                .clone()
+                .or_else(|| record.organization_name.clone())
+                .unwrap_or_else(|| {
+                    format!("Org {}", org_uuid.chars().take(8).collect::<String>())
+                });
+            let account_names = record
+                .account_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    accounts
+                        .iter()
+                        .find(|account| &account.id == id)
+                        .map(|account| account.name.clone())
+                        .or_else(|| record.account_names.get(index).cloned())
+                        .unwrap_or_default()
+                })
+                .collect();
+            let removed = !record.account_ids.iter().any(|id| {
+                accounts.iter().any(|account| {
+                    &account.id == id
+                        && account.tool_id == ToolId::Claude
+                        && account.api_provider.is_none()
+                        && !is_virtual_api_account(account)
+                })
+            });
+            (
+                org_uuid.clone(),
+                UsageOrgLabel {
+                    label,
+                    email: record.email.clone(),
+                    account_names,
+                    removed,
+                },
+            )
+        })
+        .collect()
+}
+
 fn is_virtual_api_account(account: &Account) -> bool {
     account.fingerprint == "api-local"
 }
@@ -3287,5 +3596,141 @@ mod tests {
         ];
         let best = best_replacement(&accounts, &ToolId::Claude, 100.0, None).unwrap();
         assert_eq!(best.id, "visible-used");
+    }
+
+    fn claude_identity(org_uuid: &str, org_name: Option<&str>, email: Option<&str>) -> ClaudeProfileIdentity {
+        ClaudeProfileIdentity {
+            org_uuid: org_uuid.to_string(),
+            org_name: org_name.map(str::to_string),
+            email: email.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn upsert_claude_org_adds_account_and_is_idempotent() {
+        let mut registry = std::collections::BTreeMap::new();
+        let identity = claude_identity("org-1", Some("Acme"), Some("a@x.com"));
+        assert!(upsert_claude_org(&mut registry, &identity, "acc1", "Work", "t1"));
+        let record = &registry["org-1"];
+        assert_eq!(record.account_ids, vec!["acc1".to_string()]);
+        assert_eq!(record.account_names, vec!["Work".to_string()]);
+        assert_eq!(record.email.as_deref(), Some("a@x.com"));
+        assert_eq!(record.organization_name.as_deref(), Some("Acme"));
+        assert_eq!(record.last_seen, "t1");
+        // Same data at the same timestamp → nothing to change.
+        assert!(!upsert_claude_org(&mut registry, &identity, "acc1", "Work", "t1"));
+        // A fresh lookup only bumps last_seen.
+        assert!(upsert_claude_org(&mut registry, &identity, "acc1", "Work", "t2"));
+        assert_eq!(registry["org-1"].last_seen, "t2");
+        // A partial profile response must not erase the stored email/name.
+        let partial = claude_identity("org-1", None, None);
+        upsert_claude_org(&mut registry, &partial, "acc1", "Work", "t3");
+        assert_eq!(registry["org-1"].email.as_deref(), Some("a@x.com"));
+        assert_eq!(registry["org-1"].organization_name.as_deref(), Some("Acme"));
+    }
+
+    #[test]
+    fn upsert_claude_org_refreshes_renamed_account() {
+        let mut registry = std::collections::BTreeMap::new();
+        let identity = claude_identity("org-1", None, Some("a@x.com"));
+        upsert_claude_org(&mut registry, &identity, "acc1", "Old", "t1");
+        assert!(upsert_claude_org(&mut registry, &identity, "acc1", "New", "t2"));
+        assert_eq!(registry["org-1"].account_ids, vec!["acc1".to_string()]);
+        assert_eq!(registry["org-1"].account_names, vec!["New".to_string()]);
+    }
+
+    #[test]
+    fn upsert_claude_org_moves_account_between_orgs() {
+        let mut registry = std::collections::BTreeMap::new();
+        let org_a = claude_identity("org-a", None, Some("a@x.com"));
+        let org_b = claude_identity("org-b", None, Some("b@x.com"));
+        upsert_claude_org(&mut registry, &org_a, "acc1", "Work", "t1");
+        upsert_claude_org(&mut registry, &org_b, "acc2", "Other", "t1");
+        // acc1 re-logs into org-b: it must leave org-a entirely (one org per account) and join
+        // org-b keeping account_ids/account_names aligned by position.
+        assert!(upsert_claude_org(&mut registry, &org_b, "acc1", "Work", "t2"));
+        assert!(registry["org-a"].account_ids.is_empty());
+        assert!(registry["org-a"].account_names.is_empty());
+        assert_eq!(
+            registry["org-b"].account_ids,
+            vec!["acc2".to_string(), "acc1".to_string()]
+        );
+        assert_eq!(
+            registry["org-b"].account_names,
+            vec!["Other".to_string(), "Work".to_string()]
+        );
+    }
+
+    fn org_record(
+        email: Option<&str>,
+        org_name: Option<&str>,
+        ids: &[&str],
+        names: &[&str],
+    ) -> ClaudeOrgRecord {
+        ClaudeOrgRecord {
+            email: email.map(str::to_string),
+            organization_name: org_name.map(str::to_string),
+            account_ids: ids.iter().map(|id| id.to_string()).collect(),
+            account_names: names.iter().map(|name| name.to_string()).collect(),
+            last_seen: String::new(),
+        }
+    }
+
+    #[test]
+    fn claude_org_labels_prefers_email_then_org_name_then_uuid() {
+        let mut registry = std::collections::BTreeMap::new();
+        registry.insert(
+            "uuid-with-email".to_string(),
+            org_record(Some("me@x.com"), Some("Org Name"), &[], &[]),
+        );
+        registry.insert(
+            "uuid-with-org".to_string(),
+            org_record(None, Some("Org Name"), &[], &[]),
+        );
+        registry.insert("uuid-only".to_string(), org_record(None, None, &[], &[]));
+        let labels = claude_org_labels(&registry, &[]);
+        assert_eq!(labels["uuid-with-email"].label, "me@x.com");
+        assert_eq!(labels["uuid-with-org"].label, "Org Name");
+        assert_eq!(labels["uuid-only"].label, "Org uuid-onl");
+        // No current accounts at all → every org counts as removed.
+        assert!(labels.values().all(|label| label.removed));
+    }
+
+    #[test]
+    fn claude_org_labels_marks_removed_and_prefers_current_names() {
+        // "keep" is a normal Claude OAuth account; "api-acct" is a local-API account (not a
+        // subscription login) — it must not count as a current eligible account.
+        let current = test_account("keep", false, 0.0);
+        let mut api = test_account("api-acct", false, 0.0);
+        api.fingerprint = "api-local".to_string();
+        let accounts = vec![current, api];
+
+        let mut registry = std::collections::BTreeMap::new();
+        registry.insert(
+            "org-live".to_string(),
+            org_record(Some("live@x.com"), None, &["keep"], &["Stale Name"]),
+        );
+        registry.insert(
+            "org-gone".to_string(),
+            org_record(Some("gone@x.com"), None, &["deleted"], &["Deleted Acct"]),
+        );
+        registry.insert(
+            "org-api".to_string(),
+            org_record(None, None, &["api-acct"], &["API"]),
+        );
+        let labels = claude_org_labels(&registry, &accounts);
+
+        let live = &labels["org-live"];
+        assert!(!live.removed);
+        // The live account's current name wins over the stale stored one.
+        assert_eq!(live.account_names, vec!["keep".to_string()]);
+
+        let gone = &labels["org-gone"];
+        assert!(gone.removed);
+        // A removed account keeps the name recorded when it was last seen.
+        assert_eq!(gone.account_names, vec!["Deleted Acct".to_string()]);
+
+        // api-acct still exists but is not a Claude OAuth account → the org is removed.
+        assert!(labels["org-api"].removed);
     }
 }

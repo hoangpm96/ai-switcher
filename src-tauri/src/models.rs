@@ -1002,6 +1002,70 @@ pub struct ToolUsage {
     /// presenting the number as complete.
     #[serde(default)]
     pub unpriced_models: Vec<String>,
+    /// Claude only: usage split by the Claude organization (= subscription account) that ran it,
+    /// read from the `credential_org` markers in the session JSONL. Includes accounts that were
+    /// removed from the app, plus one row with `org_uuid == ""` for usage logged before markers
+    /// existed. Empty for other tools. Highest cost/token usage first.
+    #[serde(default)]
+    pub accounts: Vec<AccountUsage>,
+}
+
+/// Token usage attributed to one Claude organization (one subscription login).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsage {
+    /// `organizationUuid` from the JSONL `credential_org` marker; "" = not attributable.
+    pub org_uuid: String,
+    /// Human label: account email when known, else the org name, else a short uuid.
+    pub label: String,
+    /// Names of the app accounts (current or removed) that were logged in to this org.
+    pub account_names: Vec<String>,
+    /// true when no account currently in the app maps to this org (deleted, or never added).
+    pub removed: bool,
+    pub tokens: TokenBreakdown,
+    pub cost_usd: Option<f64>,
+    pub session_count: u32,
+    pub last_active: String,
+    pub daily: Vec<DayUsage>,
+    pub by_model: Vec<ModelUsage>,
+    pub sessions: Vec<SessionUsage>,
+    /// This account's usage split per working directory (same shape and rules as
+    /// `ToolUsage::projects`, restricted to this account), highest cost/tokens first. Lets the UI
+    /// filter an account's numbers by project.
+    #[serde(default)]
+    pub projects: Vec<ProjectUsage>,
+}
+
+/// How the usage report should label one org — built by app_state from `StoredState::claude_orgs`
+/// + the current accounts, consumed by `usage::build_report`. Not serialized to the UI.
+#[derive(Clone, Debug, Default)]
+pub struct UsageOrgLabel {
+    pub label: String,
+    /// Login email of the org, used to fold email-only usage (logs from before `credential_org`
+    /// markers) into the same row.
+    pub email: Option<String>,
+    pub account_names: Vec<String>,
+    pub removed: bool,
+}
+
+/// Persistent registry entry (state.json `claudeOrgs`, keyed by organization uuid). Survives
+/// account deletion so usage of a removed account keeps its name; re-adding the same login maps
+/// back to the same record.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeOrgRecord {
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub organization_name: Option<String>,
+    /// App account ids ever resolved to this org.
+    #[serde(default)]
+    pub account_ids: Vec<String>,
+    /// Their names (kept after deletion), same order as `account_ids`.
+    #[serde(default)]
+    pub account_names: Vec<String>,
+    #[serde(default)]
+    pub last_seen: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

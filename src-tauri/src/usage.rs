@@ -1,7 +1,8 @@
 // ---------------------------------------------------------------------------
 // Token usage tracking — aggregates token counts + USD cost from the CLIs' local
-// JSONL logs, for the "Usage" tab. Aggregated per tool (Claude / Codex), NOT per
-// account, across every config dir on the machine.
+// JSONL logs, for the "Usage" tab. Aggregated per tool (Claude / Codex) across every
+// config dir on the machine; Claude additionally splits usage per subscription org
+// via the `credential_org` marker lines in the session JSONL.
 //
 //   Claude: <config_dir>/projects/**/*.jsonl — each assistant message line carries
 //           `message.usage` (input/output/cache tokens). These logs UNDERCOUNT badly
@@ -15,12 +16,12 @@
 // ---------------------------------------------------------------------------
 
 use crate::models::{
-    DayUsage, ModelUsage, ProjectUsage, SessionUsage, TokenBreakdown, ToolId, ToolUsage,
-    UsageReport,
+    AccountUsage, DayUsage, ModelUsage, ProjectUsage, SessionUsage, TokenBreakdown, ToolId,
+    ToolUsage, UsageOrgLabel, UsageReport,
 };
 use crate::pricing::{load_price_table, PriceTable};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -28,8 +29,9 @@ use std::path::{Path, PathBuf};
 const MAX_SESSIONS: usize = 30;
 
 /// Bump when the cache format or scan logic changes in a way that invalidates old aggregates
-/// (e.g. the symlink-dedup fix) so a stale cache is discarded instead of double-counting.
-const CACHE_VERSION: u32 = 4;
+/// (e.g. the symlink-dedup fix, org attribution) so a stale cache is discarded instead of
+/// double-counting.
+const CACHE_VERSION: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // On-disk incremental cache
@@ -47,6 +49,13 @@ struct UsageCache {
     buckets: BTreeMap<String, TokenBreakdown>,
     /// "tool|YYYY-MM-DD|model|absolute-path" → totals for the Projects view.
     project_buckets: BTreeMap<String, TokenBreakdown>,
+    /// Claude only: "YYYY-MM-DD|model|org" → totals for the per-account split. "" org collects
+    /// usage logged before `credential_org` markers existed.
+    account_buckets: BTreeMap<String, TokenBreakdown>,
+    /// Claude only: "YYYY-MM-DD|model|org|absolute-path" → totals for `AccountUsage::projects`,
+    /// the per-account split by working directory. The org segment is the same attribution key
+    /// as `account_buckets`.
+    account_project_buckets: BTreeMap<String, TokenBreakdown>,
     /// JSONL file path → session summary (each file is one session).
     sessions: BTreeMap<String, SessionRecord>,
 }
@@ -75,6 +84,14 @@ struct FileCursor {
     /// over again. Capped to the most recent ids (see `remember_counted`).
     #[serde(default)]
     claude_counted: Vec<CountedMessage>,
+    /// Claude only: the `credential_org` in effect at the cursor, so a rescan that starts
+    /// mid-file keeps attributing usage to the right account.
+    #[serde(default)]
+    claude_org: String,
+    /// Claude only: the login email from the latest `session_context` attachment — the fallback
+    /// identity for sessions logged before `credential_org` markers existed.
+    #[serde(default)]
+    claude_email: String,
 }
 
 /// One assistant message's usage as already added to the buckets.
@@ -117,6 +134,9 @@ struct SessionRecord {
     id: String,
     date: String,
     model: String,
+    /// Claude only: the latest `credential_org` seen in the session ("" = unattributed).
+    #[serde(default)]
+    org: String,
     #[serde(default)]
     project: String,
     tokens: TokenBreakdown,
@@ -150,12 +170,14 @@ fn save_cache(path: &Path, cache: &UsageCache) {
 
 /// Scan the given config dirs incrementally, persist the cache, then build the report.
 /// `range_days` limits the totals/chart/tables to the last N local days (0 = all time).
+/// `org_labels` maps Claude org uuids to display info for the per-account split.
 pub fn build_report(
     cache_path: &Path,
     price_cache_path: &Path,
     claude_dirs: &[PathBuf],
     codex_dirs: &[PathBuf],
     range_days: u32,
+    org_labels: &BTreeMap<String, UsageOrgLabel>,
 ) -> UsageReport {
     let mut cache = load_cache(cache_path);
 
@@ -164,13 +186,20 @@ pub fn build_report(
     // real file once, or its tokens get counted 2-3x.
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
+    let mut claude_files: Vec<PathBuf> = Vec::new();
     for dir in claude_dirs {
         for file in collect_jsonl(&dir.join("projects"), "") {
             let real = std::fs::canonicalize(&file).unwrap_or(file);
             if seen.insert(real.clone()) {
-                scan_claude_file(&real, &mut cache);
+                claude_files.push(real);
             }
         }
+    }
+    // Parent sessions first: a subagent file without its own `credential_org` marker inherits the
+    // org its parent session is running under (see `parent_session_path`).
+    claude_files.sort_by_key(|path| parent_session_path(path).is_some());
+    for file in &claude_files {
+        scan_claude_file(file, &mut cache);
     }
     for dir in codex_dirs {
         for file in collect_jsonl(&dir.join("sessions"), "rollout-") {
@@ -185,7 +214,7 @@ pub fn build_report(
     save_cache(cache_path, &cache);
 
     let prices = load_price_table(price_cache_path);
-    build_report_from_cache(&cache, &prices, range_days)
+    build_report_from_cache(&cache, &prices, range_days, org_labels)
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +301,23 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
         .get(&key)
         .map(|c| c.claude_counted.clone())
         .unwrap_or_default();
+    let (mut org, mut email) = cache
+        .files
+        .get(&key)
+        .map(|c| (c.claude_org.clone(), c.claude_email.clone()))
+        .unwrap_or_default();
+    // Subagent transcripts often carry no identity of their own — they run under the same login as
+    // the session that spawned them, so start from the parent's. Lines in the file still win.
+    if let Some(parent) = parent_session_path(path) {
+        if let Some(cursor) = cache.files.get(&parent.to_string_lossy().to_string()) {
+            if org.is_empty() {
+                org = cursor.claude_org.clone();
+            }
+            if email.is_empty() {
+                email = cursor.claude_email.clone();
+            }
+        }
+    }
     let mut project = cache
         .sessions
         .get(&key)
@@ -282,10 +328,26 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
     let mut best: BTreeMap<String, ClaudeEntry> = BTreeMap::new();
     let Some(new_offset) = for_each_new_line(path, offset, |line| {
         if !line.contains("\"usage\"") {
-            if project.is_empty() && line.contains("\"cwd\"") {
+            // `credential_org` attachment lines carry no usage, so they land here: they mark
+            // which account the FOLLOWING assistant lines belong to (written at session start
+            // and again on a mid-session account switch).
+            // `session_context` lines carry the login email — the only identity in logs written
+            // before the markers existed.
+            if line.contains("\"credential_org\"")
+                || line.contains("\"session_context\"")
+                || (project.is_empty() && line.contains("\"cwd\""))
+            {
                 if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                    if let Some(found) = project_path(&value) {
-                        project = found;
+                    if let Some(found) = credential_org(&value) {
+                        org = found;
+                    }
+                    if let Some(found) = session_email(&value) {
+                        email = found;
+                    }
+                    if project.is_empty() {
+                        if let Some(found) = project_path(&value) {
+                            project = found;
+                        }
                     }
                 }
             }
@@ -302,6 +364,7 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
         let Some(mut entry) = claude_entry(&value) else {
             return;
         };
+        entry.org = attribution_key(&org, &email);
         entry.project = project.clone();
         match best.get(&entry.id) {
             Some(existing) if existing.tokens.total() >= entry.tokens.total() => {}
@@ -324,6 +387,15 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
         }
         remember_counted(&mut counted, &entry.id, entry.tokens);
         add_bucket(cache, "claude", &entry.date, &entry.model, &delta);
+        add_account_bucket(cache, &entry.date, &entry.model, &entry.org, &delta);
+        add_account_project_bucket(
+            cache,
+            &entry.date,
+            &entry.model,
+            &entry.org,
+            &entry.project,
+            &delta,
+        );
         add_project_bucket(
             cache,
             "claude",
@@ -339,6 +411,7 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
             &session_id,
             &entry.date,
             &entry.model,
+            &entry.org,
             &entry.project,
             &delta,
         );
@@ -347,12 +420,15 @@ fn scan_claude_file(path: &Path, cache: &mut UsageCache) {
     let cursor = cache.files.entry(key).or_default();
     cursor.offset = new_offset;
     cursor.claude_counted = counted;
+    cursor.claude_org = org;
+    cursor.claude_email = email;
 }
 
 struct ClaudeEntry {
     id: String,
     model: String,
     date: String,
+    org: String,
     project: String,
     tokens: TokenBreakdown,
 }
@@ -394,9 +470,71 @@ fn claude_entry(value: &serde_json::Value) -> Option<ClaudeEntry> {
         id,
         model,
         date,
+        org: String::new(),
         project: String::new(),
         tokens,
     })
+}
+
+/// Prefix for attribution keys that only know the login email (no org marker yet).
+const EMAIL_KEY_PREFIX: &str = "email:";
+
+/// Who a usage line is attributed to: the org uuid when a marker was seen, else `email:<login>`
+/// from the session context, else "" (unknown). `account_usage` folds email keys into the org
+/// that login belongs to when the registry knows it.
+fn attribution_key(org: &str, email: &str) -> String {
+    if !org.is_empty() {
+        org.to_string()
+    } else if !email.is_empty() {
+        format!("{EMAIL_KEY_PREFIX}{email}")
+    } else {
+        String::new()
+    }
+}
+
+/// The login email from a `session_context` attachment, whose `context.userEmail` reads
+/// "The user's email address is someone@example.com. Use it only to …". Lowercased.
+fn session_email(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("attachment") {
+        return None;
+    }
+    let attachment = value.get("attachment")?;
+    if attachment.get("type").and_then(|t| t.as_str()) != Some("session_context") {
+        return None;
+    }
+    let text = attachment.get("context")?.get("userEmail")?.as_str()?;
+    let (_, rest) = text.split_once("email address is ")?;
+    let email = rest.split_whitespace().next()?.trim_end_matches('.');
+    email.contains('@').then(|| email.to_lowercase())
+}
+
+/// `<project>/<session>/subagents/agent-*.jsonl` → `<project>/<session>.jsonl`; None for a
+/// top-level session file.
+fn parent_session_path(path: &Path) -> Option<PathBuf> {
+    let subagents = path.parent()?;
+    if subagents.file_name()? != "subagents" {
+        return None;
+    }
+    let session_dir = subagents.parent()?;
+    let session = session_dir.file_name()?.to_str()?;
+    Some(session_dir.with_file_name(format!("{session}.jsonl")))
+}
+
+/// Extracts the org uuid from a `credential_org` attachment line — emitted at session start and
+/// whenever the logged-in account changes mid-session. Following assistant lines belong to that
+/// org until the next marker.
+fn credential_org(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("attachment") {
+        return None;
+    }
+    let attachment = value.get("attachment")?;
+    if attachment.get("type").and_then(|t| t.as_str()) != Some("credential_org") {
+        return None;
+    }
+    attachment
+        .get("organizationUuid")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +620,7 @@ fn scan_codex_file(path: &Path, cache: &mut UsageCache) {
             &session_id,
             &date,
             &model,
+            "",
             &project,
             &tokens,
         );
@@ -579,6 +718,40 @@ fn add_project_bucket(
     cache.project_buckets.entry(key).or_default().add(tokens);
 }
 
+/// Claude only: the same delta into the per-org map ("date|model|org", "" = unattributed).
+fn add_account_bucket(
+    cache: &mut UsageCache,
+    date: &str,
+    model: &str,
+    org: &str,
+    tokens: &TokenBreakdown,
+) {
+    let key = format!("{date}|{model}|{org}");
+    cache.account_buckets.entry(key).or_default().add(tokens);
+}
+
+/// Claude only: the same delta into the per-org-per-project map
+/// ("date|model|org|absolute-path") that feeds `AccountUsage::projects`. Skipped when the
+/// project path is unknown (same rule as `add_project_bucket`).
+fn add_account_project_bucket(
+    cache: &mut UsageCache,
+    date: &str,
+    model: &str,
+    org: &str,
+    project: &str,
+    tokens: &TokenBreakdown,
+) {
+    if project.is_empty() {
+        return;
+    }
+    let key = format!("{date}|{model}|{org}|{project}");
+    cache
+        .account_project_buckets
+        .entry(key)
+        .or_default()
+        .add(tokens);
+}
+
 fn add_session(
     cache: &mut UsageCache,
     path_key: &str,
@@ -586,6 +759,7 @@ fn add_session(
     id: &str,
     date: &str,
     model: &str,
+    org: &str,
     project: &str,
     tokens: &TokenBreakdown,
 ) {
@@ -594,14 +768,16 @@ fn add_session(
         id: id.to_string(),
         date: date.to_string(),
         model: model.to_string(),
+        org: org.to_string(),
         project: project.to_string(),
         tokens: TokenBreakdown::default(),
     });
     record.tokens.add(tokens);
-    // Track the latest activity date + the model in use at that point.
+    // Track the latest activity date + the model/org in use at that point.
     if date >= record.date.as_str() {
         record.date = date.to_string();
         record.model = model.to_string();
+        record.org = org.to_string();
     }
     if !project.is_empty() {
         record.project = project.to_string();
@@ -652,6 +828,7 @@ fn build_report_from_cache(
     cache: &UsageCache,
     prices: &PriceTable,
     range_days: u32,
+    org_labels: &BTreeMap<String, UsageOrgLabel>,
 ) -> UsageReport {
     let today = today_local();
     let cutoff = cutoff_date(range_days);
@@ -664,6 +841,7 @@ fn build_report_from_cache(
                 &tool_id,
                 &today,
                 cutoff.as_deref(),
+                org_labels,
             )
         })
         .collect();
@@ -701,6 +879,7 @@ fn tool_usage(
     tool_id: &ToolId,
     today: &str,
     cutoff: Option<&str>,
+    org_labels: &BTreeMap<String, UsageOrgLabel>,
 ) -> ToolUsage {
     let tool = tool_id.as_str();
     let prefix = format!("{tool}|");
@@ -710,7 +889,6 @@ fn tool_usage(
     let mut by_model: BTreeMap<String, TokenBreakdown> = BTreeMap::new();
     let mut total = TokenBreakdown::default();
     let mut today_tokens = TokenBreakdown::default();
-    let mut project_models: BTreeMap<String, BTreeMap<String, TokenBreakdown>> = BTreeMap::new();
     let mut project_day_models: BTreeMap<
         String,
         BTreeMap<String, BTreeMap<String, TokenBreakdown>>,
@@ -784,12 +962,6 @@ fn tool_usage(
             continue;
         }
         if in_range(date, cutoff) {
-            project_models
-                .entry(path.to_string())
-                .or_default()
-                .entry(model.to_string())
-                .or_default()
-                .add(tokens);
             project_day_models
                 .entry(path.to_string())
                 .or_default()
@@ -801,115 +973,15 @@ fn tool_usage(
         }
     }
 
-    let mut project_sessions: BTreeMap<String, (u32, String)> = BTreeMap::new();
-    let mut project_session_rows: BTreeMap<String, Vec<SessionUsage>> = BTreeMap::new();
-    for record in cache.sessions.values().filter(|record| record.tool == tool) {
-        if record.project.is_empty() {
-            continue;
-        }
-        let item = project_sessions
-            .entry(record.project.clone())
-            .or_insert((0, record.date.clone()));
-        if in_range(&record.date, cutoff) {
-            item.0 += 1;
-            project_session_rows
-                .entry(record.project.clone())
-                .or_default()
-                .push(SessionUsage {
-                    id: record.id.clone(),
-                    date: record.date.clone(),
-                    model: record.model.clone(),
-                    tokens: record.tokens,
-                    cost_usd: prices.cost(&record.model, &record.tokens),
-                });
-        }
-        if record.date > item.1 {
-            item.1 = record.date.clone();
-        }
-    }
-
-    let project_paths: BTreeSet<String> = project_models.keys().cloned().collect();
-    let mut projects: Vec<ProjectUsage> = project_paths
-        .into_iter()
-        .map(|path| {
-            let models = project_models.get(&path);
-            let tokens = models
-                .into_iter()
-                .flat_map(|models| models.values())
-                .fold(TokenBreakdown::default(), |mut sum, item| {
-                    sum.add(item);
-                    sum
-                });
-            let cost_usd = models.and_then(|models| {
-                sum_cost(
-                    models
-                        .iter()
-                        .map(|(model, tokens)| prices.cost(model, tokens)),
-                )
-            });
-            let (session_count, last_active) = project_sessions
-                .get(&path)
-                .cloned()
-                .unwrap_or((0, "unknown".to_string()));
-            let daily = project_day_models
-                .get(&path)
-                .into_iter()
-                .flat_map(|days| days.iter())
-                .map(|(date, models)| {
-                    let tokens = models.values().fold(
-                        TokenBreakdown::default(),
-                        |mut sum, tokens| {
-                            sum.add(tokens);
-                            sum
-                        },
-                    );
-                    let cost_usd = sum_cost(
-                        models
-                            .iter()
-                            .map(|(model, tokens)| prices.cost(model, tokens)),
-                    );
-                    DayUsage {
-                        date: date.clone(),
-                        tokens,
-                        cost_usd,
-                    }
-                })
-                .collect();
-            let mut by_model: Vec<ModelUsage> = models
-                .into_iter()
-                .flat_map(|models| models.iter())
-                .map(|(model, tokens)| ModelUsage {
-                    model: model.clone(),
-                    tokens: *tokens,
-                    cost_usd: prices.cost(model, tokens),
-                })
-                .collect();
-            by_model.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total()));
-            let mut sessions = project_session_rows.get(&path).cloned().unwrap_or_default();
-            sessions.sort_by(|a, b| {
-                b.date
-                    .cmp(&a.date)
-                    .then(b.tokens.total().cmp(&a.tokens.total()))
-            });
-            sessions.truncate(MAX_SESSIONS);
-            ProjectUsage {
-                path,
-                tokens,
-                cost_usd,
-                session_count,
-                last_active,
-                daily,
-                by_model,
-                sessions,
-            }
-        })
-        .collect();
-    projects.sort_by(|a, b| {
-        b.cost_usd
-            .partial_cmp(&a.cost_usd)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.tokens.total().cmp(&a.tokens.total()))
-    });
+    let projects = project_usage(
+        &project_day_models,
+        cache
+            .sessions
+            .values()
+            .filter(|record| record.tool == tool),
+        prices,
+        cutoff,
+    );
 
     let mut sessions: Vec<SessionUsage> = cache
         .sessions
@@ -926,6 +998,14 @@ fn tool_usage(
     sessions.sort_by(|a, b| b.date.cmp(&a.date).then(b.tokens.total().cmp(&a.tokens.total())));
     sessions.truncate(MAX_SESSIONS);
 
+    // Claude splits usage per subscription org (the logged-in account); other tools have no
+    // per-account attribution.
+    let accounts = if matches!(tool_id, ToolId::Claude) {
+        account_usage(cache, prices, cutoff, org_labels)
+    } else {
+        Vec::new()
+    };
+
     ToolUsage {
         tool_id: tool_id.clone(),
         display_name: tool_id.display_name().to_string(),
@@ -939,7 +1019,308 @@ fn tool_usage(
         sessions,
         projects,
         unpriced_models,
+        accounts,
     }
+}
+
+/// Rolls up a date → model → tokens tree into the shared report pieces: total tokens, total
+/// cost (None when nothing is priced), per-day rows (oldest → newest) and per-model rows (most
+/// tokens first). Shared by the Projects and per-account splits.
+fn rollup_day_models(
+    day_models: &BTreeMap<String, BTreeMap<String, TokenBreakdown>>,
+    prices: &PriceTable,
+) -> (TokenBreakdown, Option<f64>, Vec<DayUsage>, Vec<ModelUsage>) {
+    let mut total = TokenBreakdown::default();
+    let mut daily = Vec::new();
+    let mut models: BTreeMap<String, TokenBreakdown> = BTreeMap::new();
+    for (date, day) in day_models {
+        let mut day_tokens = TokenBreakdown::default();
+        for (model, tokens) in day {
+            day_tokens.add(tokens);
+            models.entry(model.clone()).or_default().add(tokens);
+        }
+        total.add(&day_tokens);
+        daily.push(DayUsage {
+            date: date.clone(),
+            tokens: day_tokens,
+            cost_usd: sum_cost(day.iter().map(|(model, tokens)| prices.cost(model, tokens))),
+        });
+    }
+    let mut by_model: Vec<ModelUsage> = models
+        .into_iter()
+        .map(|(model, tokens)| ModelUsage {
+            cost_usd: prices.cost(&model, &tokens),
+            model,
+            tokens,
+        })
+        .collect();
+    by_model.sort_by(|a, b| b.tokens.total().cmp(&a.tokens.total()));
+    let cost_usd = sum_cost(by_model.iter().map(|m| m.cost_usd));
+    (total, cost_usd, daily, by_model)
+}
+
+/// Builds the `ProjectUsage` rows for one scope — a whole tool (`ToolUsage::projects`) or a
+/// single account (`AccountUsage::projects`). `day_models` is the scope's path → date → model →
+/// tokens tree, already filtered to the range; `records` are the scope's session records (range
+/// filtering happens here so `last_active` can still see sessions outside it). Rows sort highest
+/// cost/token usage first.
+fn project_usage<'a>(
+    day_models: &BTreeMap<String, BTreeMap<String, BTreeMap<String, TokenBreakdown>>>,
+    records: impl Iterator<Item = &'a SessionRecord>,
+    prices: &PriceTable,
+    cutoff: Option<&str>,
+) -> Vec<ProjectUsage> {
+    // path → (in-range session count, latest session date, in-range session rows).
+    let mut project_sessions: BTreeMap<String, (u32, String, Vec<SessionUsage>)> =
+        BTreeMap::new();
+    for record in records {
+        if record.project.is_empty() {
+            continue;
+        }
+        let item = project_sessions
+            .entry(record.project.clone())
+            .or_insert_with(|| (0, String::new(), Vec::new()));
+        if in_range(&record.date, cutoff) {
+            item.0 += 1;
+            item.2.push(SessionUsage {
+                id: record.id.clone(),
+                date: record.date.clone(),
+                model: record.model.clone(),
+                tokens: record.tokens,
+                cost_usd: prices.cost(&record.model, &record.tokens),
+            });
+        }
+        // "unknown" sorts after every ISO date, so it must never win the latest-date comparison.
+        if record.date != "unknown" && record.date > item.1 {
+            item.1 = record.date.clone();
+        }
+    }
+    for item in project_sessions.values_mut() {
+        if item.1.is_empty() {
+            item.1 = "unknown".to_string();
+        }
+    }
+
+    let mut projects: Vec<ProjectUsage> = day_models
+        .iter()
+        .map(|(path, day_models)| {
+            let (tokens, cost_usd, daily, by_model) = rollup_day_models(day_models, prices);
+            let (session_count, last_active, mut sessions) = project_sessions
+                .remove(path)
+                .unwrap_or_else(|| (0, "unknown".to_string(), Vec::new()));
+            sessions.sort_by(|a, b| {
+                b.date
+                    .cmp(&a.date)
+                    .then(b.tokens.total().cmp(&a.tokens.total()))
+            });
+            sessions.truncate(MAX_SESSIONS);
+            ProjectUsage {
+                path: path.clone(),
+                tokens,
+                cost_usd,
+                session_count,
+                last_active,
+                daily,
+                by_model,
+                sessions,
+            }
+        })
+        .collect();
+    projects.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.tokens.total().cmp(&a.tokens.total()))
+    });
+    projects
+}
+
+/// Claude only: one `AccountUsage` per org that has tokens in range. Org "" collects usage
+/// written before `credential_org` markers existed; it reports as "Unattributed" and always
+/// sorts last.
+fn account_usage(
+    cache: &UsageCache,
+    prices: &PriceTable,
+    cutoff: Option<&str>,
+    org_labels: &BTreeMap<String, UsageOrgLabel>,
+) -> Vec<AccountUsage> {
+    // A login email seen only in `session_context` (no org marker) belongs to the org the registry
+    // resolved for that email, when there is one — fold it in so one account is one row.
+    let email_orgs: BTreeMap<String, String> = org_labels
+        .iter()
+        .filter_map(|(org, info)| Some((info.email.as_ref()?.to_lowercase(), org.clone())))
+        .collect();
+    let resolve = |key: &str| -> String {
+        key.strip_prefix(EMAIL_KEY_PREFIX)
+            .and_then(|email| email_orgs.get(email))
+            .cloned()
+            .unwrap_or_else(|| key.to_string())
+    };
+
+    // org → date → model → tokens, in range.
+    let mut org_day_models: BTreeMap<
+        String,
+        BTreeMap<String, BTreeMap<String, TokenBreakdown>>,
+    > = BTreeMap::new();
+    for (key, tokens) in cache.account_buckets.iter() {
+        // key = "date|model|org" (a Claude-only map — no tool prefix).
+        let mut parts = key.splitn(3, '|');
+        let date = parts.next().unwrap_or("unknown");
+        let model = parts.next().unwrap_or("unknown");
+        let org = parts.next().unwrap_or("");
+        if !in_range(date, cutoff) {
+            continue;
+        }
+        org_day_models
+            .entry(resolve(org))
+            .or_default()
+            .entry(date.to_string())
+            .or_default()
+            .entry(model.to_string())
+            .or_default()
+            .add(tokens);
+    }
+
+    // org → project path → date → model → tokens, in range — the per-account project split,
+    // folded through `resolve` exactly like the totals above.
+    let mut org_project_day_models: BTreeMap<
+        String,
+        BTreeMap<String, BTreeMap<String, BTreeMap<String, TokenBreakdown>>>,
+    > = BTreeMap::new();
+    for (key, tokens) in cache.account_project_buckets.iter() {
+        // key = "date|model|org|project" — splitn(4) keeps any '|' inside the path itself.
+        let mut parts = key.splitn(4, '|');
+        let date = parts.next().unwrap_or("unknown");
+        let model = parts.next().unwrap_or("unknown");
+        let org = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        if path.is_empty() || !in_range(date, cutoff) {
+            continue;
+        }
+        org_project_day_models
+            .entry(resolve(org))
+            .or_default()
+            .entry(path.to_string())
+            .or_default()
+            .entry(date.to_string())
+            .or_default()
+            .entry(model.to_string())
+            .or_default()
+            .add(tokens);
+    }
+
+    // org → (in-range session count, latest session date, in-range session rows) — same rules
+    // as the project split above.
+    let mut org_sessions: BTreeMap<String, (u32, String, Vec<SessionUsage>)> = BTreeMap::new();
+    for record in cache
+        .sessions
+        .values()
+        .filter(|record| record.tool == ToolId::Claude.as_str())
+    {
+        let item = org_sessions
+            .entry(resolve(&record.org))
+            .or_insert_with(|| (0, String::new(), Vec::new()));
+        if in_range(&record.date, cutoff) {
+            item.0 += 1;
+            item.2.push(SessionUsage {
+                id: record.id.clone(),
+                date: record.date.clone(),
+                model: record.model.clone(),
+                tokens: record.tokens,
+                cost_usd: prices.cost(&record.model, &record.tokens),
+            });
+        }
+        // "unknown" sorts after every ISO date, so it must never win the latest-date comparison.
+        if record.date != "unknown" && record.date > item.1 {
+            item.1 = record.date.clone();
+        }
+    }
+    for item in org_sessions.values_mut() {
+        if item.1.is_empty() {
+            item.1 = "unknown".to_string();
+        }
+    }
+
+    // resolved org → its session records — the project split matches a session to
+    // (account, project path) the same way.
+    let mut sessions_by_org: BTreeMap<String, Vec<&SessionRecord>> = BTreeMap::new();
+    for record in cache
+        .sessions
+        .values()
+        .filter(|record| record.tool == ToolId::Claude.as_str())
+    {
+        sessions_by_org
+            .entry(resolve(&record.org))
+            .or_default()
+            .push(record);
+    }
+
+    let mut accounts: Vec<AccountUsage> = org_day_models
+        .into_iter()
+        .map(|(org, day_models)| {
+            let (tokens, cost_usd, daily, by_model) = rollup_day_models(&day_models, prices);
+            let (session_count, last_active, mut sessions) = org_sessions
+                .remove(&org)
+                .unwrap_or_else(|| (0, "unknown".to_string(), Vec::new()));
+            sessions.sort_by(|a, b| {
+                b.date
+                    .cmp(&a.date)
+                    .then(b.tokens.total().cmp(&a.tokens.total()))
+            });
+            sessions.truncate(MAX_SESSIONS);
+            let projects = project_usage(
+                &org_project_day_models.remove(&org).unwrap_or_default(),
+                sessions_by_org
+                    .remove(&org)
+                    .unwrap_or_default()
+                    .into_iter(),
+                prices,
+                cutoff,
+            );
+            let info = org_labels.get(&org);
+            let label = if org.is_empty() {
+                "Unattributed".to_string()
+            } else if let Some(email) = org.strip_prefix(EMAIL_KEY_PREFIX) {
+                // A login the registry never resolved (e.g. deleted before org lookups existed).
+                email.to_string()
+            } else {
+                match info.map(|info| info.label.as_str()) {
+                    Some(label) if !label.is_empty() => label.to_string(),
+                    _ => format!("Org {org:.8}"),
+                }
+            };
+            let removed = !org.is_empty() && info.map(|info| info.removed).unwrap_or(true);
+            AccountUsage {
+                org_uuid: org,
+                label,
+                account_names: info
+                    .map(|info| info.account_names.clone())
+                    .unwrap_or_default(),
+                removed,
+                tokens,
+                cost_usd,
+                session_count,
+                last_active,
+                daily,
+                by_model,
+                sessions,
+                projects,
+            }
+        })
+        .collect();
+    // Highest cost/token usage first — except the unattributed row, which always goes last.
+    accounts.sort_by(|a, b| {
+        a.org_uuid
+            .is_empty()
+            .cmp(&b.org_uuid.is_empty())
+            .then(
+                b.cost_usd
+                    .partial_cmp(&a.cost_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(b.tokens.total().cmp(&a.tokens.total()))
+    });
+    accounts
 }
 
 #[cfg(test)]
@@ -1034,13 +1415,13 @@ mod tests {
 
         // 7-day range → only the recent line. (Use a fresh cache per call to re-aggregate.)
         let cache7 = base.join("usage7.json");
-        let r7 = build_report(&cache7, &prices, &dirs, &[], 7);
+        let r7 = build_report(&cache7, &prices, &dirs, &[], 7, &BTreeMap::new());
         let claude7 = r7.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
         assert_eq!(claude7.total.total(), 15);
 
         // All time → both lines.
         let cache_all = base.join("usageAll.json");
-        let r_all = build_report(&cache_all, &prices, &dirs, &[], 0);
+        let r_all = build_report(&cache_all, &prices, &dirs, &[], 0, &BTreeMap::new());
         let claude_all = r_all.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
         assert_eq!(claude_all.total.total(), 1515);
 
@@ -1068,7 +1449,7 @@ mod tests {
         let cache = base.join("usage.json");
         let prices = base.join("prices.json"); // missing → no cost, fine for token assert
         let claude_dirs = vec![base.join("default"), base.join("profile")];
-        let report = build_report(&cache, &prices, &claude_dirs, &[], 0);
+        let report = build_report(&cache, &prices, &claude_dirs, &[], 0, &BTreeMap::new());
         let _ = std::fs::remove_dir_all(&base);
 
         let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
@@ -1111,6 +1492,7 @@ mod tests {
             &[base.join("claude")],
             &[base.join("codex")],
             0,
+            &BTreeMap::new(),
         );
 
         let claude = report.tools.iter().find(|tool| tool.tool_id == ToolId::Claude).unwrap();
@@ -1149,5 +1531,497 @@ mod tests {
         // m1 (5+7) + m2 (3+4) counted exactly once each.
         assert_eq!(total.input, 8);
         assert_eq!(total.output, 11);
+    }
+
+    /// Sum the account_bucket tokens for one org (bucket keys are "date|model|org" where the
+    /// date is the LOCAL day, so tests match on the "|org" suffix).
+    fn org_bucket_total(cache: &UsageCache, org: &str) -> u64 {
+        let suffix = format!("|{org}");
+        cache
+            .account_buckets
+            .iter()
+            .filter(|(key, _)| key.ends_with(&suffix))
+            .map(|(_, tokens)| tokens.total())
+            .sum()
+    }
+
+    #[test]
+    fn session_context_email_attributes_pre_marker_usage() {
+        let base = std::env::temp_dir().join(format!("aisw_org_email_{}", std::process::id()));
+        let projects = base.join("default/projects/-proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        let usage = |id: &str, input: u64| {
+            format!(
+                r#"{{"message":{{"model":"claude-x","id":"{id}","role":"assistant","usage":{{"input_tokens":{input},"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}},"timestamp":"2026-09-10T10:01:00.000Z"}}"#
+            )
+        };
+        let context = |email: &str| {
+            format!(
+                r#"{{"type":"attachment","attachment":{{"type":"session_context","context":{{"userEmail":"The user's email address is {email}. Use it only to identify the user."}}}},"timestamp":"2026-09-10T10:00:00.000Z"}}"#
+            )
+        };
+        // Old session of a login the registry knows (by email) → folds into its org row.
+        std::fs::write(
+            projects.join("old-known.jsonl"),
+            format!("{}\n{}\n", context("Work@Example.com"), usage("a1", 10)),
+        )
+        .unwrap();
+        // Old session of a login the registry never saw (deleted account) → its own email row.
+        std::fs::write(
+            projects.join("old-gone.jsonl"),
+            format!("{}\n{}\n", context("gone@example.com"), usage("g1", 5)),
+        )
+        .unwrap();
+        // New session with a marker for the known org.
+        std::fs::write(
+            projects.join("new.jsonl"),
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-work"},"timestamp":"2026-09-28T10:00:00.000Z"}"#,
+                usage("n1", 1)
+            ),
+        )
+        .unwrap();
+
+        let mut org_labels: BTreeMap<String, UsageOrgLabel> = BTreeMap::new();
+        org_labels.insert(
+            "org-work".to_string(),
+            UsageOrgLabel {
+                label: "work@example.com".to_string(),
+                email: Some("work@example.com".to_string()),
+                account_names: vec!["Work".to_string()],
+                removed: false,
+            },
+        );
+        let report = build_report(
+            &base.join("usage.json"),
+            &base.join("prices.json"),
+            &[base.join("default")],
+            &[],
+            0,
+            &org_labels,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude.accounts.len(), 2);
+        let work = claude.accounts.iter().find(|a| a.org_uuid == "org-work").unwrap();
+        assert_eq!(work.tokens.total(), 11);
+        assert_eq!(work.session_count, 2);
+        let gone = claude
+            .accounts
+            .iter()
+            .find(|a| a.org_uuid == "email:gone@example.com")
+            .unwrap();
+        assert_eq!(gone.label, "gone@example.com");
+        assert!(gone.removed);
+        assert_eq!(gone.tokens.total(), 5);
+    }
+
+    #[test]
+    fn subagent_without_marker_inherits_parent_org() {
+        let base = std::env::temp_dir().join(format!("aisw_org_subagent_{}", std::process::id()));
+        let project = base.join("default/projects/-proj");
+        let subagents = project.join("sess1/subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::write(
+            project.join("sess1.jsonl"),
+            concat!(
+                r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-parent"},"timestamp":"2026-09-28T10:00:00.000Z"}"#, "\n",
+                r#"{"message":{"model":"claude-x","id":"p1","role":"assistant","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:01:00.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            subagents.join("agent-a1.jsonl"),
+            concat!(
+                r#"{"message":{"model":"claude-x","id":"s1","role":"assistant","usage":{"input_tokens":40,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:02:00.000Z"}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let report = build_report(
+            &base.join("usage.json"),
+            &base.join("prices.json"),
+            &[base.join("default")],
+            &[],
+            0,
+            &BTreeMap::new(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude.accounts.len(), 1);
+        assert_eq!(claude.accounts[0].org_uuid, "org-parent");
+        assert_eq!(claude.accounts[0].tokens.total(), 44);
+    }
+
+    #[test]
+    fn credential_org_marker_attributes_following_usage() {
+        let mut cache = UsageCache::default();
+        let tmp = std::env::temp_dir().join(format!("aisw_org_marker_{}.jsonl", std::process::id()));
+        let content = concat!(
+            r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-aaa"},"timestamp":"2026-09-28T10:00:00.000Z"}"#, "\n",
+            r#"{"message":{"model":"claude-x","id":"m1","role":"assistant","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:01:00.000Z"}"#, "\n",
+        );
+        std::fs::write(&tmp, content).unwrap();
+        scan_claude_file(&tmp, &mut cache);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(org_bucket_total(&cache, "org-aaa"), 15);
+        assert_eq!(org_bucket_total(&cache, ""), 0);
+        assert_eq!(cache.sessions.values().next().unwrap().org, "org-aaa");
+    }
+
+    #[test]
+    fn org_switch_mid_file_splits_usage() {
+        let mut cache = UsageCache::default();
+        let tmp = std::env::temp_dir().join(format!("aisw_org_switch_{}.jsonl", std::process::id()));
+        let content = concat!(
+            r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-aaa"},"timestamp":"2026-09-28T10:00:00.000Z"}"#, "\n",
+            r#"{"message":{"model":"claude-x","id":"m1","role":"assistant","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:01:00.000Z"}"#, "\n",
+            r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-bbb"},"timestamp":"2026-09-28T10:02:00.000Z"}"#, "\n",
+            r#"{"message":{"model":"claude-x","id":"m2","role":"assistant","usage":{"input_tokens":20,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:03:00.000Z"}"#, "\n",
+        );
+        std::fs::write(&tmp, content).unwrap();
+        scan_claude_file(&tmp, &mut cache);
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(org_bucket_total(&cache, "org-aaa"), 15);
+        assert_eq!(org_bucket_total(&cache, "org-bbb"), 27);
+        // The session record keeps the latest org seen.
+        assert_eq!(cache.sessions.values().next().unwrap().org, "org-bbb");
+    }
+
+    #[test]
+    fn org_cursor_persists_across_incremental_rescans() {
+        let base = std::env::temp_dir().join(format!("aisw_org_incr_{}", std::process::id()));
+        let projects = base.join("default/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let file = projects.join("conv.jsonl");
+        let marker = r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-aaa"},"timestamp":"2026-09-28T10:00:00.000Z"}"#;
+        let line1 = r#"{"message":{"model":"claude-x","id":"m1","role":"assistant","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:01:00.000Z"}"#;
+        std::fs::write(&file, format!("{marker}\n{line1}\n")).unwrap();
+
+        let cache = base.join("usage.json");
+        let prices = base.join("prices.json"); // missing → no cost, fine for token assert
+        let dirs = vec![base.join("default")];
+        build_report(&cache, &prices, &dirs, &[], 0, &BTreeMap::new());
+
+        // Appended line has NO marker — the cursor's stored org must still attribute it.
+        let line2 = r#"{"message":{"model":"claude-x","id":"m2","role":"assistant","usage":{"input_tokens":20,"output_tokens":7,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:05:00.000Z"}"#;
+        let mut file_handle = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        use std::io::Write;
+        writeln!(file_handle, "{line2}").unwrap();
+        let report = build_report(&cache, &prices, &dirs, &[], 0, &BTreeMap::new());
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude.accounts.len(), 1);
+        assert_eq!(claude.accounts[0].org_uuid, "org-aaa");
+        assert_eq!(claude.accounts[0].tokens.total(), 42);
+        assert_eq!(claude.accounts[0].session_count, 1);
+    }
+
+    #[test]
+    fn pre_marker_usage_reports_unattributed_last() {
+        let base = std::env::temp_dir().join(format!("aisw_org_unattr_{}", std::process::id()));
+        let projects = base.join("default/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        // m1 predates the marker feature (no marker line) → "" org; m2 follows a marker.
+        let content = concat!(
+            r#"{"message":{"model":"claude-x","id":"m1","role":"assistant","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:01:00.000Z"}"#, "\n",
+            r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-aaa"},"timestamp":"2026-09-28T10:02:00.000Z"}"#, "\n",
+            r#"{"message":{"model":"claude-x","id":"m2","role":"assistant","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:03:00.000Z"}"#, "\n",
+        );
+        std::fs::write(projects.join("conv.jsonl"), content).unwrap();
+
+        let report = build_report(
+            &base.join("usage.json"),
+            &base.join("prices.json"),
+            &[base.join("default")],
+            &[],
+            0,
+            &BTreeMap::new(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude.accounts.len(), 2);
+        // Unattributed sorts last even though it holds most of the tokens.
+        assert_eq!(claude.accounts[0].org_uuid, "org-aaa");
+        // "unknown" (the empty default) must not beat a real ISO date as the latest activity.
+        assert_eq!(claude.accounts[0].last_active, "2026-09-28");
+        let last = &claude.accounts[1];
+        assert_eq!(last.org_uuid, "");
+        assert_eq!(last.label, "Unattributed");
+        assert!(!last.removed);
+        assert_eq!(last.tokens.total(), 150);
+    }
+
+    #[test]
+    fn org_labels_drive_label_names_and_removed() {
+        let base = std::env::temp_dir().join(format!("aisw_org_labels_{}", std::process::id()));
+        let projects = base.join("default/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let content = concat!(
+            r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"da624f70-known"},"timestamp":"2026-09-28T10:00:00.000Z"}"#, "\n",
+            r#"{"message":{"model":"claude-x","id":"m1","role":"assistant","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:01:00.000Z"}"#, "\n",
+            r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"deadbeef-gone"},"timestamp":"2026-09-28T10:02:00.000Z"}"#, "\n",
+            r#"{"message":{"model":"claude-x","id":"m2","role":"assistant","usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-09-28T10:03:00.000Z"}"#, "\n",
+        );
+        std::fs::write(projects.join("conv.jsonl"), content).unwrap();
+
+        let mut org_labels: BTreeMap<String, UsageOrgLabel> = BTreeMap::new();
+        org_labels.insert(
+            "da624f70-known".to_string(),
+            UsageOrgLabel {
+                label: "work@example.com".to_string(),
+                email: Some("work@example.com".to_string()),
+                account_names: vec!["Work".to_string()],
+                removed: false,
+            },
+        );
+        let report = build_report(
+            &base.join("usage.json"),
+            &base.join("prices.json"),
+            &[base.join("default")],
+            &[],
+            0,
+            &org_labels,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        let known = claude
+            .accounts
+            .iter()
+            .find(|a| a.org_uuid == "da624f70-known")
+            .unwrap();
+        assert_eq!(known.label, "work@example.com");
+        assert_eq!(known.account_names, vec!["Work".to_string()]);
+        assert!(!known.removed);
+
+        // An org with no label record is flagged removed and gets a short-uuid label.
+        let unknown = claude
+            .accounts
+            .iter()
+            .find(|a| a.org_uuid == "deadbeef-gone")
+            .unwrap();
+        assert_eq!(unknown.label, "Org deadbeef");
+        assert!(unknown.removed);
+        assert!(unknown.account_names.is_empty());
+    }
+
+    #[test]
+    fn account_projects_split_usage_by_working_directory() {
+        let base = std::env::temp_dir().join(format!("aisw_acct_proj_{}", std::process::id()));
+        let project_a = base.join("work/proj-a");
+        let project_b = base.join("work/proj-b");
+        let claude_projects = base.join("default/projects");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+        std::fs::create_dir_all(&claude_projects).unwrap();
+        let path_a = std::fs::canonicalize(&project_a)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let path_b = std::fs::canonicalize(&project_b)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let marker = r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-aaa"},"timestamp":"2026-09-28T10:00:00.000Z"}"#;
+        let usage = |id: &str, input: u64, output: u64| {
+            format!(
+                r#"{{"message":{{"model":"claude-x","id":"{id}","role":"assistant","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}},"timestamp":"2026-09-28T10:01:00.000Z"}}"#
+            )
+        };
+        // One org ran sessions in two different working directories.
+        std::fs::write(
+            claude_projects.join("sess-a.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                format!(r#"{{"type":"user","cwd":"{path_a}"}}"#),
+                marker,
+                usage("a1", 10, 5)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            claude_projects.join("sess-b.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                format!(r#"{{"type":"user","cwd":"{path_b}"}}"#),
+                marker,
+                usage("b1", 20, 7)
+            ),
+        )
+        .unwrap();
+
+        let report = build_report(
+            &base.join("usage.json"),
+            &base.join("prices.json"),
+            &[base.join("default")],
+            &[],
+            0,
+            &BTreeMap::new(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude.accounts.len(), 1);
+        let projects = &claude.accounts[0].projects;
+        assert_eq!(projects.len(), 2);
+        // Most tokens first (costs all tie at None without a price table).
+        assert_eq!(projects[0].path, path_b);
+        assert_eq!(projects[0].tokens.total(), 27);
+        assert_eq!(projects[0].session_count, 1);
+        assert_eq!(projects[0].sessions.len(), 1);
+        assert_eq!(projects[1].path, path_a);
+        assert_eq!(projects[1].tokens.total(), 15);
+        assert_eq!(projects[1].session_count, 1);
+    }
+
+    #[test]
+    fn account_projects_in_a_shared_project_stay_per_org() {
+        let base =
+            std::env::temp_dir().join(format!("aisw_acct_shared_{}", std::process::id()));
+        let project = base.join("work/shared");
+        let claude_projects = base.join("default/projects");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&claude_projects).unwrap();
+        let path = std::fs::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let cwd = format!(r#"{{"type":"user","cwd":"{path}"}}"#);
+        let marker = |org: &str| {
+            format!(
+                r#"{{"type":"attachment","attachment":{{"type":"credential_org","organizationUuid":"{org}"}},"timestamp":"2026-09-28T10:00:00.000Z"}}"#
+            )
+        };
+        let usage = |id: &str, input: u64| {
+            format!(
+                r#"{{"message":{{"model":"claude-x","id":"{id}","role":"assistant","usage":{{"input_tokens":{input},"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}},"timestamp":"2026-09-28T10:01:00.000Z"}}"#
+            )
+        };
+        // Two orgs ran sessions in the SAME working directory.
+        std::fs::write(
+            claude_projects.join("sess-aaa.jsonl"),
+            format!("{}\n{}\n{}\n", cwd, marker("org-aaa"), usage("a1", 15)),
+        )
+        .unwrap();
+        std::fs::write(
+            claude_projects.join("sess-bbb.jsonl"),
+            format!("{}\n{}\n{}\n", cwd, marker("org-bbb"), usage("b1", 30)),
+        )
+        .unwrap();
+
+        let report = build_report(
+            &base.join("usage.json"),
+            &base.join("prices.json"),
+            &[base.join("default")],
+            &[],
+            0,
+            &BTreeMap::new(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        assert_eq!(claude.accounts.len(), 2);
+        // Each account's project row holds only its own tokens/sessions.
+        let aaa = claude
+            .accounts
+            .iter()
+            .find(|a| a.org_uuid == "org-aaa")
+            .unwrap();
+        assert_eq!(aaa.projects.len(), 1);
+        assert_eq!(aaa.projects[0].path, path);
+        assert_eq!(aaa.projects[0].tokens.total(), 15);
+        assert_eq!(aaa.projects[0].session_count, 1);
+        let bbb = claude
+            .accounts
+            .iter()
+            .find(|a| a.org_uuid == "org-bbb")
+            .unwrap();
+        assert_eq!(bbb.projects.len(), 1);
+        assert_eq!(bbb.projects[0].path, path);
+        assert_eq!(bbb.projects[0].tokens.total(), 30);
+        assert_eq!(bbb.projects[0].session_count, 1);
+    }
+
+    #[test]
+    fn email_keyed_usage_folds_into_the_orgs_projects() {
+        let base =
+            std::env::temp_dir().join(format!("aisw_acct_email_{}", std::process::id()));
+        let project = base.join("work/proj");
+        let claude_projects = base.join("default/projects");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&claude_projects).unwrap();
+        let path = std::fs::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let cwd = format!(r#"{{"type":"user","cwd":"{path}"}}"#);
+        let usage = |id: &str, input: u64| {
+            format!(
+                r#"{{"message":{{"model":"claude-x","id":"{id}","role":"assistant","usage":{{"input_tokens":{input},"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}},"timestamp":"2026-09-28T10:01:00.000Z"}}"#
+            )
+        };
+        // A pre-marker session (identity only via session_context email) and a marked session
+        // for the org that email resolves to — same working directory.
+        std::fs::write(
+            claude_projects.join("old.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                cwd,
+                r#"{"type":"attachment","attachment":{"type":"session_context","context":{"userEmail":"The user's email address is work@example.com. Use it only to identify the user."}},"timestamp":"2026-09-10T10:00:00.000Z"}"#,
+                usage("o1", 10)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            claude_projects.join("new.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                cwd,
+                r#"{"type":"attachment","attachment":{"type":"credential_org","organizationUuid":"org-work"},"timestamp":"2026-09-28T10:00:00.000Z"}"#,
+                usage("n1", 5)
+            ),
+        )
+        .unwrap();
+
+        let mut org_labels: BTreeMap<String, UsageOrgLabel> = BTreeMap::new();
+        org_labels.insert(
+            "org-work".to_string(),
+            UsageOrgLabel {
+                label: "work@example.com".to_string(),
+                email: Some("work@example.com".to_string()),
+                account_names: vec!["Work".to_string()],
+                removed: false,
+            },
+        );
+        let report = build_report(
+            &base.join("usage.json"),
+            &base.join("prices.json"),
+            &[base.join("default")],
+            &[],
+            0,
+            &org_labels,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        let claude = report.tools.iter().find(|t| t.tool_id == ToolId::Claude).unwrap();
+        // The email-only usage folded into the org — no separate "email:" account row.
+        assert_eq!(claude.accounts.len(), 1);
+        let work = &claude.accounts[0];
+        assert_eq!(work.org_uuid, "org-work");
+        assert_eq!(work.projects.len(), 1);
+        assert_eq!(work.projects[0].path, path);
+        assert_eq!(work.projects[0].tokens.total(), 15);
+        assert_eq!(work.projects[0].session_count, 2);
     }
 }

@@ -2361,6 +2361,326 @@ div.quotaError .linkBtn {
   }
 }
 
+/* Per-account usage rows (Accounts view) */
+.usageAccountsHead {
+  align-items: flex-end;
+  color: var(--text-3);
+  display: flex;
+  font-size: 11.5px;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.usageAccountsHead > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+.usageAccountsHead strong {
+  color: var(--text);
+  font-size: 13px;
+}
+.usageAccountToolbar {
+  display: flex;
+  gap: 4px;
+}
+.usageAccountToolbar button {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  min-height: 26px;
+  padding: 0 8px;
+}
+.usageAccountToolbar button:hover {
+  color: var(--accent);
+}
+.usageAccountList {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.usageAccountRow {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  display: grid;
+  padding: 10px 12px;
+  transition: border-color 0.12s ease;
+}
+.usageAccountMain {
+  align-items: flex-start;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+}
+.usageAccountRow:hover {
+  border-color: var(--line-strong);
+}
+.usageAccountRow.selected {
+  background:
+    linear-gradient(135deg, rgba(251, 106, 26, 0.05), transparent 55%),
+    var(--surface-2);
+  border-color: var(--accent);
+}
+.usageAccountRow input[type="checkbox"] {
+  accent-color: var(--accent);
+  flex: none;
+  margin: 3px 0 0;
+}
+.usageAccountInfo {
+  display: grid;
+  flex: 1;
+  gap: 3px;
+  min-width: 0;
+}
+.usageAccountTitle {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+.usageAccountTitle strong {
+  font-size: 13.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usageAccountNames {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+.usageAccountSplit {
+  color: var(--text-3);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 11px;
+  gap: 4px 12px;
+  margin-top: 2px;
+}
+.usageAccountSplit strong {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.usageAccountRow.unknown {
+  border-style: dashed;
+}
+.usageAccountNums {
+  display: grid;
+  flex: none;
+  gap: 2px;
+  justify-items: end;
+  text-align: right;
+}
+.usageAccountNums strong {
+  color: var(--accent);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+.usageAccountNums span {
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+/* Per-account expandable project list */
+.usageAccountExpand {
+  justify-content: flex-start;
+  margin: 4px 0 -4px 24px;
+  min-height: 24px;
+  width: auto;
+}
+.usageAccountProjects {
+  border-top: 1px solid var(--line);
+  display: grid;
+  list-style: none;
+  margin: 8px 0 -2px;
+  padding: 7px 0 0 24px;
+}
+.usageAccountProjects li {
+  align-items: baseline;
+  display: flex;
+  font-size: 11.5px;
+  gap: 10px;
+  padding: 2px 0;
+}
+.usageAccountProjectName {
+  color: var(--text-2);
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usageAccountProjectStats {
+  color: var(--text-3);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+.usageAccountProjectsMore {
+  color: var(--text-3);
+}
+
+/* Project filter above the account list — checkbox dropdown so it scales to many projects. */
+.projectFilter {
+  display: inline-block;
+  margin-bottom: 12px;
+  position: relative;
+}
+.projectFilterBtn {
+  box-shadow: none;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+  min-height: 28px;
+  padding: 0 10px;
+}
+.projectFilterBtn svg {
+  height: 13px;
+  width: 13px;
+}
+.projectFilterBtn svg:last-child {
+  transition: transform 0.15s ease;
+}
+.projectFilterBtn.open svg:last-child {
+  transform: rotate(180deg);
+}
+.projectFilterBtn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.projectFilterMenu {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-pop);
+  display: grid;
+  gap: 6px;
+  left: 0;
+  max-width: min(340px, calc(100vw - 48px));
+  min-width: 250px;
+  padding: 8px;
+  position: absolute;
+  top: calc(100% + 6px);
+  width: max-content;
+  z-index: 40;
+}
+.projectFilterHead {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+.projectFilterHead input {
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--edge);
+  color: var(--text);
+  flex: 1;
+  font-size: 12px;
+  min-height: 30px;
+  min-width: 0;
+  padding: 0 10px;
+}
+.projectFilterHead input:hover:not(:focus) {
+  border-color: var(--line-strong);
+}
+.projectFilterHead input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+.projectFilterHead input::placeholder {
+  color: var(--text-3);
+}
+.projectFilterHead button {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--text-2);
+  flex: none;
+  font-size: 12px;
+  font-weight: 600;
+  min-height: 26px;
+  padding: 0 8px;
+}
+.projectFilterHead button:hover {
+  color: var(--accent);
+}
+.projectFilterAll {
+  font-weight: 600;
+}
+.projectFilterList {
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 1px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding-top: 5px;
+}
+.projectFilterOption {
+  align-items: center;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  font-size: 12px;
+  gap: 8px;
+  padding: 5px 6px;
+}
+.projectFilterOption:hover {
+  background: var(--surface-2);
+}
+.projectFilterOption input[type="checkbox"] {
+  accent-color: var(--accent);
+  flex: none;
+  margin: 0;
+}
+.projectFilterName {
+  color: var(--text-2);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.projectFilterOption input:checked ~ .projectFilterName {
+  color: var(--text);
+}
+.projectFilterTokens {
+  color: var(--text-3);
+  flex: none;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.projectFilterEmpty {
+  color: var(--text-3);
+  font-size: 12px;
+  padding: 6px;
+}
+
+@media (max-width: 620px) {
+  .usageAccountMain {
+    flex-wrap: wrap;
+  }
+  .usageAccountExpand {
+    margin-left: 0;
+  }
+  .usageAccountProjects {
+    padding-left: 0;
+  }
+  .usageAccountNums {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin-left: 24px;
+    text-align: left;
+    width: 100%;
+  }
+  .usageAccountNums strong {
+    font-size: 13.5px;
+  }
+}
+
 /* Account waiting for login */
 .pendingLogin {
   display: flex;

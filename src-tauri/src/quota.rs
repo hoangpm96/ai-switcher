@@ -442,6 +442,64 @@ pub(crate) fn claude_oauth_token_fresh(config_dir: &Path) -> Option<String> {
     claude_oauth_token(config_dir)
 }
 
+/// Which subscription login a config dir belongs to: the organization uuid (the same
+/// `organizationUuid` Claude Code writes into session JSONL `credential_org` markers), the org's
+/// display name, and the account email. Filled from `GET /api/oauth/profile`.
+#[derive(Clone, Debug)]
+pub(crate) struct ClaudeProfileIdentity {
+    pub org_uuid: String,
+    pub org_name: Option<String>,
+    pub email: Option<String>,
+}
+
+/// Fetch the profile identity behind `config_dir` — same endpoint family and headers as the quota
+/// read, so the rate limits and the User-Agent requirement behave the same. Uses the stored token
+/// as-is via `claude_oauth_token`: it NEVER refreshes (a refresh would rotate the one-time-use
+/// refresh token under a live `claude` session — see `claude_oauth_token_fresh`), so an expired
+/// token simply fails here and the caller retries after the CLI renews it.
+pub(crate) fn read_claude_profile(config_dir: &Path) -> Result<ClaudeProfileIdentity> {
+    let token = claude_oauth_token(config_dir).context("couldn't get Claude's OAuth token")?;
+    let version = claude_version().unwrap_or_else(|| "0.0.0".to_string());
+    let user_agent = format!("claude-code/{version}");
+    let body = curl_get(
+        "https://api.anthropic.com/api/oauth/profile",
+        &[
+            ("Authorization", format!("Bearer {token}").as_str()),
+            ("anthropic-beta", "oauth-2025-04-20"),
+            ("User-Agent", user_agent.as_str()),
+            ("Accept", "application/json"),
+        ],
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("Claude profile response is not JSON")?;
+    claude_profile_from_value(&value).context("Claude profile has no organization uuid")
+}
+
+/// Parse the identity out of a `/api/oauth/profile` body. Live shape (verified):
+/// `{"account":{"uuid","email","display_name","full_name",...},
+///   "organization":{"uuid","name","organization_type","rate_limit_tier",...}}`.
+/// Only `organization.uuid` is required — it keys the org registry; the rest is cosmetic.
+fn claude_profile_from_value(value: &serde_json::Value) -> Option<ClaudeProfileIdentity> {
+    let org = value.get("organization")?;
+    let org_uuid = org
+        .get("uuid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|uuid| !uuid.is_empty())?
+        .to_string();
+    Some(ClaudeProfileIdentity {
+        org_uuid,
+        org_name: org
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        email: value
+            .get("account")
+            .and_then(|account| account.get("email"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+    })
+}
+
 /// Offline classification of an account's stored Claude credential. The app NEVER refreshes or
 /// rotates a Claude token itself — Anthropic's refresh grant rotates the one-time-use refresh token,
 /// and any app-side rotation invalidates the chain a live/overnight `claude` session still holds,
@@ -2158,5 +2216,34 @@ mod tests {
 
         assert_eq!(codex_account_id(&dir).as_deref(), Some("acct_123"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_profile_reads_org_uuid_name_and_email() {
+        let body = r#"{"account":{"uuid":"acct-1","email":"me@example.com","display_name":"Me","full_name":"Me Example"},"organization":{"uuid":"da624f70-0000","name":"My Org","organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}"#;
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        let identity = claude_profile_from_value(&value).expect("profile parses");
+        assert_eq!(identity.org_uuid, "da624f70-0000");
+        assert_eq!(identity.org_name.as_deref(), Some("My Org"));
+        assert_eq!(identity.email.as_deref(), Some("me@example.com"));
+    }
+
+    #[test]
+    fn claude_profile_without_org_uuid_is_unusable() {
+        // No organization object at all → nothing to key the registry on.
+        let no_org = serde_json::json!({ "account": { "uuid": "a", "email": "x@y.z" } });
+        assert!(claude_profile_from_value(&no_org).is_none());
+        // An organization without uuid is the same.
+        let no_uuid = serde_json::json!({
+            "account": { "email": "x@y.z" },
+            "organization": { "name": "Org", "organization_type": "claude_pro" }
+        });
+        assert!(claude_profile_from_value(&no_uuid).is_none());
+        // uuid alone is enough — email/org name are optional.
+        let bare = serde_json::json!({ "organization": { "uuid": "org-9" } });
+        let identity = claude_profile_from_value(&bare).expect("uuid alone parses");
+        assert_eq!(identity.org_uuid, "org-9");
+        assert!(identity.email.is_none());
+        assert!(identity.org_name.is_none());
     }
 }

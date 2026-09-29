@@ -279,6 +279,108 @@ const demoUsage: UsageReport = {
         { path: "/Volumes/Data/Git/ai-switcher", tokens: tb(90000, 360000, 3900000, 950000), costUsd: 9.74, sessionCount: 12, lastActive: "2026-06-02", daily: [{ date: "2026-06-01", tokens: tb(82000, 328000, 3490000, 855000), costUsd: 8.62 }, { date: "2026-06-02", tokens: tb(8000, 32000, 410000, 95000), costUsd: 1.12 }], byModel: [{ model: "claude-opus-4-8", tokens: tb(90000, 360000, 3900000, 950000), costUsd: 9.74 }], sessions: [{ id: "7e5d3164", date: "2026-06-02", model: "claude-opus-4-8", tokens: tb(8000, 32000, 410000, 95000), costUsd: 1.12 }] },
         { path: "/Volumes/Data/Git/reqwise", tokens: tb(30000, 120000, 1300000, 350000), costUsd: 3.1, sessionCount: 4, lastActive: "2026-06-01", daily: [{ date: "2026-06-01", tokens: tb(30000, 120000, 1300000, 350000), costUsd: 3.1 }], byModel: [{ model: "claude-sonnet-4-5", tokens: tb(30000, 120000, 1300000, 350000), costUsd: 3.1 }], sessions: [] },
       ],
+      accounts: [
+        {
+          orgUuid: "da624f70-8b1e-4c3a-9f2d-1e2a3b4c5d6e",
+          label: "hoang@work.dev",
+          accountNames: ["Work"],
+          removed: false,
+          tokens: tb(70000, 290000, 3200000, 780000),
+          costUsd: 7.9,
+          sessionCount: 9,
+          lastActive: "2026-06-02",
+          daily: [
+            { date: "2026-05-30", tokens: tb(20000, 80000, 900000, 220000), costUsd: 2.2 },
+            { date: "2026-05-31", tokens: tb(18000, 72000, 800000, 210000), costUsd: 2.0 },
+            { date: "2026-06-01", tokens: tb(16000, 78000, 700000, 200000), costUsd: 1.9 },
+            { date: "2026-06-02", tokens: tb(16000, 60000, 800000, 150000), costUsd: 1.8 },
+          ],
+          byModel: [
+            { model: "claude-opus-4-8", tokens: tb(70000, 290000, 3200000, 780000), costUsd: 7.9 },
+          ],
+          sessions: [
+            { id: "7e5d3164", date: "2026-06-02", model: "claude-opus-4-8", tokens: tb(8000, 32000, 410000, 95000), costUsd: 1.12 },
+            { id: "b2c9f011", date: "2026-06-01", model: "claude-opus-4-8", tokens: tb(16000, 78000, 700000, 200000), costUsd: 1.9 },
+          ],
+          projects: [
+            { path: "/Volumes/Data/Git/ai-switcher", tokens: tb(40000, 170000, 1900000, 470000), costUsd: 4.6, sessionCount: 6, lastActive: "2026-06-02", daily: [{ date: "2026-06-01", tokens: tb(24000, 110000, 1100000, 320000), costUsd: 3.0 }, { date: "2026-06-02", tokens: tb(16000, 60000, 800000, 150000), costUsd: 1.6 }], byModel: [{ model: "claude-opus-4-8", tokens: tb(40000, 170000, 1900000, 470000), costUsd: 4.6 }], sessions: [{ id: "7e5d3164", date: "2026-06-02", model: "claude-opus-4-8", tokens: tb(8000, 32000, 410000, 95000), costUsd: 1.12 }] },
+            { path: "/Volumes/Data/Git/reqwise", tokens: tb(30000, 120000, 1300000, 310000), costUsd: 3.3, sessionCount: 3, lastActive: "2026-06-01", daily: [{ date: "2026-05-30", tokens: tb(14000, 42000, 600000, 110000), costUsd: 1.5 }, { date: "2026-05-31", tokens: tb(8000, 36000, 300000, 90000), costUsd: 0.9 }, { date: "2026-06-01", tokens: tb(8000, 42000, 400000, 110000), costUsd: 0.9 }], byModel: [{ model: "claude-opus-4-8", tokens: tb(30000, 120000, 1300000, 310000), costUsd: 3.3 }], sessions: [{ id: "b2c9f011", date: "2026-06-01", model: "claude-opus-4-8", tokens: tb(16000, 78000, 700000, 200000), costUsd: 1.9 }] },
+          ],
+        },
+        {
+          orgUuid: "3f8a1c55-2d7b-4e90-a6c1-9d8e7f6a5b4c",
+          label: "hoangphan.personal@gmail.com",
+          accountNames: ["Machine default"],
+          removed: false,
+          tokens: tb(30000, 130000, 1500000, 380000),
+          costUsd: 3.6,
+          sessionCount: 4,
+          lastActive: "2026-06-01",
+          daily: [
+            { date: "2026-05-29", tokens: tb(10000, 40000, 500000, 110000), costUsd: 1.1 },
+            { date: "2026-05-30", tokens: tb(8000, 30000, 300000, 80000), costUsd: 0.8 },
+            { date: "2026-06-01", tokens: tb(12000, 60000, 700000, 190000), costUsd: 1.7 },
+          ],
+          byModel: [
+            { model: "claude-sonnet-4-5", tokens: tb(30000, 130000, 1500000, 380000), costUsd: 3.6 },
+          ],
+          sessions: [
+            { id: "a1b2c3d4", date: "2026-06-01", model: "claude-sonnet-4-5", tokens: tb(12000, 40000, 380000, 120000), costUsd: 0.95 },
+          ],
+          projects: [
+            { path: "/Volumes/Data/Git/ai-switcher", tokens: tb(18000, 72000, 820000, 195000), costUsd: 1.9, sessionCount: 2, lastActive: "2026-06-01", daily: [{ date: "2026-05-30", tokens: tb(6000, 32000, 320000, 85000), costUsd: 0.9 }, { date: "2026-06-01", tokens: tb(12000, 40000, 500000, 110000), costUsd: 1.0 }], byModel: [{ model: "claude-sonnet-4-5", tokens: tb(18000, 72000, 820000, 195000), costUsd: 1.9 }], sessions: [{ id: "a1b2c3d4", date: "2026-06-01", model: "claude-sonnet-4-5", tokens: tb(12000, 40000, 380000, 120000), costUsd: 0.95 }] },
+            { path: "/Users/demo/Git/homelab", tokens: tb(12000, 58000, 680000, 185000), costUsd: 1.7, sessionCount: 2, lastActive: "2026-05-29", daily: [{ date: "2026-05-29", tokens: tb(10000, 40000, 500000, 110000), costUsd: 1.1 }, { date: "2026-05-31", tokens: tb(2000, 18000, 180000, 75000), costUsd: 0.6 }], byModel: [{ model: "claude-sonnet-4-5", tokens: tb(12000, 58000, 680000, 185000), costUsd: 1.7 }], sessions: [] },
+          ],
+        },
+        {
+          orgUuid: "9c01f3ab-6e42-4b8d-b7a5-3c2d1e0f9a8b",
+          label: "client@agency.io",
+          accountNames: ["Client"],
+          removed: true,
+          tokens: tb(15000, 45000, 400000, 110000),
+          costUsd: 1.0,
+          sessionCount: 2,
+          lastActive: "2026-05-28",
+          daily: [
+            { date: "2026-05-28", tokens: tb(15000, 45000, 400000, 110000), costUsd: 1.0 },
+          ],
+          byModel: [
+            { model: "claude-opus-4-8", tokens: tb(15000, 45000, 400000, 110000), costUsd: 1.0 },
+          ],
+          sessions: [
+            { id: "c4d5e6f7", date: "2026-05-28", model: "claude-opus-4-8", tokens: tb(11000, 33000, 290000, 80000), costUsd: 0.74 },
+            { id: "d8e9f0a1", date: "2026-05-28", model: "claude-opus-4-8", tokens: tb(4000, 12000, 110000, 30000), costUsd: 0.26 },
+          ],
+          projects: [
+            { path: "/Volumes/Data/Git/client-portal", tokens: tb(11000, 33000, 290000, 80000), costUsd: 0.74, sessionCount: 1, lastActive: "2026-05-28", daily: [{ date: "2026-05-28", tokens: tb(11000, 33000, 290000, 80000), costUsd: 0.74 }], byModel: [{ model: "claude-opus-4-8", tokens: tb(11000, 33000, 290000, 80000), costUsd: 0.74 }], sessions: [{ id: "c4d5e6f7", date: "2026-05-28", model: "claude-opus-4-8", tokens: tb(11000, 33000, 290000, 80000), costUsd: 0.74 }] },
+            { path: "/Volumes/Data/Git/agency-site", tokens: tb(4000, 12000, 110000, 30000), costUsd: 0.26, sessionCount: 1, lastActive: "2026-05-28", daily: [{ date: "2026-05-28", tokens: tb(4000, 12000, 110000, 30000), costUsd: 0.26 }], byModel: [{ model: "claude-opus-4-8", tokens: tb(4000, 12000, 110000, 30000), costUsd: 0.26 }], sessions: [{ id: "d8e9f0a1", date: "2026-05-28", model: "claude-opus-4-8", tokens: tb(4000, 12000, 110000, 30000), costUsd: 0.26 }] },
+          ],
+        },
+        {
+          orgUuid: "",
+          label: "Unattributed",
+          accountNames: [],
+          removed: false,
+          tokens: tb(5000, 15000, 100000, 30000),
+          costUsd: 0.34,
+          sessionCount: 3,
+          lastActive: "2026-05-29",
+          daily: [
+            { date: "2026-05-28", tokens: tb(3000, 9000, 60000, 18000), costUsd: 0.2 },
+            { date: "2026-05-29", tokens: tb(2000, 6000, 40000, 12000), costUsd: 0.14 },
+          ],
+          byModel: [
+            { model: "claude-sonnet-4-5", tokens: tb(5000, 15000, 100000, 30000), costUsd: 0.34 },
+          ],
+          sessions: [
+            { id: "9f8e7d6c", date: "2026-05-29", model: "claude-sonnet-4-5", tokens: tb(2000, 6000, 40000, 12000), costUsd: 0.14 },
+          ],
+          projects: [
+            { path: "/Users/demo/Git/scratchpad", tokens: tb(3000, 9000, 60000, 18000), costUsd: 0.2, sessionCount: 2, lastActive: "2026-05-28", daily: [{ date: "2026-05-28", tokens: tb(3000, 9000, 60000, 18000), costUsd: 0.2 }], byModel: [{ model: "claude-sonnet-4-5", tokens: tb(3000, 9000, 60000, 18000), costUsd: 0.2 }], sessions: [] },
+            { path: "/Volumes/Data/Git/reqwise", tokens: tb(2000, 6000, 40000, 12000), costUsd: 0.14, sessionCount: 1, lastActive: "2026-05-29", daily: [{ date: "2026-05-29", tokens: tb(2000, 6000, 40000, 12000), costUsd: 0.14 }], byModel: [{ model: "claude-sonnet-4-5", tokens: tb(2000, 6000, 40000, 12000), costUsd: 0.14 }], sessions: [{ id: "9f8e7d6c", date: "2026-05-29", model: "claude-sonnet-4-5", tokens: tb(2000, 6000, 40000, 12000), costUsd: 0.14 }] },
+          ],
+        },
+      ],
     },
     {
       toolId: "codex",
@@ -307,6 +409,7 @@ const demoUsage: UsageReport = {
         { path: "/Volumes/Data/Git/ai-switcher", tokens: tb(650000, 180000, 2300000, 0), costUsd: 4.9, sessionCount: 8, lastActive: "2026-06-02", daily: [{ date: "2026-06-02", tokens: tb(650000, 180000, 2300000, 0), costUsd: 4.9 }], byModel: [{ model: "gpt-5.5", tokens: tb(650000, 180000, 2300000, 0), costUsd: 4.9 }], sessions: [{ id: "019e887b", date: "2026-06-02", model: "gpt-5.5", tokens: tb(60000, 18000, 210000, 0), costUsd: 0.51 }] },
         { path: "/Volumes/Data/Git/reqwise", tokens: tb(250000, 60000, 800000, 0), costUsd: 1.52, sessionCount: 3, lastActive: "2026-06-01", daily: [{ date: "2026-06-01", tokens: tb(250000, 60000, 800000, 0), costUsd: 1.52 }], byModel: [{ model: "gpt-5", tokens: tb(250000, 60000, 800000, 0), costUsd: 1.52 }], sessions: [] },
       ],
+      accounts: [],
     },
   ],
 };

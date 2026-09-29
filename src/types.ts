@@ -459,6 +459,28 @@ export interface ToolUsage {
   /** Models with tokens but no price in the LiteLLM cache. Non-empty = every cost above is a
    *  LOWER BOUND, so the UI must not present it as the full amount. */
   unpricedModels: string[];
+  /** Claude only: usage split per Claude organization (subscription login), incl. removed
+   *  accounts and one `orgUuid === ""` row for usage that can't be attributed. [] for other tools. */
+  accounts: AccountUsage[];
+}
+
+export interface AccountUsage {
+  /** "" = usage logged before the CLI recorded which account ran it. */
+  orgUuid: string;
+  /** Account email when known, else org name, else short uuid. */
+  label: string;
+  accountNames: string[];
+  /** No account currently in the app maps to this org. */
+  removed: boolean;
+  tokens: TokenBreakdown;
+  costUsd: number | null;
+  sessionCount: number;
+  lastActive: string;
+  daily: DayUsage[];
+  byModel: ModelUsage[];
+  sessions: SessionUsage[];
+  /** This account's usage per working directory (same shape as ToolUsage.projects). */
+  projects: ProjectUsage[];
 }
 
 export interface UsageReport {
