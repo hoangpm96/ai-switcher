@@ -5,6 +5,17 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] - 2026-10-04
+
+### Fixed
+
+- **Claude quota no longer disappears when Anthropic rate-limits the usage read.** On an HTTP 429
+  the app now waits out the `Retry-After` the server sends instead of asking again every refresh
+  (which only kept the account blocked longer). The card says it is rate-limited and when it will
+  try again, notes this usually comes from many `claude` sessions running on the same account, and
+  keeps showing the last quota numbers, marked as stale, instead of blanking them. The overlay does
+  the same.
+
 ## [0.11.0] - 2026-09-30
 
 ### Added
