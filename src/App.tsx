@@ -2655,6 +2655,31 @@ function Quota({
   refreshingToken?: boolean;
 }) {
   if (!quota) return <p className="quotaError">No quota data yet</p>;
+  // Rate limited (HTTP 429): the backend kept the last good numbers — show them, marked stale,
+  // with when the app will try again, instead of only the error.
+  const staleNumbers =
+    quota.rateLimitedUntil &&
+    (quota.fiveHour.percentUsed != null || quota.weekly.percentUsed != null);
+  if (quota.error && staleNumbers) {
+    return (
+      <div className="quotaBox">
+        <QuotaBar
+          label={quota.fiveHour.label || "5-hour limit"}
+          percent={quota.fiveHour.percentUsed}
+          resetAt={quota.fiveHour.resetAt}
+        />
+        <QuotaBar
+          label={quota.weekly.label || "Weekly limit"}
+          percent={quota.weekly.percentUsed}
+          resetAt={quota.weekly.resetAt}
+        />
+        <p className="quotaStale">
+          {quota.error}
+          {quota.updatedAt && ` · số liệu lúc ${formatReset(quota.updatedAt)}`}
+        </p>
+      </div>
+    );
+  }
   if (quota.error) {
     // A 401/403 quota read means the stored OAuth token expired. For Claude subscription accounts
     // offer a re-check: safe to click any time — it never spawns the CLI to auto-refresh anymore

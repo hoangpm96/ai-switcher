@@ -280,7 +280,24 @@ function OverlayRow({ row, compact }: { row: Row; compact: boolean }) {
         {quota?.plan && <span className="ovPlan">{quota.plan}</span>}
       </div>
 
-      {quota?.error ? (
+      {quota?.error && quota.rateLimitedUntil && windows.some((w) => w.percentUsed != null) ? (
+        // Rate limited: keep the last good bars (dimmed) and say so in one line.
+        <>
+          <div className="ovStale">
+            {windows.map((window, index) => (
+              <OverlayBar
+                key={`${window.label}-${index}`}
+                label={shortWindowLabel(window.label)}
+                percent={window.percentUsed}
+                resetAt={window.resetAt}
+              />
+            ))}
+          </div>
+          <p className="ovWarn" title={quota.error}>
+            {quota.error}
+          </p>
+        </>
+      ) : quota?.error ? (
         <p className="ovErr" title={quota.error}>
           {quota.error}
         </p>

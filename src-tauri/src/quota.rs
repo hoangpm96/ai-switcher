@@ -66,7 +66,15 @@ pub fn read_quota(tool_id: &ToolId, config_dir: &Path) -> QuotaInfo {
     let mut quota = result.unwrap_or_else(|e| match tool_id {
         // Antigravity only exposes quota while the IDE is open (language server runs locally).
         ToolId::Antigravity => QuotaInfo::with_message("Open Antigravity IDE to read quota"),
-        _ => QuotaInfo::with_message(format!("Couldn't read quota: {e:#}")),
+        _ => match e.downcast_ref::<ClaudeRateLimited>() {
+            // Already a complete, user-facing sentence — no "Couldn't read quota:" prefix.
+            Some(limited) => {
+                let mut quota = QuotaInfo::with_message(limited.to_string());
+                quota.rate_limited_until = Some(limited.until.to_rfc3339());
+                quota
+            }
+            None => QuotaInfo::with_message(format!("Couldn't read quota: {e:#}")),
+        },
     });
     // A Claude plan label comes from the stored credential, not the usage response, so it stays
     // available even when that request failed (stale token) — the row reads "Pro · couldn't read
@@ -225,6 +233,66 @@ fn parse_rfc3339_epoch(reset_at: &str) -> Option<i64> {
 static CLAUDE_CACHE: Mutex<BTreeMap<String, (Instant, QuotaInfo)>> = Mutex::new(BTreeMap::new());
 const CLAUDE_CACHE_TTL: Duration = Duration::from_secs(60);
 
+// A 429 from the usage endpoint comes with a long Retry-After (observed ~1h). Every claude CLI
+// session on the same account polls this endpoint too, so many parallel sessions can exhaust it on
+// their own. Calling again before Retry-After only extends the block — so, per config dir, skip the
+// request until then and report the rate limit instead.
+static CLAUDE_BACKOFF: Mutex<BTreeMap<String, (Instant, chrono::DateTime<chrono::Utc>)>> =
+    Mutex::new(BTreeMap::new());
+/// Used when a 429 carries no (numeric) Retry-After.
+const CLAUDE_DEFAULT_BACKOFF_SECS: u64 = 300;
+const CLAUDE_MAX_BACKOFF_SECS: u64 = 2 * 60 * 60;
+
+/// Error returned while a config dir is backing off after a 429. Its text contains "429" so
+/// `classify_live_quota_error` still maps it to `RateLimited`.
+#[derive(Debug)]
+pub(crate) struct ClaudeRateLimited {
+    pub until: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Display for ClaudeRateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let local = self.until.with_timezone(&chrono::Local);
+        write!(
+            f,
+            "Anthropic giới hạn tần suất đọc quota (HTTP 429), thử lại lúc {} — thường do nhiều phiên claude cùng chạy trên account này",
+            local.format("%H:%M")
+        )
+    }
+}
+
+impl std::error::Error for ClaudeRateLimited {}
+
+/// When this config dir is still backing off after a 429, the time the block lifts.
+fn claude_backoff_until(cache_key: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let mut guard = CLAUDE_BACKOFF.lock().ok()?;
+    match guard.get(cache_key) {
+        Some((until, at)) if Instant::now() < *until => Some(*at),
+        Some(_) => {
+            guard.remove(cache_key);
+            None
+        }
+        None => None,
+    }
+}
+
+fn start_claude_backoff(
+    cache_key: &str,
+    retry_after_secs: Option<u64>,
+) -> chrono::DateTime<chrono::Utc> {
+    let secs = retry_after_secs
+        .unwrap_or(CLAUDE_DEFAULT_BACKOFF_SECS)
+        .clamp(60, CLAUDE_MAX_BACKOFF_SECS);
+    let at = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
+    if let Ok(mut guard) = CLAUDE_BACKOFF.lock() {
+        guard.insert(
+            cache_key.to_string(),
+            (Instant::now() + Duration::from_secs(secs), at),
+        );
+    }
+    at
+}
+
 /// Drop the cached Claude quota for one config dir so the next `read_quota` re-fetches.
 /// Auto-prime's confirmation re-check needs the fresh `resets_at` right after sending "hi",
 /// which the 60s cache would otherwise mask.
@@ -246,6 +314,10 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
 
     // One credential read serves both the request (accessToken) and the plan label
     // (subscriptionType / rateLimitTier) — a second read would hit the keychain again.
+    if let Some(until) = claude_backoff_until(&cache_key) {
+        return Err(ClaudeRateLimited { until }.into());
+    }
+
     let credentials = claude_credentials_value(config_dir);
     let token = credentials
         .as_ref()
@@ -268,7 +340,18 @@ fn read_claude_quota(config_dir: &Path) -> Result<QuotaInfo> {
     // ourselves — rotating the one-time-use refresh token would invalidate a live `claude` session on
     // this account (see `claude_oauth_token_fresh`). Surface the error so the UI shows an "open Claude
     // Code to refresh" hint; the token gets renewed, conflict-free, the next time the CLI runs.
-    let body = request(&token)?;
+    let body = match request(&token) {
+        Ok(body) => body,
+        Err(error) => {
+            if let Some(http) = error.downcast_ref::<HttpStatusError>() {
+                if http.status == 429 {
+                    let until = start_claude_backoff(&cache_key, http.retry_after_secs);
+                    return Err(ClaudeRateLimited { until }.into());
+                }
+            }
+            return Err(error);
+        }
+    };
 
     let value: serde_json::Value =
         serde_json::from_str(&body).context("Claude usage response is not JSON")?;
@@ -300,6 +383,7 @@ fn quota_from_claude_usage(
         rate_limit_reset_credits: None,
         // Overwritten centrally by `read_quota` via `prime_available_for`.
         prime_available: None,
+        rate_limited_until: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -795,27 +879,59 @@ pub(crate) fn curl_get(url: &str, headers: &[(&str, &str)]) -> Result<String> {
         &["silent", "show-error"],
         &[
             ("max-time", "20".to_string()),
-            // append status code as last line
-            ("write-out", "\n%{http_code}".to_string()),
+            // append the Retry-After header and the status code as the last two lines
+            (
+                "write-out",
+                "\n%header{retry-after}\n%{http_code}".to_string(),
+            ),
         ],
     );
     let output = run_curl(config)?;
     let full = String::from_utf8_lossy(&output.stdout);
-    // Split off the status code appended by -w.
-    let (body, status_str) = full
-        .rsplit_once('\n')
-        .context("unexpected curl output format")?;
-    let status: u16 = status_str.trim().parse().unwrap_or(0);
+    let (body, retry_after_secs, status) = split_curl_write_out(&full)?;
 
     if status == 0 {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("network error: {}", stderr.trim());
     }
     if status >= 400 {
-        anyhow::bail!("HTTP {status}");
+        return Err(HttpStatusError {
+            status,
+            retry_after_secs,
+        }
+        .into());
     }
     Ok(body.to_owned())
 }
+
+/// Split `curl_get` stdout into (body, Retry-After seconds, status): its write-out appends
+/// `\n<retry-after>\n<status>`. A Retry-After in HTTP-date form is ignored (only seconds are used).
+fn split_curl_write_out(full: &str) -> Result<(&str, Option<u64>, u16)> {
+    let (rest, status_str) = full
+        .rsplit_once('\n')
+        .context("unexpected curl output format")?;
+    let (body, retry_str) = rest
+        .rsplit_once('\n')
+        .context("unexpected curl output format")?;
+    let status = status_str.trim().parse().unwrap_or(0);
+    Ok((body, retry_str.trim().parse().ok(), status))
+}
+
+/// A non-2xx answer from `curl_get`. Displays as `HTTP <status>` (other code matches on that text);
+/// callers that care about rate limits downcast to read `retry_after_secs`.
+#[derive(Debug)]
+pub(crate) struct HttpStatusError {
+    pub status: u16,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}", self.status)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
 
 pub(crate) fn curl_post(url: &str, headers: &[(&str, &str)], body: &str) -> Result<String> {
     let config = curl_config(
@@ -1024,6 +1140,7 @@ fn quota_from_antigravity_status(value: &serde_json::Value) -> Result<QuotaInfo>
         rate_limit_reset_credits: None,
         // Antigravity can't prime; `prime_available_for` returns None for it anyway.
         prime_available: None,
+        rate_limited_until: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -1256,6 +1373,7 @@ fn cursor_quota_from_value(value: &serde_json::Value) -> QuotaInfo {
             .map(plan_label),
         rate_limit_reset_credits: None,
         prime_available: None,
+        rate_limited_until: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     }
@@ -1327,6 +1445,7 @@ fn opencode_quota_from_value(value: &serde_json::Value) -> QuotaInfo {
         plan: Some("Go".to_string()),
         rate_limit_reset_credits: None,
         prime_available: None,
+        rate_limited_until: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     }
@@ -1460,6 +1579,7 @@ fn quota_from_codex_endpoint(value: &serde_json::Value) -> Result<QuotaInfo> {
         rate_limit_reset_credits: codex_reset_credit_summary(value),
         // Overwritten centrally by `read_quota` via `prime_available_for`.
         prime_available: None,
+        rate_limited_until: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -1686,6 +1806,7 @@ fn quota_from_codex_rate_limits(limits: &serde_json::Value) -> Result<QuotaInfo>
         rate_limit_reset_credits: None,
         // Overwritten centrally by `read_quota` via `prime_available_for`.
         prime_available: None,
+        rate_limited_until: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         error: None,
     })
@@ -1730,6 +1851,32 @@ fn pretty_plan(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curl_write_out_splits_body_retry_after_and_status() {
+        let (body, retry, status) = split_curl_write_out("{\"a\":1}\n3401\n429").unwrap();
+        assert_eq!((body, retry, status), ("{\"a\":1}", Some(3401), 429));
+        // No Retry-After header → empty line; a body with its own newlines stays intact.
+        let (body, retry, status) = split_curl_write_out("line1\nline2\n\n200").unwrap();
+        assert_eq!((body, retry, status), ("line1\nline2", None, 200));
+    }
+
+    #[test]
+    fn claude_rate_limit_backs_off_and_still_classifies_as_rate_limited() {
+        let key = "/tmp/ai-switcher-test-backoff";
+        assert!(claude_backoff_until(key).is_none());
+        let until = start_claude_backoff(key, Some(3401));
+        assert_eq!(claude_backoff_until(key), Some(until));
+        let error: anyhow::Error = ClaudeRateLimited { until }.into();
+        assert_eq!(
+            classify_live_quota_error(&error),
+            LiveQuotaError::RateLimited
+        );
+        // An absurd Retry-After is capped so one bad header can't silence an account for days.
+        let capped = start_claude_backoff(key, Some(10_000_000));
+        assert!(capped <= chrono::Utc::now() + chrono::Duration::seconds(2 * 60 * 60 + 5));
+        CLAUDE_BACKOFF.lock().unwrap().remove(key);
+    }
 
     #[test]
     fn claude_token_validity_uses_offline_expiry_with_skew() {
@@ -1849,6 +1996,7 @@ mod tests {
             plan: None,
             rate_limit_reset_credits: None,
             prime_available: None,
+            rate_limited_until: None,
             updated_at: None,
             error: error.map(str::to_string),
         }

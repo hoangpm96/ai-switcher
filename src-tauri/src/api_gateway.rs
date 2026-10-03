@@ -2760,6 +2760,7 @@ mod tests {
             plan: None,
             rate_limit_reset_credits: None,
             prime_available: None,
+            rate_limited_until: None,
             updated_at: None,
             error: None,
         }

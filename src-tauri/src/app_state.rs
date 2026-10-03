@@ -1087,7 +1087,10 @@ impl ManagedState {
                     .find(|a| a.tool_id == tool_id && a.id == account_id)
                 {
                     let was_exhausted = account.state == AccountState::Exhausted;
-                    account.quota = Some(quota);
+                    account.quota = Some(keep_last_quota_when_rate_limited(
+                        account.quota.as_ref(),
+                        quota,
+                    ));
                     account.updated_at = timestamp.clone();
                     account.state = if is_exhausted(account) {
                         AccountState::Exhausted
@@ -1178,7 +1181,10 @@ impl ManagedState {
                 .find(|a| a.tool_id == *tool_id && a.id == account_id)
             {
                 let was_exhausted = account.state == AccountState::Exhausted;
-                account.quota = Some(quota);
+                account.quota = Some(keep_last_quota_when_rate_limited(
+                    account.quota.as_ref(),
+                    quota,
+                ));
                 account.updated_at = now();
                 account.state = if is_exhausted(account) {
                     AccountState::Exhausted
@@ -3344,6 +3350,44 @@ fn normalized_or_default_name(
     unreachable!()
 }
 
+/// A rate-limited read (HTTP 429) carries no numbers. Keep the previous read's windows, and its
+/// `updated_at` so the UI can tell how old they are, rather than blanking the account for the whole
+/// Retry-After. `error` stays set, so auto-switch/exhaustion/prime logic still treats the numbers as
+/// unknown. A window whose reset has already passed is dropped: its percentage no longer applies.
+fn keep_last_quota_when_rate_limited(
+    previous: Option<&QuotaInfo>,
+    mut next: QuotaInfo,
+) -> QuotaInfo {
+    let Some(previous) = previous else {
+        return next;
+    };
+    let has_numbers =
+        previous.five_hour.percent_used.is_some() || previous.weekly.percent_used.is_some();
+    if next.rate_limited_until.is_none() || !has_numbers {
+        return next;
+    }
+    let now = chrono::Utc::now();
+    let still_valid = |window: &crate::models::QuotaWindow| {
+        let expired = window
+            .reset_at
+            .as_deref()
+            .and_then(|reset| chrono::DateTime::parse_from_rfc3339(reset).ok())
+            .is_some_and(|reset| reset < now);
+        if expired {
+            crate::models::QuotaWindow {
+                label: window.label.clone(),
+                ..Default::default()
+            }
+        } else {
+            window.clone()
+        }
+    };
+    next.five_hour = still_valid(&previous.five_hour);
+    next.weekly = still_valid(&previous.weekly);
+    next.updated_at = previous.updated_at.clone();
+    next
+}
+
 fn is_exhausted(account: &Account) -> bool {
     account.quota.as_ref().is_some_and(|quota| {
         quota.error.is_none()
@@ -3473,6 +3517,41 @@ fn local_time_label_from_iso(iso: &str) -> String {
 mod tests {
     use super::*;
 
+    fn window(percent: Option<f64>, reset_at: Option<String>) -> crate::models::QuotaWindow {
+        crate::models::QuotaWindow {
+            label: "w".to_string(),
+            percent_used: percent,
+            reset_at,
+            is_active: None,
+        }
+    }
+
+    #[test]
+    fn rate_limited_read_keeps_last_numbers_but_drops_expired_windows() {
+        let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let mut previous = QuotaInfo::with_message("x");
+        previous.error = None;
+        previous.five_hour = window(Some(79.0), Some(past));
+        previous.weekly = window(Some(65.0), Some(future.clone()));
+        previous.updated_at = Some("2026-10-03T18:02:00Z".to_string());
+
+        let mut limited = QuotaInfo::with_message("Anthropic giới hạn … (HTTP 429)");
+        limited.rate_limited_until = Some(future);
+        let kept = keep_last_quota_when_rate_limited(Some(&previous), limited);
+        assert_eq!(kept.five_hour.percent_used, None, "5h window already reset");
+        assert_eq!(kept.weekly.percent_used, Some(65.0));
+        assert_eq!(kept.updated_at.as_deref(), Some("2026-10-03T18:02:00Z"));
+        assert!(kept.error.is_some(), "error kept for auto-switch/prime");
+
+        // Any other error replaces the numbers as before.
+        let other = keep_last_quota_when_rate_limited(
+            Some(&previous),
+            QuotaInfo::with_message("Couldn't read quota: HTTP 401"),
+        );
+        assert_eq!(other.weekly.percent_used, None);
+    }
+
     #[test]
     fn local_time_label_shows_local_hhmm_with_offset() {
         // A UTC instant renders as the LOCAL time plus a "(UTC±N)" label — never the raw UTC HH:MM,
@@ -3525,6 +3604,7 @@ mod tests {
                 plan: None,
                 rate_limit_reset_credits: None,
                 prime_available: None,
+                rate_limited_until: None,
                 updated_at: None,
                 error: None,
             }),

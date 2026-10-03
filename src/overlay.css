@@ -182,6 +182,19 @@ html.ovWindow #root {
   letter-spacing: 0.04em;
 }
 
+.ovStale {
+  opacity: 0.55;
+}
+
+.ovWarn {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ov-amber);
+  font-size: 10px;
+}
+
 .ovErr {
   margin: 0;
   overflow: hidden;

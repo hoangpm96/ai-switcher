@@ -372,6 +372,11 @@ pub struct QuotaInfo {
     /// `None` = unknown (read error / quota not loaded) → frontend hides the button.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prime_available: Option<bool>,
+    /// Set when the provider rate-limited the usage read (HTTP 429): the RFC 3339 time the app will
+    /// next try. `error` carries the message; the windows hold the last good numbers (if any), so
+    /// the UI can keep showing them, marked stale, instead of blanking the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limited_until: Option<String>,
     pub updated_at: Option<String>,
     pub error: Option<String>,
 }
@@ -392,6 +397,7 @@ impl QuotaInfo {
             plan: None,
             rate_limit_reset_credits: None,
             prime_available: None,
+            rate_limited_until: None,
             updated_at: Some(chrono::Utc::now().to_rfc3339()),
             error: Some(message.into()),
         }

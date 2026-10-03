@@ -1310,6 +1310,14 @@ div.quotaError > p {
   margin: 0;
 }
 
+/* Rate-limited read: the bars above are the last good numbers; this line says why they're stale. */
+.quotaStale {
+  margin: 2px 0 0;
+  color: var(--amber);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
 div.quotaError .linkBtn {
   display: inline-flex;
   align-items: center;

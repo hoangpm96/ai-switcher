@@ -42,6 +42,11 @@ export interface QuotaInfo {
    * not loaded) → hide the button. Computed by the backend (provider-aware), not the UI.
    */
   primeAvailable?: boolean;
+  /**
+   * Set when the provider rate-limited the usage read (HTTP 429): when the app tries again. `error`
+   * holds the message; the windows keep the last good numbers (if any) and `updatedAt` their age.
+   */
+  rateLimitedUntil?: string | null;
   updatedAt: string | null;
   error: string | null;
 }
