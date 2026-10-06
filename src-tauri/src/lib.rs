@@ -7,6 +7,7 @@ mod prime;
 mod pricing;
 mod quota;
 mod store;
+mod sysload;
 mod tools;
 mod tray;
 mod usage;
@@ -423,6 +424,15 @@ fn get_snapshot(state: State<'_, ManagedState>) -> Result<AppSnapshot, String> {
     state.snapshot().map_err(display_error)
 }
 
+/// CPU / RAM / heaviest app for the overlay footer. Off the main thread: walking every process
+/// takes a few milliseconds.
+#[tauri::command]
+async fn get_system_load() -> Result<sysload::SystemLoad, String> {
+    tauri::async_runtime::spawn_blocking(sysload::read)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn get_overlay_settings(state: State<'_, ManagedState>) -> Result<OverlaySettings, String> {
     state.overlay_settings().map_err(display_error)
@@ -490,6 +500,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_snapshot,
             get_snapshot,
+            get_system_load,
             get_overlay_settings,
             set_overlay_settings,
             set_overlay_enabled,

@@ -36,3 +36,4 @@ tokio = { version = "1.42", features = ["macros", "net", "rt-multi-thread", "syn
 tokio-stream = "0.1"
 toml_edit = "0.22"
 uuid = { version = "1.11", features = ["v4", "serde"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }

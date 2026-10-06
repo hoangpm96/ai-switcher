@@ -561,6 +561,9 @@ pub struct OverlaySettings {
     /// Let clicks pass through to whatever is behind the overlay (view-only mode).
     #[serde(default)]
     pub click_through: bool,
+    /// Footer line with CPU / RAM and the heaviest app, to catch the machine bogging down early.
+    #[serde(default = "default_true")]
+    pub show_system: bool,
     /// Last position/size, so reopening puts it back where the user left it.
     #[serde(default)]
     pub rect: OverlayRect,
@@ -583,6 +586,7 @@ impl Default for OverlaySettings {
             hover_opacity: default_overlay_hover_opacity(),
             compact: false,
             click_through: false,
+            show_system: true,
             rect: OverlayRect::default(),
         }
     }

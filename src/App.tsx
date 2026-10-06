@@ -1248,6 +1248,14 @@ function OverlaySettingsBar({
           />
           Cho chuột xuyên qua
         </label>
+        <label>
+          <input
+            type="checkbox"
+            checked={settings.showSystem}
+            onChange={(event) => void save({ ...settings, showSystem: event.target.checked })}
+          />
+          Hiện CPU / RAM máy
+        </label>
         <label className="overlayOpacity">
           Độ mờ lúc rảnh
           <input

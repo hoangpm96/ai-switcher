@@ -73,7 +73,33 @@ export interface OverlaySettings {
   compact: boolean;
   /** Clicks pass through to the app behind the overlay. */
   clickThrough: boolean;
+  /** Footer line with CPU / RAM and the heaviest app. */
+  showSystem: boolean;
   rect: OverlayRect;
+}
+
+/** One app's share of the machine (all its helper processes summed). */
+export interface AppLoad {
+  name: string;
+  /** Bytes. */
+  memory: number;
+  /** 100 = one full core, so it can go past 100. */
+  cpuPercent: number;
+}
+
+/** Machine load for the overlay footer. */
+export interface SystemLoad {
+  /** Whole machine, 0..100. */
+  cpuPercent: number;
+  cores: number;
+  /** 1-minute load average — compare against `cores`. */
+  loadOne: number;
+  /** Bytes; "Memory Used" as Activity Monitor counts it. */
+  memoryUsed: number;
+  memoryTotal: number;
+  swapUsed: number;
+  topMemory: AppLoad | null;
+  topCpu: AppLoad | null;
 }
 
 export interface ApiProvider {

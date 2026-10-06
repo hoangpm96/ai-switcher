@@ -267,6 +267,78 @@ html.ovWindow #root {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---------- machine load footer ---------- */
+
+.ovSys {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Right padding keeps the text clear of the resize grip. */
+  padding: 4px 16px 4px 9px;
+  border-top: 1px solid var(--ov-line);
+  color: var(--ov-text-3);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ovSysLine {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.ovSysMeter {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.ovSysLabel {
+  flex: 0 0 auto;
+  font-size: 9px;
+}
+
+.ovSysTrack {
+  height: 3px;
+  min-width: 18px;
+}
+
+.ovSysValue {
+  flex: 0 0 auto;
+  color: var(--ov-text-2);
+}
+
+.ovSysHogs {
+  gap: 5px;
+}
+
+.ovSysHogs > span {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ovSysArrow {
+  flex: 0 0 auto !important;
+  font-size: 7px;
+  color: var(--ov-amber);
+}
+
+.ovSys :not(.ovBarTrack)[data-level="mid"] {
+  color: var(--ov-amber);
+}
+
+.ovSys :not(.ovBarTrack)[data-level="high"] {
+  color: var(--ov-red);
+  font-weight: 600;
+}
+
 /* ---------- settings panel ---------- */
 
 .ovSettings {

@@ -3,7 +3,14 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Check, Loader2, RefreshCw, Settings2, X } from "lucide-react";
 import { api } from "./tauri";
-import type { AppSnapshot, OverlaySettings, QuotaInfo, QuotaWindow, ToolId } from "./types";
+import type {
+  AppSnapshot,
+  OverlaySettings,
+  QuotaInfo,
+  QuotaWindow,
+  SystemLoad,
+  ToolId,
+} from "./types";
 import "./overlay.css";
 
 /** Rows are keyed `"<tool>:<accountId>"` so the same id under two tools can't collide. */
@@ -29,6 +36,7 @@ const defaultSettings: OverlaySettings = {
   hoverOpacity: 1,
   compact: false,
   clickThrough: false,
+  showSystem: true,
   rect: { x: 40, y: 60, width: 288, height: 330 },
 };
 
@@ -107,6 +115,8 @@ export function OverlayApp() {
   // the pointer is on it. In click-through mode the window gets no mouse events at all, so the
   // backend samples the pointer and pushes the state in via `overlay-hover` instead.
   const [hovered, setHovered] = useState(false);
+  // The machine is close to choking: light the panel up even while idle so it gets noticed.
+  const [sysAlert, setSysAlert] = useState(false);
   // Bumped on a timer so the "resets in …" labels count down without refetching quota.
   const [, setTick] = useState(0);
   const mounted = useRef(true);
@@ -204,7 +214,7 @@ export function OverlayApp() {
   );
 
   // Reading the settings needs the panel fully legible, whatever the idle opacity is.
-  const solid = hovered || showSettings;
+  const solid = hovered || showSettings || (settings.showSystem && sysAlert);
   const opacity = solid ? settings.hoverOpacity : settings.opacity;
 
   return (
@@ -250,6 +260,8 @@ export function OverlayApp() {
           )}
         </div>
       )}
+
+      {settings.showSystem && <SystemFooter onAlert={setSysAlert} />}
 
       {/* Frameless windows have no visible edge to grab, so give resizing an explicit handle. */}
       <span
@@ -350,6 +362,151 @@ function OverlayBar({
   );
 }
 
+type Level = "low" | "mid" | "high";
+
+/** How often the footer re-reads CPU/RAM. Short enough to catch a runaway app within seconds;
+ *  one read walks every process in ~10 ms. */
+const SYSTEM_POLL_MS = 3_000;
+
+const GB = 1024 ** 3;
+
+function worst(...levels: Level[]): Level {
+  return levels.includes("high") ? "high" : levels.includes("mid") ? "mid" : "low";
+}
+
+function byThreshold(value: number, mid: number, high: number): Level {
+  return value >= high ? "high" : value >= mid ? "mid" : "low";
+}
+
+/** `5.6` / `24` / `0.4` — GB with one decimal below 10, whole numbers above. */
+function gb(bytes: number) {
+  const value = bytes / GB;
+  return value >= 10 ? value.toFixed(0) : value.toFixed(1);
+}
+
+/** Footer: machine CPU / RAM plus the apps holding the most memory and CPU, so a runaway app
+ *  (an Electron tool at 40 GB, a stuck build) shows up before the Mac freezes. */
+function SystemFooter({ onAlert }: { onAlert: (alert: boolean) => void }) {
+  const [load, setLoad] = useState<SystemLoad | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const read = () =>
+      void api
+        .getSystemLoad()
+        .then((next) => alive && setLoad(next))
+        .catch(() => undefined);
+    read();
+    const timer = window.setInterval(read, SYSTEM_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const cpuLevel = load ? byThreshold(load.cpuPercent, 70, 90) : "low";
+  const memShare = load && load.memoryTotal > 0 ? (load.memoryUsed / load.memoryTotal) * 100 : 0;
+  // Swap growing is what actually makes macOS stutter, more than "RAM used" being high.
+  const memLevel = load
+    ? worst(byThreshold(memShare, 80, 92), byThreshold(load.swapUsed / GB, 2, 6))
+    : "low";
+  const hogMemShare =
+    load?.topMemory && load.memoryTotal > 0 ? (load.topMemory.memory / load.memoryTotal) * 100 : 0;
+  const hogMemLevel = byThreshold(hogMemShare, 25, 40);
+  // Several cores pinned by one app for a while is the classic "fan spins up" case.
+  const hogCpuLevel = load?.topCpu ? byThreshold(load.topCpu.cpuPercent, 200, 400) : "low";
+  const alert = worst(cpuLevel, memLevel, hogMemLevel, hogCpuLevel) === "high";
+
+  useEffect(() => {
+    onAlert(alert);
+  }, [alert, onAlert]);
+
+  if (!load) return null;
+
+  const loadLevel = byThreshold(load.loadOne, load.cores, load.cores * 1.5);
+  const showSwap = load.swapUsed >= 2 * GB;
+  // The culprit line only shows up once something is worth a look — idle, the footer is one line.
+  const busy = worst(cpuLevel, loadLevel, memLevel, hogMemLevel, hogCpuLevel) !== "low";
+  const sameHog = load.topMemory && load.topCpu && load.topMemory.name === load.topCpu.name;
+
+  return (
+    <footer className="ovSys">
+      <div className="ovSysLine">
+        <SystemMeter
+          label="CPU"
+          percent={load.cpuPercent}
+          level={worst(cpuLevel, loadLevel)}
+          value={`${Math.round(load.cpuPercent)}%`}
+          title={`CPU toàn máy ${Math.round(load.cpuPercent)}% · load 1 phút ${load.loadOne.toFixed(1)}/${load.cores} nhân`}
+        />
+        <SystemMeter
+          label="RAM"
+          percent={memShare}
+          level={memLevel}
+          value={`${gb(load.memoryUsed)}/${gb(load.memoryTotal)}G`}
+          title={`RAM đang dùng ${gb(load.memoryUsed)}/${gb(load.memoryTotal)} GB · swap ${gb(load.swapUsed)} GB`}
+        />
+      </div>
+      {busy && (
+        <div className="ovSysLine ovSysHogs">
+          <span className="ovSysArrow">▲</span>
+          {showSwap && (
+            <span data-level={byThreshold(load.swapUsed / GB, 2, 6)} title="Swap — tăng nhiều là máy bắt đầu đơ">
+              swap {gb(load.swapUsed)}G
+            </span>
+          )}
+          {load.topMemory && (
+            <span
+              data-level={hogMemLevel}
+              title={`App giữ nhiều RAM nhất: ${load.topMemory.name} · ${gb(load.topMemory.memory)} GB`}
+            >
+              {load.topMemory.name} {gb(load.topMemory.memory)}G
+              {sameHog && load.topCpu && (
+                <span data-level={hogCpuLevel}> · {Math.round(load.topCpu.cpuPercent)}%</span>
+              )}
+            </span>
+          )}
+          {load.topCpu && !sameHog && (
+            <span
+              data-level={hogCpuLevel}
+              title={`App ăn CPU nhất: ${load.topCpu.name} · ${Math.round(load.topCpu.cpuPercent)}% (100% = 1 nhân)`}
+            >
+              {load.topCpu.name} {Math.round(load.topCpu.cpuPercent)}%
+            </span>
+          )}
+        </div>
+      )}
+    </footer>
+  );
+}
+
+/** One half of the footer: `CPU ▰▰▱ 46%`, bar colored by how close to the limit it is. */
+function SystemMeter({
+  label,
+  percent,
+  level,
+  value,
+  title,
+}: {
+  label: string;
+  percent: number;
+  level: Level;
+  value: string;
+  title: string;
+}) {
+  return (
+    <span className="ovSysMeter" title={title}>
+      <span className="ovSysLabel">{label}</span>
+      <span className="ovBarTrack ovSysTrack" data-level={level}>
+        <span className="ovBarFill" style={{ width: `${Math.max(0, Math.min(100, percent))}%` }} />
+      </span>
+      <span className="ovSysValue" data-level={level}>
+        {value}
+      </span>
+    </span>
+  );
+}
+
 function OverlaySettingsPanel({
   snapshot,
   settings,
@@ -406,6 +563,14 @@ function OverlaySettingsPanel({
           onChange={(event) => onChange({ ...settings, clickThrough: event.target.checked })}
         />
         Cho chuột xuyên qua
+      </label>
+      <label className="ovOpt">
+        <input
+          type="checkbox"
+          checked={settings.showSystem}
+          onChange={(event) => onChange({ ...settings, showSystem: event.target.checked })}
+        />
+        Hiện CPU / RAM máy
       </label>
       {settings.clickThrough && (
         <p className="ovHint">

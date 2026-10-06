@@ -11,6 +11,7 @@ import type {
   CreateVirtualApiAccountInput,
   OrphanAccountDir,
   OverlaySettings,
+  SystemLoad,
   PrimeNowInput,
   PrimeNowResult,
   RateLimitResetCredits,
@@ -77,6 +78,7 @@ const demoOverlaySettings: OverlaySettings = {
   hoverOpacity: 1,
   compact: false,
   clickThrough: false,
+  showSystem: true,
   rect: { x: 40, y: 60, width: 288, height: 330 },
 };
 
@@ -437,6 +439,19 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   ) {
     return structuredClone({ ...demoOverlaySettings, ...(args?.input as object | undefined) }) as T;
   }
+  if (command === "get_system_load") {
+    const gb = 1024 ** 3;
+    return {
+      cpuPercent: 46,
+      cores: 12,
+      loadOne: 2.6,
+      memoryUsed: 5.64 * gb,
+      memoryTotal: 24 * gb,
+      swapUsed: 0,
+      topMemory: { name: "1DevTool", memory: 3.2 * gb, cpuPercent: 18 },
+      topCpu: { name: "node", memory: 0.4 * gb, cpuPercent: 85 },
+    } as T;
+  }
   if (command === "prime_now") {
     return { kind: "success", message: "Đã mở phiên mới — reset lúc 12:00" } as T;
   }
@@ -689,6 +704,7 @@ export const api = {
   loadSnapshot: () => invoke<AppSnapshot>("load_snapshot"),
   /** Cached snapshot without the pending-login recheck — for the overlay's polling. */
   getSnapshot: () => invoke<AppSnapshot>("get_snapshot"),
+  getSystemLoad: () => invoke<SystemLoad>("get_system_load"),
   getOverlaySettings: () => invoke<OverlaySettings>("get_overlay_settings"),
   setOverlaySettings: (input: OverlaySettings) =>
     invoke<OverlaySettings>("set_overlay_settings", { input }),
