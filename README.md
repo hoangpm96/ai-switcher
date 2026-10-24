@@ -98,4 +98,4 @@ See [CHANGELOG.md](CHANGELOG.md) for the per-version history and
 
 ## License
 
-No license file yet — add one (e.g. MIT) before sharing widely if you want to allow reuse.
+[MIT](LICENSE) © 2026 Hoang Phan.

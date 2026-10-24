@@ -3,6 +3,7 @@ name = "ai-account-switcher"
 version = "0.12.0"
 description = "Desktop account manager for AI coding tools"
 authors = ["Hoang Phan"]
+license = "MIT"
 edition = "2021"
 
 [lib]
