@@ -8,9 +8,9 @@ Built with [Tauri](https://tauri.app) (Rust + React).
 
 ## ⬇️ Download
 
-**[Download the latest `.dmg`](https://github.com/hoangpm96/ai-switcher/releases/latest/download/AI-Account-Switcher.dmg)** — free, universal (Apple Silicon + Intel), signed with a Developer ID and notarized by Apple. Open it and drag **AI Account Switcher** to Applications.
+**[Download from store.xbirds.org/ai-account-switcher](https://store.xbirds.org/ai-account-switcher)** — free, universal (Apple Silicon + Intel), signed with a Developer ID and notarized by Apple. Open the `.dmg` and drag **AI Account Switcher** to Applications.
 
-Older versions and release notes are on the [Releases](https://github.com/hoangpm96/ai-switcher/releases) page.
+From 0.13.0 the app updates itself: when a new version is out, a card in the sidebar shows what's new and one click installs it.
 
 ## Features
 
@@ -60,11 +60,11 @@ Older versions and release notes are on the [Releases](https://github.com/hoangp
 
 ## Install
 
-1. [Download the latest `.dmg`](https://github.com/hoangpm96/ai-switcher/releases/latest/download/AI-Account-Switcher.dmg).
+1. Download the `.dmg` from [store.xbirds.org/ai-account-switcher](https://store.xbirds.org/ai-account-switcher).
 2. Open the `.dmg` and drag **AI Account Switcher** to Applications.
 3. Open the app. macOS asks once whether to open an app downloaded from the internet — click **Open**.
 
-Since v0.12.1 the app is signed with a Developer ID and notarized by Apple, so no `xattr` or right-click → Open is needed. On the first launch after upgrading from an older, unsigned build, macOS may ask again whether the app may control Terminal (used to sign in) — allow it once.
+Since 0.13.0 the app is signed with a Developer ID and notarized by Apple, so no `xattr` or right-click → Open is needed, and it updates itself (Settings → Updates shows the version and checks by hand). Versions before 0.13.0 cannot update themselves: install 0.13.0 over them once. On the first launch after upgrading from an older, unsigned build, macOS may ask again whether the app may control Terminal (used to sign in) — allow it once.
 
 ## Build from source
 
@@ -78,12 +78,17 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a version tag like `v0.6.3` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg`, signs it with the Developer ID certificate, notarizes it with Apple, and publishes a GitHub Release with the versioned `.dmg` plus a fixed-name `AI-Account-Switcher.dmg` (the target of the `releases/latest/download/…` link). It needs four repository secrets — `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD` — described at the top of the workflow file. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
+Releases are published from the release Mac straight to the store's server, like Reqwise Figma — not through GitHub. One command builds the universal app, signs it with the Developer ID certificate, notarizes it with Apple, signs the in-app update package with the updater key, uploads the installer, the update package and the manifest installed apps read, and checks them over https:
 
 ```bash
-git tag v0.6.3
-git push origin main v0.6.3
+npm run publish-release            # checks + plan, changes nothing
+npm run publish-release -- --yes   # publish
+npm run publish-release -- --status
 ```
+
+Before it: bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` (and `src-tauri/Cargo.lock`), add the version to `CHANGELOG.md` and its short "what's new" lines (English + Vietnamese) to `release-notes.json`, and commit. The header of `scripts/publish.mjs` lists what goes where, the one-time setup (Apple identity, notarization profile, `ssh bahub`) and how to try an update on a test channel first.
+
+**The updater key** (`~/.config/ai-switcher/updater.key`) signs every update package, and installed apps only accept packages signed by it. Keep a backup of it (password manager or an encrypted drive, not the repo or a cloud folder): without it, apps already installed can no longer update and everyone has to download the next version by hand.
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-version history and
 [the v0.7.2 release notes](docs/releases/v0.7.2.md) for the current release.

@@ -1,6 +1,6 @@
 [package]
 name = "ai-account-switcher"
-version = "0.12.1"
+version = "0.13.0"
 description = "Desktop account manager for AI coding tools"
 authors = ["Hoang Phan"]
 license = "MIT"
@@ -33,8 +33,9 @@ tauri-plugin-notification = "2.3.3"
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-single-instance = "2.4.2"
 thiserror = "2.0"
-tokio = { version = "1.42", features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1.42", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-stream = "0.1"
 toml_edit = "0.22"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+tauri-plugin-updater = "2"

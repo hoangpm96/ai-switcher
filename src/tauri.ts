@@ -24,6 +24,7 @@ import type {
   StartApiGatewayInput,
   SwitchAccountInput,
   ToolId,
+  UpdateState,
   UsageReport,
 } from "./types";
 
@@ -423,6 +424,25 @@ const demoApiUsage: ApiUsageReport = {
   rows: [],
 };
 
+const demoUpdate: UpdateState = {
+  current: "0.13.0",
+  phase: "available",
+  info: {
+    version: "0.13.1",
+    notes: JSON.stringify([
+      { en: "Quota stays visible when a read fails", vi: "Quota vẫn hiện khi đọc lỗi" },
+      { en: "The app updates itself", vi: "App tự cập nhật" },
+    ]),
+    date: "2026-11-17T08:00:00Z",
+  },
+  downloaded: 0,
+  total: null,
+  checking: false,
+  checkedAt: "2026-11-17T08:00:00Z",
+  error: null,
+  justUpdated: null,
+};
+
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauri) {
     return tauriInvoke<T>(command, args);
@@ -438,6 +458,9 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
     command === "set_overlay_enabled"
   ) {
     return structuredClone({ ...demoOverlaySettings, ...(args?.input as object | undefined) }) as T;
+  }
+  if (command === "update_status" || command === "update_check" || command === "update_seen") {
+    return structuredClone(demoUpdate) as T;
   }
   if (command === "get_system_load") {
     const gb = 1024 ** 3;
@@ -765,4 +788,9 @@ export const api = {
   openAutoPrimeLogFolder: () => invoke<void>("open_auto_prime_log_folder"),
   wakeHelperStatus: () => invoke<boolean>("wake_helper_status"),
   uninstallWakeHelper: () => invoke<boolean>("uninstall_wake_helper"),
+  updateStatus: () => invoke<UpdateState>("update_status"),
+  updateCheck: () => invoke<UpdateState>("update_check"),
+  /** Downloads, verifies and installs the newer version, then the app restarts (never resolves on success). */
+  updateInstall: () => invoke<void>("update_install"),
+  updateSeen: () => invoke<UpdateState>("update_seen"),
 };

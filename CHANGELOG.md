@@ -5,7 +5,17 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.12.1] - 2026-11-16
+## [0.13.0] - 2026-11-17
+
+### Added
+
+- **The app updates itself.** A little after it starts, and then every few hours, the app asks
+  store.xbirds.org whether a newer version is out. When one is, a card in the sidebar shows what's
+  new with an "Update & restart" button: the app downloads the new version, checks that it was
+  signed with the release key, replaces itself and reopens, then says which version it is on now.
+  Settings → Updates shows the running version and has a "Check for updates" button. This version
+  has to be installed by hand once (from store.xbirds.org/ai-account-switcher); every version after
+  it arrives this way.
 
 ### Changed
 
@@ -16,11 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rate limit (HTTP 429) kept them. A window whose reset time has passed is dropped, since its
   percentage no longer applies. The tray menu marks such numbers with `~`. Auto-switch, the weekly
   lock, the API gateway and "Prime ngay" still treat them as unknown, so nothing acts on old data.
-
-### Distribution
-
-- The macOS build is now signed with a Developer ID and notarized by Apple, so the downloaded
-  `.dmg` opens without a Gatekeeper warning — no more right-click → Open or `xattr -cr`.
+- **Signed, notarized, and downloaded from the store.** The macOS build is now signed with a
+  Developer ID and notarized by Apple, so the downloaded `.dmg` opens without a Gatekeeper warning
+  — no more right-click → Open or `xattr -cr`. Downloads move from GitHub Releases to
+  store.xbirds.org/ai-account-switcher.
 
 ## [0.12.0] - 2026-10-07
 

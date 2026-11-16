@@ -101,6 +101,12 @@ impl Store {
 
     /// Human-readable activity log for "Prime ngay" attempts (one line per event). The filename is
     /// kept from the removed auto-prime feature so the user's existing log history stays in place.
+    /// Written just before an in-app update replaces the app (version + notes), read once by the
+    /// relaunched app to say "updated to vX" and show what's new. See `updater.rs`.
+    pub fn update_marker_path(&self) -> PathBuf {
+        self.root.join("update-installed.json")
+    }
+
     pub fn auto_prime_log_path(&self) -> PathBuf {
         self.root.join("auto-prime.log")
     }

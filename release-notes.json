@@ -1,0 +1,18 @@
+{
+  "0.13.0": {
+    "app": [
+      {
+        "en": "The app updates itself: a card shows what's new, one click installs it",
+        "vi": "App tự cập nhật: có thẻ báo có gì mới, bấm một lần là cài"
+      },
+      {
+        "en": "A failed quota read keeps showing the last known numbers",
+        "vi": "Đọc quota lỗi vẫn hiện số liệu gần nhất, kèm giờ của số đó"
+      },
+      {
+        "en": "Signed and notarized by Apple: opens without a warning",
+        "vi": "Đã ký và được Apple chứng nhận: mở không bị cảnh báo"
+      }
+    ]
+  }
+}

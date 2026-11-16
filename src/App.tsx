@@ -38,6 +38,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { api } from "./tauri";
+import { UpdateCard, UpdatedNote, UpdateSettings, useUpdates } from "./Updates";
 import { UsageView } from "./UsageView";
 import logoUrl from "./assets/logo.svg";
 import type {
@@ -183,6 +184,7 @@ export function App() {
   const [switchNotice, setSwitchNotice] = useState<string | null>(null);
   const [autoSwitchBanner, setAutoSwitchBanner] = useState<string | null>(null);
   const [version, setVersion] = useState("");
+  const updates = useUpdates();
   const [setupPrompted, setSetupPrompted] = useState<Set<ToolId>>(new Set());
   const [showHidden, setShowHidden] = useState(false);
 
@@ -475,6 +477,8 @@ export function App() {
         </section>
       )}
 
+      <UpdatedNote state={updates.state} onClose={() => void updates.seen()} />
+
       <div className="toastStack">
         {toasts.map((item) => (
           <section
@@ -555,6 +559,8 @@ export function App() {
               <small>CLI paths</small>
             </button>
           </div>
+
+          <UpdateCard state={updates.state} onInstall={() => void updates.install()} />
 
           <div className="sidebarFoot">
             <img className="footLogo" src={logoUrl} alt="" />
@@ -641,6 +647,7 @@ export function App() {
             onAutoSwitchChange={(toolId, enabled, threshold) =>
               run(`autoSwitch-${toolId}`, () => api.setAutoSwitchSetting(toolId, enabled, threshold))
             }
+            updates={updates}
           />
         )}
 
@@ -971,12 +978,14 @@ function SettingsView({
   notify,
   onSetup,
   onAutoSwitchChange,
+  updates,
 }: {
   snapshot: AppSnapshot;
   busy: boolean;
   notify: (text: string, kind?: "success" | "error" | "info") => void;
   onSetup: (toolId: ToolId) => void;
   onAutoSwitchChange: (toolId: ToolId, enabled: boolean, threshold: number) => void;
+  updates: ReturnType<typeof useUpdates>;
 }) {
   const cliTools = snapshot.tools.filter((tool) => tool.id !== "antigravity");
   // Auto-switch reacts to a 5-hour window running out — only Claude and Codex have one.
@@ -1035,6 +1044,13 @@ function SettingsView({
       </div>
 
       <div className="settingsList">
+        <UpdateSettings
+          state={updates.state}
+          onCheck={() => void updates.check()}
+          onInstall={() => void updates.install()}
+          installError={updates.installError}
+        />
+
         {cliTools.map((tool) => (
           <CliSetupBar
             key={tool.id}

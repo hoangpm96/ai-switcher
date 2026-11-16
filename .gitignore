@@ -18,8 +18,9 @@ docs/*
 !docs/releases/*.md
 review.md
 
-# Local scratch / test debris (never publish)
-scripts/
+# Local scratch / test debris (never publish) — except the release command
+scripts/*
+!scripts/publish.mjs
 test_codex_sandbox
 test_codex_sandbox.rs
 .agy-review-*

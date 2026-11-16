@@ -10,6 +10,7 @@ mod store;
 mod sysload;
 mod tools;
 mod tray;
+mod updater;
 mod usage;
 mod wake;
 
@@ -23,6 +24,26 @@ use models::{
     SwitchAccountInput, ToolId, UsageReport,
 };
 use tauri::{Emitter, Manager, State};
+
+#[tauri::command]
+fn update_status(app: tauri::AppHandle) -> updater::UpdateState {
+    updater::status(&app)
+}
+
+#[tauri::command]
+async fn update_check(app: tauri::AppHandle) -> updater::UpdateState {
+    updater::check(&app).await
+}
+
+#[tauri::command]
+async fn update_install(app: tauri::AppHandle) -> Result<(), String> {
+    updater::install(&app).await
+}
+
+#[tauri::command]
+fn update_seen(app: tauri::AppHandle) -> updater::UpdateState {
+    updater::seen(&app)
+}
 
 #[tauri::command]
 fn load_snapshot(state: State<'_, ManagedState>) -> Result<AppSnapshot, String> {
@@ -496,6 +517,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             load_snapshot,
@@ -541,11 +563,18 @@ pub fn run() {
             delete_api_gateway_combo,
             set_api_gateway_account,
             refresh_api_gateway_models,
-            create_virtual_api_account
+            create_virtual_api_account,
+            update_status,
+            update_check,
+            update_install,
+            update_seen
         ])
         .setup(|app| {
             // Menu-bar (tray) icon for quick account switching without opening the window.
             tray::create(app.handle())?;
+
+            // In-app updates: first check shortly after start, then every few hours.
+            updater::init(app.handle());
 
             // Reopen the floating quota overlay if it was left on last time. Going through
             // `apply` (not `show`) also restores click-through and starts the pointer watcher.

@@ -521,3 +521,26 @@ export interface UsageReport {
   priceStatus: string;
   priceUpdatedAt: string | null;
 }
+
+/** In-app update (mirrors `updater::UpdateState` in Rust). */
+export type UpdatePhase = "idle" | "available" | "downloading" | "installing";
+
+export interface UpdateInfo {
+  version: string;
+  /** JSON list of `{ en, vi }` lines (release-notes.json); older/other servers may send plain text. */
+  notes?: string | null;
+  date?: string | null;
+}
+
+export interface UpdateState {
+  current: string;
+  phase: UpdatePhase;
+  info: UpdateInfo | null;
+  downloaded: number;
+  total: number | null;
+  checking: boolean;
+  checkedAt: string | null;
+  error: string | null;
+  /** Set once after the app was reopened by an update, until `updateSeen`. */
+  justUpdated: UpdateInfo | null;
+}

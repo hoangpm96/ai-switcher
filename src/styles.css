@@ -3411,3 +3411,116 @@ div.quotaError .linkBtn {
 .warnText {
   color: var(--amber);
 }
+
+/* ---- In-app updates (Updates.tsx) ---- */
+.updateCard,
+.updatedNote {
+  display: grid;
+  gap: 8px;
+  padding: 10px 10px 9px;
+  border: 1px solid rgba(251, 106, 26, 0.35);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(160deg, var(--accent-soft), transparent 70%), var(--surface);
+  box-shadow: var(--edge);
+}
+
+.updateCard {
+  margin-top: 8px;
+}
+
+.updatedNote {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 40;
+  width: min(340px, calc(100vw - 36px));
+  box-shadow: var(--shadow-pop);
+}
+
+.updateHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent);
+}
+
+.updateHead strong {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+button.updateClose {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+}
+
+button.updateClose:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.updateNotes {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding-left: 16px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.updateNotes li.more {
+  color: var(--text-3);
+  list-style: none;
+  margin-left: -16px;
+}
+
+.updateProgress {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--line-strong);
+}
+
+.updateProgress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-grad);
+  transition: width 0.2s ease;
+}
+
+button.updateBtn {
+  justify-content: center;
+  width: 100%;
+  font-size: 12px;
+}
+
+.updateHint {
+  color: var(--text-3);
+  font-size: 10.5px;
+  text-align: center;
+}
+
+.updateError {
+  margin: 0;
+  color: var(--red);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.updateSettingsRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
