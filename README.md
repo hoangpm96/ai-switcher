@@ -64,7 +64,7 @@ Older versions and release notes are on the [Releases](https://github.com/hoangp
 2. Open the `.dmg` and drag **AI Account Switcher** to Applications.
 3. Open the app. macOS asks once whether to open an app downloaded from the internet — click **Open**.
 
-Since v0.12.1 the app is signed with a Developer ID and notarized by Apple, so no `xattr` or right-click → Open is needed. On the first launch after upgrading from an older, unsigned build, macOS may ask again for permissions the app had (controlling Terminal, Keychain access) — allow them once.
+Since v0.12.1 the app is signed with a Developer ID and notarized by Apple, so no `xattr` or right-click → Open is needed. On the first launch after upgrading from an older, unsigned build, macOS may ask again whether the app may control Terminal (used to sign in) — allow it once.
 
 ## Build from source
 
