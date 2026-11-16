@@ -8,9 +8,9 @@ Built with [Tauri](https://tauri.app) (Rust + React).
 
 ## ⬇️ Download
 
-Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/ai-switcher/releases/latest) page — download the `.dmg` under **Assets**, open it, and drag **AI Account Switcher** to Applications.
+**[Download the latest `.dmg`](https://github.com/hoangpm96/ai-switcher/releases/latest/download/AI-Account-Switcher.dmg)** — free, universal (Apple Silicon + Intel), signed with a Developer ID and notarized by Apple. Open it and drag **AI Account Switcher** to Applications.
 
-> First launch only: the app is unsigned, so right-click it → **Open** (or run `xattr -cr "/Applications/AI Account Switcher.app"`). See [Install](#install) below.
+Older versions and release notes are on the [Releases](https://github.com/hoangpm96/ai-switcher/releases) page.
 
 ## Features
 
@@ -60,19 +60,11 @@ Get the latest **`.dmg`** from the [**Releases**](https://github.com/hoangpm96/a
 
 ## Install
 
-1. Download the latest `.dmg` from the [Releases](https://github.com/hoangpm96/ai-switcher/releases/latest) page.
+1. [Download the latest `.dmg`](https://github.com/hoangpm96/ai-switcher/releases/latest/download/AI-Account-Switcher.dmg).
 2. Open the `.dmg` and drag **AI Account Switcher** to Applications.
+3. Open the app. macOS asks once whether to open an app downloaded from the internet — click **Open**.
 
-The app is **not code-signed** (no paid Apple Developer account), so macOS Gatekeeper will warn on first launch. To open it:
-
-- **Right-click** the app in Applications → **Open** → **Open** in the dialog, **or**
-- Run once in Terminal:
-
-  ```bash
-  xattr -cr "/Applications/AI Account Switcher.app"
-  ```
-
-You only need to do this the first time.
+Since v0.12.1 the app is signed with a Developer ID and notarized by Apple, so no `xattr` or right-click → Open is needed. On the first launch after upgrading from an older, unsigned build, macOS may ask again for permissions the app had (controlling Terminal, Keychain access) — allow them once.
 
 ## Build from source
 
@@ -86,7 +78,7 @@ npm run tauri build    # produce a .dmg in src-tauri/target/release/bundle/dmg
 
 ## Releasing
 
-Pushing a version tag like `v0.6.3` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg` and publishes a GitHub Release with the artifact attached. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
+Pushing a version tag like `v0.6.3` triggers the GitHub Actions workflow (`.github/workflows/release.yml`), which builds a universal macOS `.dmg`, signs it with the Developer ID certificate, notarizes it with Apple, and publishes a GitHub Release with the versioned `.dmg` plus a fixed-name `AI-Account-Switcher.dmg` (the target of the `releases/latest/download/…` link). It needs four repository secrets — `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD` — described at the top of the workflow file. Bump the version in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `src-tauri/Cargo.lock` first, then:
 
 ```bash
 git tag v0.6.3

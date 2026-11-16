@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The signed build runs under the hardened runtime (required for notarization). The app drives
+         other apps through osascript: Terminal for the sign-in flow ("do script") and Antigravity IDE
+         ("quit" before swapping its account). The hardened runtime blocks Apple events without this. -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

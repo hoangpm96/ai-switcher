@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Shown by macOS the first time the app asks to control another app (merged into the bundle's
+         Info.plist by Tauri). -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>AI Account Switcher opens Terminal to sign in to an account, and quits Antigravity IDE before switching its account.</string>
+</dict>
+</plist>
