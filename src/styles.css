@@ -1310,7 +1310,27 @@ div.quotaError > p {
   margin: 0;
 }
 
-/* Rate-limited read: the bars above are the last good numbers; this line says why they're stale. */
+/* Failed read (429, expired token, network…): the bars are the last known numbers, dimmed; the note
+   under them says why they're stale and how old they are. */
+.quotaStaleBars {
+  display: grid;
+  gap: 10px;
+  opacity: 0.6;
+}
+
+.quotaStaleNote {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.quotaStaleNote .linkBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .quotaStale {
   margin: 2px 0 0;
   color: var(--amber);

@@ -222,7 +222,9 @@ fn account_label(account: &Account) -> String {
     let mut trailer: Vec<String> = Vec::new();
     if let Some(quota) = &account.quota {
         if let Some(percent) = quota.five_hour.percent_used {
-            trailer.push(format!("{}%", percent.round() as i64));
+            // A failed read keeps the last known numbers; `~` marks them as not current.
+            let stale = if quota.error.is_some() { "~" } else { "" };
+            trailer.push(format!("{stale}{}%", percent.round() as i64));
         }
         if let Some(plan) = &quota.plan {
             trailer.push(plan.clone());

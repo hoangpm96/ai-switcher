@@ -292,8 +292,9 @@ function OverlayRow({ row, compact }: { row: Row; compact: boolean }) {
         {quota?.plan && <span className="ovPlan">{quota.plan}</span>}
       </div>
 
-      {quota?.error && quota.rateLimitedUntil && windows.some((w) => w.percentUsed != null) ? (
-        // Rate limited: keep the last good bars (dimmed) and say so in one line.
+      {quota?.error && rowWindows(quota).some((w) => w.percentUsed != null) ? (
+        // Read failed (rate limit, expired token, network…): keep the last known bars (dimmed) and
+        // say why, plus how old they are, in one line.
         <>
           <div className="ovStale">
             {windows.map((window, index) => (
@@ -305,7 +306,15 @@ function OverlayRow({ row, compact }: { row: Row; compact: boolean }) {
               />
             ))}
           </div>
-          <p className="ovWarn" title={quota.error}>
+          <p
+            className="ovWarn"
+            title={
+              quota.updatedAt
+                ? `${quota.error}\nSố liệu lúc ${absoluteTime(quota.updatedAt)}`
+                : quota.error
+            }
+          >
+            {quota.updatedAt && `${dataTime(quota.updatedAt)} · `}
             {quota.error}
           </p>
         </>
@@ -618,6 +627,16 @@ function countdown(value: string) {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}g ${minutes % 60}p`;
   return `${Math.floor(hours / 24)}n ${hours % 24}g`;
+}
+
+/** When the kept numbers were read: `14:20` today, `15/11 14:20` on an earlier day. */
+function dataTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const time = new Intl.DateTimeFormat("vi-VN", { hour: "2-digit", minute: "2-digit" }).format(date);
+  if (date.toDateString() === new Date().toDateString()) return time;
+  const day = new Intl.DateTimeFormat("vi-VN", { day: "2-digit", month: "2-digit" }).format(date);
+  return `${day} ${time}`;
 }
 
 function absoluteTime(value: string) {

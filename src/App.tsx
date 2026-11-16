@@ -2663,62 +2663,72 @@ function Quota({
   refreshingToken?: boolean;
 }) {
   if (!quota) return <p className="quotaError">No quota data yet</p>;
-  // Rate limited (HTTP 429): the backend kept the last good numbers — show them, marked stale,
-  // with when the app will try again, instead of only the error.
-  const staleNumbers =
-    quota.rateLimitedUntil &&
-    (quota.fiveHour.percentUsed != null || quota.weekly.percentUsed != null);
-  if (quota.error && staleNumbers) {
-    return (
-      <div className="quotaBox">
-        <QuotaBar
-          label={quota.fiveHour.label || "5-hour limit"}
-          percent={quota.fiveHour.percentUsed}
-          resetAt={quota.fiveHour.resetAt}
-        />
-        <QuotaBar
-          label={quota.weekly.label || "Weekly limit"}
-          percent={quota.weekly.percentUsed}
-          resetAt={quota.weekly.resetAt}
-        />
-        <p className="quotaStale">
-          {quota.error}
-          {quota.updatedAt && ` · số liệu lúc ${formatReset(quota.updatedAt)}`}
-        </p>
-      </div>
-    );
-  }
+  // A 401/403 quota read means the stored OAuth token expired. For Claude subscription accounts
+  // offer a re-check: safe to click any time — it never spawns the CLI to auto-refresh anymore
+  // (that used to invalidate a live `claude` session elsewhere, forcing a manual /login — verified
+  // live 2026-07-08/09). It just re-reads the token: clears a transient 401, or tells you to log in
+  // yourself if the token is genuinely expired. Other errors (network, parse) just show the message.
+  const isAuthError = !!quota.error && /\b40[13]\b/.test(quota.error);
+  const tokenButton = canRefreshToken && isAuthError && onRefreshToken && (
+    <button
+      className="linkBtn"
+      onClick={onRefreshToken}
+      disabled={refreshingToken}
+      title="Kiểm tra lại token đăng nhập (không tự làm mới — nếu hết hạn thật, cần mở claude và đăng nhập lại thủ công)"
+    >
+      {refreshingToken ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} Làm mới token
+    </button>
+  );
+
   if (quota.error) {
-    // A 401/403 quota read means the stored OAuth token expired. For Claude subscription accounts
-    // offer a re-check: safe to click any time — it never spawns the CLI to auto-refresh anymore
-    // (that used to invalidate a live `claude` session elsewhere, forcing a manual /login — verified
-    // live 2026-07-08/09). It just re-reads the token: clears a transient 401, or tells you to log in
-    // yourself if the token is genuinely expired. Other errors (network, parse) just show the message.
-    const isAuthError = /\b40[13]\b/.test(quota.error);
+    // The read failed (rate limit, expired token, network…). The backend kept the last good
+    // numbers when it had any — show them dimmed, with the error and how old they are, instead of
+    // only the error: the last known weekly/5h usage is often exactly what the user needs.
+    if (hasQuotaNumbers(quota)) {
+      return (
+        <div className="quotaBox">
+          <div className="quotaStaleBars">
+            <QuotaBars quota={quota} />
+          </div>
+          <div className="quotaStaleNote">
+            <p className="quotaStale">
+              {quota.error}
+              {quota.updatedAt && ` · số liệu lúc ${formatReset(quota.updatedAt)}`}
+            </p>
+            {tokenButton}
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="quotaError">
         <p>{quota.error}</p>
-        {canRefreshToken && isAuthError && onRefreshToken && (
-          <button
-            className="linkBtn"
-            onClick={onRefreshToken}
-            disabled={refreshingToken}
-            title="Kiểm tra lại token đăng nhập (không tự làm mới — nếu hết hạn thật, cần mở claude và đăng nhập lại thủ công)"
-          >
-            {refreshingToken ? <Loader2 className="spin" size={13} /> : <RefreshCw size={13} />} Làm mới token
-          </button>
-        )}
+        {tokenButton}
       </div>
     );
   }
 
+  return (
+    <div className="quotaBox">
+      <QuotaBars quota={quota} />
+    </div>
+  );
+}
+
+function hasQuotaNumbers(quota: NonNullable<Account["quota"]>) {
+  return [quota.fiveHour, quota.weekly, ...(quota.models ?? [])].some(
+    (window) => window.percentUsed != null,
+  );
+}
+
+function QuotaBars({ quota }: { quota: NonNullable<Account["quota"]> }) {
   // Some providers report more than the 5h + weekly pair: Antigravity one window per model,
   // Cursor and opencode several usage buckets. When they do, that list IS the quota.
   if (quota.models && quota.models.length > 0) {
     // Cursor's three buckets all reset at the end of the same billing period — printing the same
     // stamp on every row is just noise, so a repeated one is dropped.
     return (
-      <div className="quotaBox">
+      <>
         {quota.models.map((window, index) => (
           <QuotaBar
             key={window.label}
@@ -2731,12 +2741,12 @@ function Quota({
             }
           />
         ))}
-      </div>
+      </>
     );
   }
 
   return (
-    <div className="quotaBox">
+    <>
       <QuotaBar
         label={quota.fiveHour.label || "5-hour limit"}
         percent={quota.fiveHour.percentUsed}
@@ -2747,7 +2757,7 @@ function Quota({
         percent={quota.weekly.percentUsed}
         resetAt={quota.weekly.resetAt}
       />
-    </div>
+    </>
   );
 }
 

@@ -1087,7 +1087,7 @@ impl ManagedState {
                     .find(|a| a.tool_id == tool_id && a.id == account_id)
                 {
                     let was_exhausted = account.state == AccountState::Exhausted;
-                    account.quota = Some(keep_last_quota_when_rate_limited(
+                    account.quota = Some(keep_last_quota_on_error(
                         account.quota.as_ref(),
                         quota,
                     ));
@@ -1181,7 +1181,7 @@ impl ManagedState {
                 .find(|a| a.tool_id == *tool_id && a.id == account_id)
             {
                 let was_exhausted = account.state == AccountState::Exhausted;
-                account.quota = Some(keep_last_quota_when_rate_limited(
+                account.quota = Some(keep_last_quota_on_error(
                     account.quota.as_ref(),
                     quota,
                 ));
@@ -1707,7 +1707,8 @@ impl ManagedState {
         {
             if account.state == AccountState::NeedsLogin {
                 account.state = AccountState::Idle;
-                account.quota = Some(read_quota(tool_id, &config_dir));
+                let quota = read_quota(tool_id, &config_dir);
+                account.quota = Some(keep_last_quota_on_error(account.quota.as_ref(), quota));
                 account.updated_at = now();
             }
         }
@@ -3350,20 +3351,27 @@ fn normalized_or_default_name(
     unreachable!()
 }
 
-/// A rate-limited read (HTTP 429) carries no numbers. Keep the previous read's windows, and its
-/// `updated_at` so the UI can tell how old they are, rather than blanking the account for the whole
-/// Retry-After. `error` stays set, so auto-switch/exhaustion/prime logic still treats the numbers as
-/// unknown. A window whose reset has already passed is dropped: its percentage no longer applies.
-fn keep_last_quota_when_rate_limited(
-    previous: Option<&QuotaInfo>,
-    mut next: QuotaInfo,
-) -> QuotaInfo {
+/// A failed read (rate limit, expired token 401/403, network, IDE closed…) carries no numbers. Keep
+/// the previous read's windows, and its `updated_at` so the UI can tell how old they are, rather
+/// than blanking the account — the last known numbers are often exactly what the user needs (e.g. a
+/// token that expired overnight still shows where the weekly limit stood). `error` stays set, so
+/// auto-switch/exhaustion/weekly-lock/prime/gateway logic still treats the numbers as unknown.
+/// A window whose reset has already passed is dropped: its percentage no longer applies.
+fn keep_last_quota_on_error(previous: Option<&QuotaInfo>, mut next: QuotaInfo) -> QuotaInfo {
     let Some(previous) = previous else {
         return next;
     };
-    let has_numbers =
-        previous.five_hour.percent_used.is_some() || previous.weekly.percent_used.is_some();
-    if next.rate_limited_until.is_none() || !has_numbers {
+    if next.error.is_none() {
+        return next;
+    }
+    let has_numbers = previous.five_hour.percent_used.is_some()
+        || previous.weekly.percent_used.is_some()
+        || previous
+            .models
+            .iter()
+            .flatten()
+            .any(|window| window.percent_used.is_some());
+    if !has_numbers {
         return next;
     }
     let now = chrono::Utc::now();
@@ -3384,6 +3392,16 @@ fn keep_last_quota_when_rate_limited(
     };
     next.five_hour = still_valid(&previous.five_hour);
     next.weekly = still_valid(&previous.weekly);
+    next.models = previous
+        .models
+        .as_ref()
+        .map(|models| models.iter().map(still_valid).collect());
+    if next.plan.is_none() {
+        next.plan = previous.plan.clone();
+    }
+    if next.rate_limit_reset_credits.is_none() {
+        next.rate_limit_reset_credits = previous.rate_limit_reset_credits.clone();
+    }
     next.updated_at = previous.updated_at.clone();
     next
 }
@@ -3527,29 +3545,72 @@ mod tests {
     }
 
     #[test]
-    fn rate_limited_read_keeps_last_numbers_but_drops_expired_windows() {
+    fn failed_read_keeps_last_numbers_but_drops_expired_windows() {
         let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
         let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
         let mut previous = QuotaInfo::with_message("x");
         previous.error = None;
         previous.five_hour = window(Some(79.0), Some(past));
         previous.weekly = window(Some(65.0), Some(future.clone()));
+        previous.plan = Some("Max 5x".to_string());
         previous.updated_at = Some("2026-10-03T18:02:00Z".to_string());
 
         let mut limited = QuotaInfo::with_message("Anthropic giới hạn … (HTTP 429)");
         limited.rate_limited_until = Some(future);
-        let kept = keep_last_quota_when_rate_limited(Some(&previous), limited);
+        let kept = keep_last_quota_on_error(Some(&previous), limited);
         assert_eq!(kept.five_hour.percent_used, None, "5h window already reset");
         assert_eq!(kept.weekly.percent_used, Some(65.0));
         assert_eq!(kept.updated_at.as_deref(), Some("2026-10-03T18:02:00Z"));
         assert!(kept.error.is_some(), "error kept for auto-switch/prime");
 
-        // Any other error replaces the numbers as before.
-        let other = keep_last_quota_when_rate_limited(
+        // Any other failure (expired token, network…) keeps the last known numbers too.
+        let auth = keep_last_quota_on_error(
             Some(&previous),
             QuotaInfo::with_message("Couldn't read quota: HTTP 401"),
         );
-        assert_eq!(other.weekly.percent_used, None);
+        assert_eq!(auth.weekly.percent_used, Some(65.0));
+        assert_eq!(auth.plan.as_deref(), Some("Max 5x"));
+        assert_eq!(auth.updated_at.as_deref(), Some("2026-10-03T18:02:00Z"));
+        assert_eq!(auth.error.as_deref(), Some("Couldn't read quota: HTTP 401"));
+
+        // A second failure in a row still carries the ORIGINAL good read's time.
+        let again = keep_last_quota_on_error(
+            Some(&auth),
+            QuotaInfo::with_message("Couldn't read quota: HTTP 401"),
+        );
+        assert_eq!(again.weekly.percent_used, Some(65.0));
+        assert_eq!(again.updated_at.as_deref(), Some("2026-10-03T18:02:00Z"));
+
+        // A successful read replaces everything.
+        let mut fresh = QuotaInfo::with_message("x");
+        fresh.error = None;
+        fresh.weekly = window(Some(70.0), None);
+        let replaced = keep_last_quota_on_error(Some(&auth), fresh);
+        assert_eq!(replaced.weekly.percent_used, Some(70.0));
+        assert!(replaced.error.is_none());
+    }
+
+    #[test]
+    fn failed_read_keeps_last_per_model_windows() {
+        let mut previous = QuotaInfo::with_message("x");
+        previous.error = None;
+        previous.models = Some(vec![window(Some(40.0), None)]);
+        let kept = keep_last_quota_on_error(
+            Some(&previous),
+            QuotaInfo::with_message("Open Antigravity IDE to read quota"),
+        );
+        assert_eq!(kept.models.as_ref().map(|m| m[0].percent_used), Some(Some(40.0)));
+    }
+
+    #[test]
+    fn failed_read_without_previous_numbers_stays_an_error() {
+        let previous = QuotaInfo::with_message("Couldn't read quota: HTTP 401");
+        let next = keep_last_quota_on_error(
+            Some(&previous),
+            QuotaInfo::with_message("Couldn't read quota: HTTP 401"),
+        );
+        assert_eq!(next.five_hour.percent_used, None);
+        assert_eq!(next.weekly.percent_used, None);
     }
 
     #[test]
