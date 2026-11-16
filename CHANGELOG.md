@@ -5,6 +5,23 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-11-16
+
+### Changed
+
+- **A failed quota read keeps the last known numbers.** When reading an account's quota fails for
+  any reason — an expired token (HTTP 401/403), a network error, Antigravity's IDE being closed —
+  the card and the overlay keep showing the last numbers that were read, dimmed, with the error and
+  the time those numbers are from ("số liệu lúc …"), instead of only the red error. Before, only a
+  rate limit (HTTP 429) kept them. A window whose reset time has passed is dropped, since its
+  percentage no longer applies. The tray menu marks such numbers with `~`. Auto-switch, the weekly
+  lock, the API gateway and "Prime ngay" still treat them as unknown, so nothing acts on old data.
+
+### Distribution
+
+- The macOS build is now signed with a Developer ID and notarized by Apple, so the downloaded
+  `.dmg` opens without a Gatekeeper warning — no more right-click → Open or `xattr -cr`.
+
 ## [0.12.0] - 2026-10-07
 
 ### Added
