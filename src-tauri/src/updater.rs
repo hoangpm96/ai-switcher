@@ -10,6 +10,7 @@
 //! builds, signs and uploads the files.
 
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -27,6 +28,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Test hook: read the manifest from another https URL instead — the `--test` channel of
 /// `scripts/publish.mjs`, so a release can be tried end to end without offering it to anyone.
 const ENDPOINT_ENV: &str = "AI_SWITCHER_UPDATE_ENDPOINT";
+/// The app can't be replaced where it runs from (the mounted .dmg). The UI recognises "read-only" and
+/// says it in the user's language.
+const READ_ONLY: &str = "The app is running from a read-only place (the disk image?). Drag AI Account Switcher to Applications, open it from there, then update.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,7 +120,7 @@ pub async fn check(app: &AppHandle) -> UpdateState {
         s.checking = true;
         s.error = None;
     });
-    let found = match updater(app) {
+    let found = match updater(app, None) {
         Ok(updater) => updater.check().await.map_err(|e| e.to_string()),
         Err(e) => Err(e),
     };
@@ -149,13 +153,22 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
     if busy(app) {
         return Err("An update is already being installed".into());
     }
+    // Work out where the new version goes before downloading anything: a copy that can't be
+    // replaced should say so now, not after a 14 MB download.
+    let target = match install_target() {
+        Ok(target) => target,
+        Err(e) => {
+            edit(app, |s| s.error = Some(e.clone()));
+            return Err(e);
+        }
+    };
     edit(app, |s| {
         s.phase = UpdatePhase::Downloading;
         s.downloaded = 0;
         s.total = None;
         s.error = None;
     });
-    let result = download_and_install(app).await;
+    let result = download_and_install(app, target.as_ref()).await;
     match result {
         Ok(info) => {
             // Tell the reopened app what it was updated to. Best effort: without it the app just
@@ -166,7 +179,30 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
             }
             // Free the single-instance socket first so the new process can claim it.
             tauri_plugin_single_instance::destroy(app);
-            app.restart();
+            match target {
+                Some(target) => {
+                    // The package was checked against the updater key; don't let a leftover
+                    // "downloaded from the internet" flag translocate the new copy again.
+                    let _ = std::process::Command::new("/usr/bin/xattr")
+                        .args(["-dr", "com.apple.quarantine"])
+                        .arg(&target.app)
+                        .status();
+                    if target.translocated {
+                        // This process runs from the read-only translocation mount, so restarting
+                        // its own binary would reopen the old copy. Open the updated original once
+                        // this process is gone.
+                        let _ = std::process::Command::new("/bin/sh")
+                            .arg("-c")
+                            .arg("sleep 2; /usr/bin/open \"$0\"")
+                            .arg(&target.app)
+                            .spawn();
+                        app.exit(0);
+                        return Ok(());
+                    }
+                    app.restart();
+                }
+                None => app.restart(),
+            }
         }
         Err(e) => {
             edit(app, |s| {
@@ -178,6 +214,99 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
     }
 }
 
+/// The installed copy an update replaces.
+struct InstallTarget {
+    /// The `.app` bundle.
+    app: PathBuf,
+    /// Its executable: the updater replaces the bundle holding the path it is given.
+    exe: PathBuf,
+    /// The running copy is a translocated one (see `translocation`).
+    translocated: bool,
+}
+
+/// Where the new version must go. `Ok(None)` outside an app bundle (a dev build): the updater then
+/// uses its own default. `Err(READ_ONLY)` when that place can't be written at all.
+///
+/// macOS runs a quarantined app that was not moved by Finder (opened straight from the .dmg, or
+/// copied by a script) from a read-only "translocated" mount; replacing that path fails with
+/// "Read-only file system (os error 30)". The copy the user actually has is the original location,
+/// so that is the one to replace.
+fn install_target() -> Result<Option<InstallTarget>, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let Some(running) = exe
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|ext| ext == "app"))
+        .map(Path::to_path_buf)
+    else {
+        return Ok(None);
+    };
+    let inside = exe.strip_prefix(&running).map(Path::to_path_buf).ok();
+    let (bundle, translocated) = match translocation::original(&running) {
+        Some(original) => (original, true),
+        None => (running, false),
+    };
+    let exe = inside.map(|rel| bundle.join(rel)).unwrap_or(exe);
+
+    if let Some(parent) = bundle.parent() {
+        let probe = parent.join(format!(".ai-switcher-update-probe-{}", std::process::id()));
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+            }
+            // EROFS: a mounted disk image. Permission denied is fine: the updater asks for an
+            // administrator password then.
+            Err(e) if e.raw_os_error() == Some(30) => return Err(READ_ONLY.into()),
+            Err(_) => {}
+        }
+    }
+    Ok(Some(InstallTarget {
+        app: bundle,
+        exe,
+        translocated,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+mod translocation {
+    use core_foundation::base::TCFType;
+    use core_foundation::url::{CFURL, CFURLRef};
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+
+    // Security.framework, public since macOS 10.12 (SecTranslocate.h).
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecTranslocateIsTranslocatedURL(path: CFURLRef, is_translocated: *mut bool, error: *mut *const c_void) -> u8;
+        fn SecTranslocateCreateOriginalPathForURL(path: CFURLRef, error: *mut *const c_void) -> CFURLRef;
+    }
+
+    /// Where a translocated bundle really lives; `None` when `app` is not translocated.
+    pub fn original(app: &Path) -> Option<PathBuf> {
+        let url = CFURL::from_path(app, true)?;
+        let mut translocated = false;
+        // SAFETY: `url` is a valid CFURL for the call; a null error pointer is allowed.
+        let ok = unsafe {
+            SecTranslocateIsTranslocatedURL(url.as_concrete_TypeRef(), &mut translocated, std::ptr::null_mut())
+        };
+        if ok == 0 || !translocated {
+            return None;
+        }
+        // SAFETY: as above; the result follows the Create rule, so we own it.
+        let raw = unsafe { SecTranslocateCreateOriginalPathForURL(url.as_concrete_TypeRef(), std::ptr::null_mut()) };
+        if raw.is_null() {
+            return None;
+        }
+        unsafe { CFURL::wrap_under_create_rule(raw) }.to_path()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod translocation {
+    pub fn original(_: &std::path::Path) -> Option<std::path::PathBuf> {
+        None
+    }
+}
+
 /// The user closed the "updated to vX" note.
 pub fn seen(app: &AppHandle) -> UpdateState {
     let marker = app.state::<ManagedState>().store.update_marker_path();
@@ -186,8 +315,8 @@ pub fn seen(app: &AppHandle) -> UpdateState {
     snapshot(app)
 }
 
-async fn download_and_install(app: &AppHandle) -> Result<UpdateInfo, String> {
-    let update = updater(app)?
+async fn download_and_install(app: &AppHandle, target: Option<&InstallTarget>) -> Result<UpdateInfo, String> {
+    let update = updater(app, target.map(|t| t.exe.as_path()))?
         .check()
         .await
         .map_err(|e| e.to_string())?
@@ -220,8 +349,11 @@ async fn download_and_install(app: &AppHandle) -> Result<UpdateInfo, String> {
     Ok(info)
 }
 
-fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+fn updater(app: &AppHandle, exe: Option<&Path>) -> Result<tauri_plugin_updater::Updater, String> {
     let mut builder = app.updater_builder().timeout(REQUEST_TIMEOUT);
+    if let Some(exe) = exe {
+        builder = builder.executable_path(exe);
+    }
     if let Ok(url) = std::env::var(ENDPOINT_ENV) {
         let url = url
             .parse::<tauri::Url>()
@@ -267,4 +399,16 @@ fn edit_quiet(app: &AppHandle, f: impl FnOnce(&mut UpdateState)) {
 fn edit(app: &AppHandle, f: impl FnOnce(&mut UpdateState)) {
     edit_quiet(app, f);
     let _ = app.emit(EVENT, snapshot(app));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_app_that_was_not_translocated_has_no_original() {
+        // Also proves the Security.framework symbols link and run on this macOS.
+        assert_eq!(translocation::original(Path::new("/System/Applications/Calculator.app")), None);
+        assert_eq!(translocation::original(Path::new("/nonexistent/X.app")), None);
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ai-account-switcher"
-version = "0.13.0"
+version = "0.13.1"
 description = "Desktop account manager for AI coding tools"
 authors = ["Hoang Phan"]
 license = "MIT"
@@ -39,3 +39,8 @@ toml_edit = "0.22"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 tauri-plugin-updater = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# SecTranslocate: find where a translocated (quarantined, not moved by Finder) app really lives, so an
+# update replaces that copy instead of failing on the read-only translocation mount. See updater.rs.
+core-foundation = "0.10"

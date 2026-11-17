@@ -5,6 +5,16 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] - 2026-11-17
+
+### Fixed
+
+- **"Update & restart" failed with "Read-only file system (os error 30)"** when macOS ran the app
+  from its read-only "translocated" copy — which it does for a downloaded app that was not dragged
+  to Applications in Finder (copied another way, or opened straight from the disk image). The update
+  now replaces the copy the app was actually opened from and reopens it. When the app runs from the
+  mounted disk image itself, the card says to drag it to Applications first, before downloading.
+
 ## [0.13.0] - 2026-11-17
 
 ### Added

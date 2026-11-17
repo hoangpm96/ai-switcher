@@ -39,6 +39,17 @@ export function noteLines(notes?: string | null): string[] {
     .filter(Boolean);
 }
 
+/** Errors a user can act on, in their language; anything else as the updater said it. */
+export function updateError(message: string | null | undefined): string | null {
+  if (!message) return null;
+  if (/read-only|os error 30/i.test(message))
+    return L(
+      "The app is running from a place it can't change (the disk image?). Drag AI Account Switcher to Applications, open it from there, then update.",
+      "App đang chạy từ chỗ chỉ đọc (file .dmg?). Kéo AI Account Switcher vào Applications, mở app từ đó rồi cập nhật.",
+    );
+  return message;
+}
+
 export function useUpdates() {
   const [state, setState] = useState<UpdateState | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
@@ -133,7 +144,7 @@ export function UpdateCard({
           <span style={{ width: `${pct ?? 8}%` }} />
         </div>
       )}
-      {state.error && state.phase === "available" && <p className="updateError">{state.error}</p>}
+      {state.error && state.phase === "available" && <p className="updateError">{updateError(state.error)}</p>}
       <button className="primary updateBtn" onClick={onInstall} disabled={busy}>
         {busy ? <Loader2 className="spin" size={13} /> : <Download size={13} />}
         {state.phase === "downloading"
@@ -198,7 +209,9 @@ export function UpdateSettings({
       : state.info && state.phase !== "idle"
         ? L(`Version ${state.info.version} is available.`, `Đã có bản ${state.info.version}.`)
         : state.error
-          ? L(`Couldn't check: ${state.error}`, `Không kiểm tra được: ${state.error}`)
+          ? /read-only|os error 30/i.test(state.error)
+            ? updateError(state.error)
+            : L(`Couldn't check: ${state.error}`, `Không kiểm tra được: ${state.error}`)
           : state.checkedAt
             ? L(`Up to date · checked at ${clock(state.checkedAt)}`, `Đang là bản mới nhất · kiểm tra lúc ${clock(state.checkedAt)}`)
             : L("Checks for updates by itself every few hours.", "App tự kiểm tra bản mới vài giờ một lần.");
@@ -230,7 +243,7 @@ export function UpdateSettings({
           </button>
         )}
       </div>
-      {installError && <p className="updateError">{installError}</p>}
+      {installError && <p className="updateError">{updateError(installError)}</p>}
     </div>
   );
 }
