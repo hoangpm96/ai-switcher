@@ -5,6 +5,14 @@ All notable changes to **AI Account Switcher** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.2] - 2026-11-18
+
+### Changed
+
+- Version number only — the app is the same as 0.13.1. The `v0.13.0` and `v0.13.1` tags never
+  reached GitHub, so this is the version tagged there. Not published to the store: installed apps
+  stay on 0.13.1 (it has no entry in `release-notes.json`, so `npm run publish-release` refuses it).
+
 ## [0.13.1] - 2026-11-17
 
 ### Fixed
